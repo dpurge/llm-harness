@@ -14,6 +14,7 @@ from google.auth import exceptions as auth_exceptions
 from google.genai import errors, types
 
 from llm_harness.config import ProviderConfig
+from llm_harness.embeddings import EmbeddingError
 from llm_harness.providers import vertex
 from llm_harness.providers.environment import hidden_environment
 from llm_harness.providers.vertex import VertexProvider, create
@@ -191,6 +192,15 @@ async def test_request_maps_roles_order_and_whole_history() -> None:
         types.Content(role="user", parts=[types.Part(text="three")]),
     ]
     assert call["config"] == types.GenerateContentConfig()
+
+
+async def test_response_schema_is_ignored() -> None:
+    client = finished()
+    req = request().model_copy(update={"response_schema": {"type": "object"}})
+    [event async for event in make_provider(client).stream_chat(req)]
+    plain = finished()
+    await collect(plain)
+    assert client.calls == plain.calls
 
 
 async def test_system_messages_become_one_system_instruction() -> None:
@@ -722,3 +732,146 @@ def test_hidden_environment_restores_on_error(
     with pytest.raises(RuntimeError), hidden_environment(prefixes=("HIDE_",)):
         raise RuntimeError("boom")
     assert os.environ["HIDE_ME"] == "1"
+
+
+# --- embeddings --------------------------------------------------------------
+
+
+class _EmbedModels:
+    def __init__(self, owner: "FakeEmbedClient") -> None:
+        self._owner = owner
+
+    async def embed_content(self, **kwargs: Any) -> types.EmbedContentResponse:
+        self._owner.calls.append(kwargs)
+        if self._owner.raises is not None:
+            raise self._owner.raises
+        return types.EmbedContentResponse.model_validate(
+            {"embeddings": [{"values": v} for v in self._owner.vectors]}
+        )
+
+
+class _EmbedAio:
+    def __init__(self, owner: "FakeEmbedClient") -> None:
+        self.models = _EmbedModels(owner)
+
+
+class FakeEmbedClient:
+    """Stands in for genai.Client.aio.models.embed_content; records kwargs."""
+
+    def __init__(
+        self,
+        vectors: list[list[float]] | None = None,
+        *,
+        raises: Exception | None = None,
+    ) -> None:
+        self.vectors = vectors if vectors is not None else [[0.5, 1.5]]
+        self.raises = raises
+        self.calls: list[dict[str, Any]] = []
+        self.aio = _EmbedAio(self)
+
+
+async def embed_with(
+    client: FakeEmbedClient, texts: list[str], dimensions: int | None = None
+) -> list[list[float]]:
+    return await make_provider(client).embed("embed-x", texts, dimensions)  # type: ignore[arg-type]
+
+
+async def test_embed_without_dimensions_sends_no_config() -> None:
+    client = FakeEmbedClient([[1.0], [2.0]])
+    vectors = await embed_with(client, ["a", "b"])
+    assert vectors == [[1.0], [2.0]]
+    assert client.calls == [{"model": "embed-x", "contents": ["a", "b"]}]
+
+
+async def test_embed_with_dimensions_sends_output_dimensionality() -> None:
+    client = FakeEmbedClient([[1.0]])
+    await embed_with(client, ["a"], dimensions=256)
+    config = client.calls[0]["config"]
+    assert isinstance(config, types.EmbedContentConfig)
+    assert config.output_dimensionality == 256
+
+
+@pytest.mark.parametrize(
+    ("cls", "code", "kind"),
+    [
+        (errors.ClientError, 400, "bad_request"),
+        (errors.ClientError, 401, "auth"),
+        (errors.ClientError, 403, "auth"),
+        (errors.ClientError, 404, "not_found"),
+        (errors.ClientError, 429, "rate_limit"),
+        (errors.ClientError, 418, "unknown"),
+        (errors.ServerError, 500, "unknown"),
+    ],
+)
+async def test_embed_api_errors_map_to_kind(
+    cls: type[errors.APIError], code: int, kind: str
+) -> None:
+    client = FakeEmbedClient(raises=api_error(cls, code, "boom"))
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(client, ["a"])
+    assert info.value.kind == kind
+    assert "boom" in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        auth_exceptions.DefaultCredentialsError("no ADC"),
+        auth_exceptions.RefreshError("expired"),
+        auth_exceptions.GoogleAuthError("bad"),
+    ],
+)
+async def test_embed_credential_errors_are_auth(exc: Exception) -> None:
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(FakeEmbedClient(raises=exc), ["a"])
+    assert info.value.kind == "auth"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectError("refused"),
+        httpx.ReadTimeout("slow"),
+        ConnectionResetError("reset"),
+        auth_exceptions.TransportError("token endpoint unreachable"),
+        *AIOHTTP_CONNECTION_ERRORS,
+    ],
+)
+async def test_embed_connection_failures_are_connection(exc: Exception) -> None:
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(FakeEmbedClient(raises=exc), ["a"])
+    assert info.value.kind == "connection"
+
+
+async def test_embed_other_aiohttp_errors_are_unknown() -> None:
+    client = FakeEmbedClient(raises=aiohttp.InvalidURL("bad"))
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(client, ["a"])
+    assert info.value.kind == "unknown"
+
+
+async def test_embed_error_message_is_redacted() -> None:
+    shape = "sk-abcdefghij1234567890"
+    text = f"bad key {shape} Bearer tok123456 at http://u:hunter2@host/x"
+    client = FakeEmbedClient(raises=api_error(errors.ClientError, 401, text))
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(client, ["a"])
+    message = str(info.value)
+    assert shape not in message
+    assert "tok123456" not in message
+    assert "hunter2" not in message
+    assert "[REDACTED:api_key]" in message
+
+
+async def test_embed_vector_count_mismatch_is_unknown() -> None:
+    client = FakeEmbedClient([[1.0]])
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(client, ["a", "b"])
+    assert info.value.kind == "unknown"
+    assert "1" in str(info.value) and "2" in str(info.value)
+
+
+async def test_embed_programming_errors_are_not_wrapped() -> None:
+    client = FakeEmbedClient(raises=TypeError("our bug"))
+    with pytest.raises(TypeError, match="our bug"):
+        await embed_with(client, ["a"])

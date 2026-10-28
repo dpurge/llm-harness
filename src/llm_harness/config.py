@@ -12,6 +12,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PositiveInt,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -20,6 +21,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from llm_harness.redact import Secret
 
@@ -126,6 +128,9 @@ class Price(_Frozen):
     _finite = field_validator("input_per_mtok", "output_per_mtok")(_require_finite)
 
 
+EMBEDDING_EXCLUSIVE_TAGS = ("chat", "default", "orchestrator")
+
+
 class ModelConfig(_Frozen):
     id: NonEmptyStr
     name: NonEmptyStr
@@ -135,13 +140,169 @@ class ModelConfig(_Frozen):
     priority: StrictInt | StrictFloat
     price: Price = Price()
     thinking: StrictBool | None = None
+    # Output size of an embedding model; None means the model's own default.
+    dimensions: PositiveInt | None = None
 
     _finite_priority = field_validator("priority")(_require_finite)
+
+    @model_validator(mode="after")
+    def _check_embedding_tags(self) -> Self:
+        # Vectors and chat replies are different products: one entry is never both.
+        if "embedding" in self.tags:
+            clashing = [tag for tag in EMBEDDING_EXCLUSIVE_TAGS if tag in self.tags]
+            if clashing:
+                names = ", ".join(repr(tag) for tag in clashing)
+                raise ValueError(
+                    f"model {self.id!r} is tagged 'embedding' and cannot also be "
+                    f"tagged {names}"
+                )
+        return self
+
+
+USER_ID_MAX_LENGTH = 128
+
+
+def _check_user_id(value: object) -> str | None:
+    """None stays None; anything else must be a short, printable, non-blank string.
+
+    The string is kept as given: stripping silently would make two computers
+    with "ann " and "ann" look like the same user while the files differ.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        # ValueError, not TypeError: pydantic only turns ValueError into an error.
+        raise ValueError(  # noqa: TRY004
+            f"user_id must be a string, not {type(value).__name__}; "
+            'write it as user_id = "your-name"'
+        )
+    if not value.strip():
+        raise ValueError(
+            "user_id must not be empty or blank; set a name or remove the key"
+        )
+    if len(value) > USER_ID_MAX_LENGTH:
+        raise ValueError(
+            f"user_id must be at most {USER_ID_MAX_LENGTH} characters, "
+            f"got {len(value)}; shorten it"
+        )
+    if not value.isprintable():
+        raise ValueError(
+            "user_id must not contain control characters or newlines; "
+            "use plain printable text"
+        )
+    return value
+
+
+def default_data_dir() -> Path:
+    # Evaluated per call so a patched HOME is honoured.
+    return Path.home() / ".local" / "share" / "llm-harness"
+
+
+# Backends the program can use now, and backends that are recognised but come
+# with a later feature: naming them tells the user the config is not wrong, the
+# feature is just not here yet.
+_AVAILABLE_BACKENDS = {
+    "relational": ("sqlite",),
+    "vector": ("qdrant-edge", "none"),
+    "files": ("local",),
+}
+_PLANNED_BACKENDS = {"relational": ("postgres",), "vector": ("qdrant",), "files": ()}
+
+
+def _check_backend(kind: str, value: str) -> str:
+    available = _AVAILABLE_BACKENDS[kind]
+    if value in available:
+        return value
+    valid = ", ".join(available)
+    # The message is built here: pydantic's template syntax has no !r.
+    if value in _PLANNED_BACKENDS[kind]:
+        raise PydanticCustomError(
+            "backend_planned",
+            f"{value!r} is not available yet (planned feature "
+            f"storage-backends-remote); use one of: {valid}",
+        )
+    raise PydanticCustomError(
+        "backend_unknown", f"unknown backend {value!r}; use one of: {valid}"
+    )
+
+
+def _check_storage_path(value: object) -> object:
+    """Expand `~`; a relative path would depend on the working directory."""
+    if not isinstance(value, str | Path):
+        return value  # pydantic reports the wrong type
+    if not str(value).strip():
+        raise PydanticCustomError(
+            "path_empty", "path must not be empty; set an absolute path or remove it"
+        )
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise PydanticCustomError(
+            "path_relative",
+            f"path {str(value)!r} must be absolute (or start with ~); "
+            "a relative path depends on the working directory",
+        )
+    return path
+
+
+class RelationalConfig(_Frozen):
+    backend: str = "sqlite"
+    path: Path | None = None
+
+    @field_validator("backend")
+    @classmethod
+    def _backend_rule(cls, value: str) -> str:
+        return _check_backend("relational", value)
+
+    _path_rule = field_validator("path", mode="before")(_check_storage_path)
+
+    def resolved_path(self, data_dir: Path) -> Path:
+        return self.path or data_dir / "harness.db"
+
+
+class VectorConfig(_Frozen):
+    backend: str = "qdrant-edge"
+    path: Path | None = None
+
+    @field_validator("backend")
+    @classmethod
+    def _backend_rule(cls, value: str) -> str:
+        return _check_backend("vector", value)
+
+    _path_rule = field_validator("path", mode="before")(_check_storage_path)
+
+    def resolved_path(self, data_dir: Path) -> Path:
+        return self.path or data_dir / "vectors"
+
+
+class FilesConfig(_Frozen):
+    backend: str = "local"
+    root: Path | None = None
+
+    @field_validator("backend")
+    @classmethod
+    def _backend_rule(cls, value: str) -> str:
+        return _check_backend("files", value)
+
+    _root_rule = field_validator("root", mode="before")(_check_storage_path)
+
+    def resolved_root(self, data_dir: Path) -> Path:
+        return self.root or data_dir / "files"
+
+
+class StorageConfig(_Frozen):
+    relational: RelationalConfig = RelationalConfig()
+    vector: VectorConfig = VectorConfig()
+    files: FilesConfig = FilesConfig()
 
 
 class HarnessConfig(_Frozen):
     providers: dict[str, ProviderConfig]
     models: list[ModelConfig]
+    # The same on every computer, so the orchestrator can tell whose state it is.
+    user_id: str | None = None
+    storage: StorageConfig = StorageConfig()
+
+    _user_id_rule = field_validator("user_id", mode="before")(_check_user_id)
 
     @model_validator(mode="after")
     def _check_references(self) -> Self:
@@ -197,6 +358,21 @@ def _read_yaml(path: Path) -> object:
         raise _unreadable(path, exc) from None
 
 
+def _load_storage(raw: object) -> StorageConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"invalid {CONFIG_FILE}: storage must be a table, not "
+            f"{type(raw).__name__}; write it as [storage.vector] and so on"
+        )
+    try:
+        # Wrapped so error locations start with "storage".
+        return TypeAdapter(dict[str, StorageConfig]).validate_python({"storage": raw})[
+            "storage"
+        ]
+    except ValidationError as exc:
+        raise _format_validation_error(CONFIG_FILE, exc) from None
+
+
 def load_config(config_dir: Path) -> HarnessConfig:
     config_path = config_dir / CONFIG_FILE
     models_path = config_dir / MODELS_FILE
@@ -205,17 +381,28 @@ def load_config(config_dir: Path) -> HarnessConfig:
         raise MissingConfigError(missing)
 
     toml_data = _read_toml(config_path)
-    unknown = sorted(set(toml_data) - {"providers"})
+    unknown = sorted(set(toml_data) - {"providers", "user_id", "storage"})
     if unknown:
         raise ConfigError(
             f"invalid {CONFIG_FILE}: unknown top-level keys: {', '.join(unknown)}"
         )
+    for provider_table in toml_data.get("providers", {}).values():
+        if isinstance(provider_table, dict) and "user_id" in provider_table:
+            raise ConfigError(
+                f"invalid {CONFIG_FILE}: user_id found inside [providers.<id>]; "
+                "put user_id at the top of the file, before any [providers...] header"
+            )
     try:
         providers = TypeAdapter(dict[str, ProviderConfig]).validate_python(
             toml_data.get("providers", {})
         )
     except ValidationError as exc:
         raise _format_validation_error(CONFIG_FILE, exc) from None
+    try:
+        user_id = _check_user_id(toml_data.get("user_id"))
+    except ValueError as exc:
+        raise ConfigError(f"invalid {CONFIG_FILE}: {exc}") from None
+    storage = _load_storage(toml_data.get("storage", {}))
 
     yaml_data = _read_yaml(models_path)
     if not isinstance(yaml_data, dict) or set(yaml_data) != {"models"}:
@@ -224,7 +411,9 @@ def load_config(config_dir: Path) -> HarnessConfig:
         )
     try:
         models = TypeAdapter(list[ModelConfig]).validate_python(yaml_data["models"])
-        return HarnessConfig(providers=providers, models=models)
+        return HarnessConfig(
+            providers=providers, models=models, user_id=user_id, storage=storage
+        )
     except ValidationError as exc:
         raise _format_validation_error(MODELS_FILE, exc) from None
 
@@ -279,34 +468,105 @@ def resolve_think(flag: bool | None, model: ModelConfig) -> bool | None:
     return flag if flag is not None else model.thinking
 
 
+def _lookup_model(config: HarnessConfig, model_id: str) -> ModelConfig:
+    for model in config.models:
+        if model.id == model_id:
+            return model
+    valid = ", ".join(model.id for model in config.models)
+    raise ConfigError(f"unknown model {model_id!r}; valid ids: {valid}")
+
+
+def _lookup_chat_model(config: HarnessConfig, model_id: str) -> ModelConfig:
+    """Like `_lookup_model`, but refuses an embedding model: it cannot chat."""
+    model = _lookup_model(config, model_id)
+    if "embedding" in model.tags:
+        raise ConfigError(
+            f"model {model_id!r} is tagged 'embedding' and cannot be used for chat"
+        )
+    return model
+
+
+def _top_priority(candidates: list[ModelConfig], label: str) -> ModelConfig:
+    """The single highest-priority model; a tie at the top is an error."""
+    top = max(model.priority for model in candidates)
+    best = [model for model in candidates if model.priority == top]
+    if len(best) > 1:
+        ids = ", ".join(model.id for model in best)
+        raise ConfigError(f"several {label} models share the top priority {top}: {ids}")
+    return best[0]
+
+
 def select_model(config: HarnessConfig, model_id: str | None) -> ModelConfig:
     if model_id is not None:
-        for model in config.models:
-            if model.id == model_id:
-                return model
-        valid = ", ".join(model.id for model in config.models)
-        raise ConfigError(f"unknown model {model_id!r}; valid ids: {valid}")
+        return _lookup_chat_model(config, model_id)
 
     defaults = [model for model in config.models if "default" in model.tags]
     if not defaults:
         raise ConfigError(
             "no model is tagged 'default'; use --model or tag one in models.yaml"
         )
-    top = max(model.priority for model in defaults)
-    best = [model for model in defaults if model.priority == top]
-    if len(best) > 1:
-        ids = ", ".join(model.id for model in best)
-        raise ConfigError(f"several default models share the top priority {top}: {ids}")
-    return best[0]
+    return _top_priority(defaults, "default")
+
+
+def select_orchestrator_model(
+    config: HarnessConfig, model_id: str | None
+) -> ModelConfig:
+    """The model that drives the orchestrator; never falls back to `default`."""
+    if model_id is not None:
+        return _lookup_chat_model(config, model_id)
+
+    candidates = [model for model in config.models if "orchestrator" in model.tags]
+    if not candidates:
+        raise ConfigError(
+            "no model is tagged 'orchestrator'; tag one in models.yaml or use --model"
+        )
+    return _top_priority(candidates, "orchestrator")
+
+
+def select_embedding_model(config: HarnessConfig, model_id: str | None) -> ModelConfig:
+    """The model that produces embeddings; never falls back to a chat model."""
+    if model_id is not None:
+        model = _lookup_model(config, model_id)
+        if "embedding" not in model.tags:
+            raise ConfigError(f"model {model_id!r} is not tagged 'embedding'")
+        return model
+
+    candidates = [model for model in config.models if "embedding" in model.tags]
+    if not candidates:
+        raise ConfigError(
+            "no model has the tag 'embedding'; tag one in models.yaml or pass its id"
+        )
+    return _top_priority(candidates, "embedding")
+
+
+def chat_models(config: HarnessConfig) -> list[ModelConfig]:
+    """The models a person can chat with: everything not tagged 'embedding'."""
+    return [model for model in config.models if "embedding" not in model.tags]
 
 
 EXAMPLE_CONFIG_TOML = """\
-# llm-harness connection settings. Keep this file private: chmod 600.
+# llm-harness connection settings: where each provider lives and how to sign in.
+# Keep this file private: chmod 600. The list of models is in models.yaml.
+# Lines that start with "# " are examples; remove the "# " to switch one on.
 
+# Your name. Use the same user_id on every computer so your state follows you.
+# Optional. It must stay above the first [table] header, because a key written
+# after a header belongs to that table.
+# user_id = "your-name"
+
+# One [providers.<id>] table per provider. The <id> (here "local") is the name
+# that "provider:" in models.yaml refers to. `type` is "ollama", "openai" or
+# "vertex"; the other keys depend on the type.
+
+# Ollama on this computer. It needs `base_url` and takes no key.
 [providers.local]
 type = "ollama"
 base_url = "http://localhost:11434"
 
+# An OpenAI-compatible service (OpenAI, OpenRouter, ...). It needs `base_url`
+# and one key: either the name of an environment variable (api_key_env, the
+# safer way) or the key itself (api_key). Never both. `reasoning_style` is
+# optional: it says how the `thinking` setting of a model is sent.
 # [providers.openai]
 # type = "openai"
 # base_url = "https://api.openai.com/v1"
@@ -314,25 +574,101 @@ base_url = "http://localhost:11434"
 # api_key = "sk-..."               # an inline key (not both)
 # reasoning_style = "openai"       # or "openrouter"; how `thinking` is sent
 
+# Google Vertex AI. It needs `project` and `location` and takes no key, no
+# base_url: it signs in with Application Default Credentials (run
+# `gcloud auth application-default login` once).
 # [providers.vertex]
 # type = "vertex"
 # project = "my-gcp-project"
 # location = "us-central1"
+
+# Where data lives; every key is optional and the values below are what you
+# get when you write nothing. Paths must be absolute (or start with ~).
+# Write these tables after user_id.
+# Relational data (usage ledger): "sqlite" is the only backend available now.
+# [storage.relational]
+# backend = "sqlite"
+# path = "/absolute/path/harness.db"   # default: ~/.local/share/llm-harness/harness.db
+
+# Vector search: "qdrant-edge" (local), or "none" to turn vector search off.
+# [storage.vector]
+# backend = "qdrant-edge"              # or "none" to turn vector search off
+# path = "/absolute/path"              # default: ~/.local/share/llm-harness/vectors
+
+# Files: "local" is the only backend available now.
+# [storage.files]
+# backend = "local"
+# root = "/absolute/path"              # default: ~/.local/share/llm-harness/files
 """
 
 EXAMPLE_MODELS_YAML = """\
-# llm-harness model registry (no secrets here). Higher priority wins.
+# llm-harness model registry: the list of models you can use. No secrets here
+# (keys go in config.toml). Lines that start with "# " are notes or examples.
+#
+# Every entry has these keys:
+#   id        short unique name; this is what --model and the selectors use.
+#   name      the label people see in menus.
+#   provider  the id of a [providers.<id>] table in config.toml.
+#   model     the name the provider knows the model by (for Ollama, what
+#             `ollama list` shows).
+#   tags      a list of labels:
+#               orchestrator  the model the program starts with: the one with
+#                             the highest priority. When a model fails, the
+#                             other orchestrator models are tried next, by
+#                             priority.
+#               default       a last resort: after the orchestrator models,
+#                             the models tagged default are tried, by
+#                             priority.
+#               chat          marks a model as a chat model; starting and
+#                             falling back use orchestrator and default.
+#               embedding     reserved, see the embedding example below.
+#             Any other tag (like "cheap") is a free label you can use to
+#             group models; it changes nothing.
+#   priority  a number; higher wins. Two orchestrator models at the same top
+#             priority are an error, and so are two embedding models, so give
+#             each a different number.
+#   thinking  optional. true or false asks the model to think (or not) before
+#             it answers; leave it out to use the model's own default.
+#   price     optional. Cost per million tokens, used for the usage
+#             numbers: input_per_mtok and output_per_mtok. Both default
+#             to 0, which is right for local models.
 models:
   - id: gemma-local
     name: Gemma 4 12B (local)
     provider: local
     model: gemma4:12b
-    tags: [default, chat, cheap]
+    tags: [default, chat, orchestrator, cheap]
     priority: 100
     # thinking: false   # optional; omitted = the model's own default
     price:
       input_per_mtok: 0
       output_per_mtok: 0
+
+  # An embedding model turns text into numbers (vectors) for search. It is not
+  # a chat model:
+  #   - Tag it [embedding]. Never combine that tag with chat, default or
+  #     orchestrator: the program refuses to start.
+  #   - It never answers chat, and it is hidden from the chat selectors and
+  #     from --model.
+  #   - There is no fallback between embedding models: the one with the highest
+  #     priority is used.
+  #   - `dimensions` is optional, a positive whole number. It is sent to the
+  #     provider only when you set it; leave it out to keep the model's own
+  #     size. Check that your model supports the value you ask for.
+  # To use it, run `ollama pull bge-m3`, then remove the "# " in front of the
+  # lines between the two marker lines (the markers stay commented).
+  # --- embedding example: begin ---
+  #   - id: bge-m3-local
+  #     name: BGE-M3 embeddings (local)
+  #     provider: local
+  #     model: bge-m3
+  #     tags: [embedding]
+  #     priority: 1
+  #     # dimensions: 256   # optional; omitted = the model's own size
+  #     price:
+  #       input_per_mtok: 0
+  #       output_per_mtok: 0
+  # --- embedding example: end ---
 """
 
 _EXAMPLES = {

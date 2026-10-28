@@ -7,6 +7,7 @@ import httpx
 import ollama
 
 from llm_harness.config import ProviderConfig
+from llm_harness.embeddings import EmbeddingError
 from llm_harness.providers.base import ChatProvider
 from llm_harness.providers.environment import hidden_environment
 from llm_harness.redact import Secret, redact
@@ -46,8 +47,16 @@ class OllamaProvider:
     async def stream_chat(self, req: ChatRequest) -> AsyncIterator[StreamEvent]:
         messages = [{"role": m.role, "content": m.content} for m in req.messages]
         try:
+            # `format` is sent only when set, so other requests are unchanged.
+            extra = (
+                {} if req.response_schema is None else {"format": req.response_schema}
+            )
             stream = await self._client.chat(
-                model=req.model, messages=messages, stream=True, think=req.think
+                model=req.model,
+                messages=messages,
+                stream=True,
+                think=req.think,
+                **extra,
             )
             async with aclosing(stream):
                 async for chunk in stream:
@@ -76,6 +85,29 @@ class OllamaProvider:
             yield _error("bad_request", exc)
         except (httpx.TransportError, ConnectionError) as exc:
             yield _error("connection", exc)
+
+    async def embed(
+        self, model: str, texts: list[str], dimensions: int | None
+    ) -> list[list[float]]:
+        # `dimensions` is sent only when set, so the model keeps its own size.
+        extra = {} if dimensions is None else {"dimensions": dimensions}
+        try:
+            response = await self._client.embed(model=model, input=texts, **extra)
+        except ollama.ResponseError as exc:
+            raise EmbeddingError(
+                _STATUS_KINDS.get(exc.status_code, "unknown"), redact(str(exc))
+            ) from exc
+        except ollama.RequestError as exc:
+            raise EmbeddingError("bad_request", redact(str(exc))) from exc
+        except (httpx.TransportError, ConnectionError) as exc:
+            raise EmbeddingError("connection", redact(str(exc))) from exc
+        vectors = [[float(x) for x in vector] for vector in response.embeddings]
+        if len(vectors) != len(texts):
+            raise EmbeddingError(
+                "unknown",
+                f"Ollama returned {len(vectors)} vectors for {len(texts)} texts",
+            )
+        return vectors
 
     async def aclose(self) -> None:
         await self._client.close()

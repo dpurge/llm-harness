@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from rich.text import Text
 from textual.pilot import Pilot
-from textual.widgets import Collapsible, Input, Markdown, Select, Static
+from textual.widgets import Input, Markdown, Select, Static
 from textual.widgets.markdown import MarkdownBlock, MarkdownFence
 
 from llm_harness.config import ConfigError, HarnessConfig, ProviderConfig
@@ -24,6 +24,7 @@ from llm_harness.types import (
     Usage,
     UsageEvent,
 )
+from tests.fake_steps import ScriptedSteps, as_step_reply, reply_events
 from tests.fakes import ScriptedProvider, router_factory_for
 
 CONFIG = HarnessConfig.model_validate(
@@ -71,7 +72,7 @@ REPLY = [TextDelta(text="Hel"), TextDelta(text="lo"), Done(finish_reason="stop")
 
 class RecordingProvider(ScriptedProvider):
     def __init__(self, events: list[StreamEvent], **kwargs: Any) -> None:
-        super().__init__(events, **kwargs)
+        super().__init__(as_step_reply(events), **kwargs)
         self.close_calls = 0
 
     async def aclose(self) -> None:
@@ -95,6 +96,18 @@ class Factory:
 
 
 CANARY = "sk-CANARY-123456789"
+RESPOND_HELLO = {"type": "respond", "text": "Hello"}
+ASK_FILE = {"type": "ask_user", "question": "Which file?"}
+
+
+class StepFactory:
+    """One ScriptedSteps provider serving full step replies, for every model."""
+
+    def __init__(self, scripts: list[list[StreamEvent]]) -> None:
+        self.provider = ScriptedSteps(scripts)
+
+    def __call__(self, config: ProviderConfig) -> ScriptedSteps:
+        return self.provider
 
 
 class BoomFactory(Factory):
@@ -199,7 +212,7 @@ async def test_thinking_is_in_a_collapsed_block_not_in_the_reply() -> None:
     app = make_app(factory)
     async with app.run_test() as pilot:
         await send(pilot, app, "hi")
-        (block,) = app.query(Collapsible)
+        (block,) = app.query("#log Collapsible")
         assert block.title == "Thinking"
         assert block.collapsed is True
         assert texts(app, "thinking") == ["pondering"]
@@ -210,7 +223,7 @@ async def test_no_thinking_block_without_thinking_deltas() -> None:
     app = make_app(Factory(REPLY))
     async with app.run_test() as pilot:
         await send(pilot, app, "hi")
-        assert list(app.query(Collapsible)) == []
+        assert list(app.query("#log Collapsible")) == []
 
 
 async def test_usage_line_follows_the_reply() -> None:
@@ -233,16 +246,17 @@ async def test_error_event_shows_error_and_restores_the_input() -> None:
         assert texts(app, "error") == ["error (auth): bad key"]
         assert prompt_of(app).value == "hello"
         assert prompt_of(app).disabled is False
-        assert app._session is not None and app._session.history == []
+        assert app._orchestrator is not None
+        assert app._orchestrator.has_completed_turn is False
 
 
 async def test_input_is_disabled_during_a_turn_and_enabled_after() -> None:
-    factory = Factory([TextDelta(text="par"), *REPLY], hang_after=1)
+    factory = Factory([ThinkingDelta(text="par"), *REPLY], hang_after=1)
     app = make_app(factory)
     async with app.run_test() as pilot:
         prompt_of(app).value = "hi"
         await pilot.press("enter")
-        await wait_for(pilot, lambda: reply_texts(app) == ["par"])
+        await wait_for(pilot, lambda: texts(app, "thinking") == ["par"])
         assert prompt_of(app).disabled is True
         await pilot.press("escape")
         await app.workers.wait_for_complete()
@@ -251,33 +265,49 @@ async def test_input_is_disabled_during_a_turn_and_enabled_after() -> None:
 
 
 async def test_escape_cancels_the_turn_and_restores_the_input() -> None:
-    factory = Factory([TextDelta(text="par"), *REPLY], hang_after=1)
+    factory = Factory([ThinkingDelta(text="par"), *REPLY], hang_after=1)
     app = make_app(factory)
     async with app.run_test() as pilot:
         prompt_of(app).value = "hi there"
         await pilot.press("enter")
-        await wait_for(pilot, lambda: reply_texts(app) == ["par"])
+        await wait_for(pilot, lambda: texts(app, "thinking") == ["par"])
         await pilot.press("escape")
         await app.workers.wait_for_complete()
         await pilot.pause()
         assert texts(app, "note") == ["cancelled"]
         assert prompt_of(app).value == "hi there"
-        assert app._session is not None and app._session.history == []
+        assert app._orchestrator is not None
+        assert app._orchestrator.has_completed_turn is False
         assert factory.providers[0].closed is True
 
 
-async def test_second_request_carries_the_whole_history() -> None:
+def request_text(request) -> str:
+    return "\n".join(m.content for m in request.messages)
+
+
+async def test_the_ui_never_sends_a_transcript_only_state() -> None:
+    first = f"remember {CANARY}"
     factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, first)
+        await send(pilot, app, "two")
+        requests = factory.providers[0].requests
+        assert [m.role for m in requests[-1].messages] == ["system", "user"]
+        assert CANARY in request_text(requests[0])
+        assert CANARY not in request_text(requests[1])
+        assert "Hello" not in request_text(requests[1])
+
+
+async def test_text_kept_in_the_state_is_sent_again_on_the_next_turn() -> None:
+    kept = {"findings": {"$append": [{"text": CANARY, "source": "user"}]}}
+    reply = reply_events(RESPOND_HELLO, {"goal": "g", **kept})
+    factory = StepFactory([reply, reply_events(RESPOND_HELLO)])
     app = make_app(factory)
     async with app.run_test() as pilot:
         await send(pilot, app, "one")
         await send(pilot, app, "two")
-        messages = factory.providers[0].requests[-1].messages
-        assert [(m.role, m.content) for m in messages] == [
-            ("user", "one"),
-            ("assistant", "Hello"),
-            ("user", "two"),
-        ]
+        assert CANARY in request_text(factory.provider.requests[1])
 
 
 @pytest.mark.parametrize("flag", [True, False, None])
@@ -287,6 +317,99 @@ async def test_think_flag_reaches_the_request(flag: bool | None) -> None:
     async with app.run_test() as pilot:
         await send(pilot, app, "hi")
         assert factory.providers[0].requests[-1].think is flag
+
+
+class ErrorThenReplyFactory:
+    """The first provider fails every call; later ones answer normally."""
+
+    def __init__(self) -> None:
+        self.providers: list[RecordingProvider] = []
+
+    def __call__(self, config: ProviderConfig) -> RecordingProvider:
+        events = (
+            REPLY
+            if self.providers
+            else [ErrorEvent(kind="connection", message="refused")]
+        )
+        provider = RecordingProvider(events)
+        self.providers.append(provider)
+        return provider
+
+
+async def test_a_status_line_follows_each_valid_step() -> None:
+    app = make_app(Factory(REPLY))
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        assert texts(app, "note") == ["step 1: answering"]
+
+
+async def test_a_status_line_is_plain_sanitised_text() -> None:
+    hostile = "[bold red]x[/]\x1b[31m"
+    factory = StepFactory(
+        [
+            reply_events({"type": "call_tool", "tool": hostile}, {"goal": "g"}),
+            reply_events(RESPOND_HELLO),
+        ]
+    )
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        assert texts(app, "note") == [
+            "step 1: calling tool [bold red]x[/][31m",
+            "step 2: answering",
+        ]
+        assert "\x1b" not in screen_text(app)
+
+
+async def test_the_ask_user_question_is_shown_as_the_assistant_reply() -> None:
+    factory = StepFactory([reply_events(ASK_FILE, {"goal": "g"})])
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "fix it")
+        assert reply_texts(app) == ["Which file?"]
+        assert texts(app, "note") == ["step 1: asking the user"]
+        assert texts(app, "error") == []
+        assert prompt_of(app).disabled is False
+
+
+async def test_the_selector_stays_free_after_a_failed_first_turn() -> None:
+    factory = ErrorThenReplyFactory()
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        (error,) = texts(app, "error")
+        assert error.endswith("pick a model to try it now")
+        assert app._orchestrator is not None
+        assert app._orchestrator.has_completed_turn is False
+        app.query_one("#model", Select).value = "m2"
+        await pilot.pause()
+        assert len(factory.providers) == 2
+        assert texts(app, "note") == []
+        await send(pilot, app, "hi")
+        assert reply_texts(app) == ["Hello"]
+        assert factory.providers[1].requests[-1].model == "provider-model-2"
+
+
+async def test_the_selector_locks_after_a_completed_turn() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        assert app._orchestrator is not None
+        assert app._orchestrator.has_completed_turn is False
+        await send(pilot, app, "hi")
+        assert app._orchestrator.has_completed_turn is True
+        app.query_one("#model", Select).value = "m2"
+        await pilot.pause()
+        assert len(factory.providers) == 1
+        assert "applies to the next new chat (Ctrl+N)" in texts(app, "note")
+
+
+async def test_an_ask_user_turn_also_locks_the_selector() -> None:
+    app = make_app(StepFactory([reply_events(ASK_FILE, {"goal": "g"})]))
+    async with app.run_test() as pilot:
+        await send(pilot, app, "fix it")
+        assert app._orchestrator is not None
+        assert app._orchestrator.has_completed_turn is True
 
 
 # Security
@@ -378,7 +501,10 @@ async def test_selection_with_history_waits_for_ctrl_n() -> None:
         await send(pilot, app, "first")
         app.query_one("#model", Select).value = "m2"
         await pilot.pause()
-        assert texts(app, "note") == ["applies to the next new chat (Ctrl+N)"]
+        assert texts(app, "note") == [
+            "step 1: answering",
+            "applies to the next new chat (Ctrl+N)",
+        ]
         assert len(factory.providers) == 1
 
         await send(pilot, app, "second")
@@ -392,7 +518,7 @@ async def test_selection_with_history_waits_for_ctrl_n() -> None:
         await send(pilot, app, "third")
         request = factory.providers[1].requests[-1]
         assert request.model == "provider-model-2"
-        assert [m.content for m in request.messages] == ["third"]
+        assert "first" not in request_text(request)
 
 
 async def test_config_error_on_selection_is_shown_and_session_keeps_working() -> None:
@@ -424,11 +550,8 @@ async def test_config_error_on_new_chat_keeps_the_current_chat() -> None:
         ]
         assert reply_texts(app) == ["Hello"]
         await send(pilot, app, "second")
-        assert [m.content for m in factory.providers[0].requests[-1].messages] == [
-            "first",
-            "Hello",
-            "second",
-        ]
+        assert len(factory.providers[0].requests) == 2
+        assert factory.providers[0].requests[-1].model == "provider-model-1"
 
 
 async def test_failed_initial_model_can_be_replaced_by_a_working_one() -> None:
@@ -466,9 +589,10 @@ async def test_unexpected_stream_exception_is_one_masked_line_and_the_app_goes_o
         assert "Traceback" not in screen_text(app)
         assert prompt_of(app).value == "hello"
         assert prompt_of(app).disabled is False
-        assert app._session is not None and app._session.history == []
+        assert app._orchestrator is not None
+        assert app._orchestrator.has_completed_turn is False
         await send(pilot, app, "again")
-        assert reply_texts(app) == ["par", "Hello"]
+        assert reply_texts(app) == ["Hello"]
         assert prompt_of(app).value == ""
         assert app.return_code is None
 
@@ -491,11 +615,8 @@ async def test_unexpected_provider_factory_exception_keeps_the_current_session()
         assert "Traceback" not in screen_text(app)
         assert prompt_of(app).disabled is False
         await send(pilot, app, "second")
-        assert [m.content for m in factory.providers[0].requests[-1].messages] == [
-            "first",
-            "Hello",
-            "second",
-        ]
+        assert len(factory.providers[0].requests) == 2
+        assert factory.providers[0].requests[-1].model == "provider-model-1"
         assert factory.providers[0].close_calls == 0
 
 
@@ -553,6 +674,44 @@ async def test_model_names_are_literal_text_not_markup(initial: int) -> None:
         ]
         assert all(isinstance(prompt, Text) for prompt in prompts)
         assert [prompt.plain for prompt in prompts] == NAMES
+
+
+def embedding_config_app() -> ChatApp:
+    config = HarnessConfig.model_validate(
+        {
+            "providers": {"local": {"type": "ollama", "base_url": "http://x"}},
+            "models": [
+                {
+                    "id": "bge-m3-local",
+                    "name": "BGE M3",
+                    "provider": "local",
+                    "model": "bge-m3",
+                    "tags": ["embedding"],
+                    "priority": 1,
+                },
+                {
+                    "id": "chat1",
+                    "name": "Chat One",
+                    "provider": "local",
+                    "model": "chat-model",
+                    "tags": ["default"],
+                    "priority": 1,
+                },
+            ],
+        }
+    )
+    return ChatApp(
+        config, config.models[1], router_factory_for(config, Factory(REPLY)), False
+    )
+
+
+async def test_selector_hides_embedding_models() -> None:
+    app = embedding_config_app()
+    async with app.run_test():
+        select = app.query_one("#model", Select)
+        assert [(label.plain, value) for label, value in select._options] == [
+            ("Chat One", "chat1")
+        ]
 
 
 # Fallback notes, the usage line and the manual flag
@@ -616,7 +775,8 @@ async def test_a_fallback_shows_the_note_the_reply_and_the_usage_line() -> None:
     async with app.run_test() as pilot:
         await send(pilot, app, "hi")
         assert texts(app, "note") == [
-            "dead-model unavailable (connection); using live-model"
+            "dead-model unavailable (connection); using live-model",
+            "step 1: answering",
         ]
         assert reply_texts(app) == ["pong"]
         (line,) = texts(app, "usage")
@@ -637,7 +797,9 @@ async def test_a_second_turn_skips_the_model_in_backoff_when_a_store_is_used(
         await send(pilot, app, "two")
         assert texts(app, "note") == [
             "dead-model unavailable (connection); using live-model",
+            "step 1: answering",
             "dead-model is in backoff; using live-model",
+            "step 1: answering",
         ]
         assert [line.rsplit("| ", 1)[1] for line in texts(app, "usage")] == [
             "session $0.02]",
@@ -657,8 +819,9 @@ async def test_an_unusable_database_notice_is_shown_once_as_a_note(
     async with app.run_test() as pilot:
         await send(pilot, app, "one")
         await send(pilot, app, "two")
-        (note,) = texts(app, "note")
+        note, *steps = texts(app, "note")
         assert note.startswith("usage database unavailable (")
+        assert steps == ["step 1: answering"] * 2
         assert reply_texts(app) == ["Hello", "Hello"]
 
 
@@ -748,15 +911,17 @@ async def test_quit_command_while_a_turn_runs_cancels_it_and_quits() -> None:
     assert factory.providers[0].close_calls == 1
 
 
-async def test_quit_command_is_not_added_to_the_history() -> None:
-    app = make_app(Factory(REPLY))
+async def test_quit_command_is_not_sent_to_the_model() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
     async with app.run_test() as pilot:
         await send(pilot, app, "hi")
         prompt_of(app).value = "/quit"
         await pilot.press("enter")
         await pilot.pause()
-        assert app._session is not None
-        assert [m.content for m in app._session.history] == ["hi", "Hello"]
+        assert app._orchestrator is not None
+        assert app._orchestrator.state.turn == 1
+        assert len(factory.providers[0].requests) == 1
         assert texts(app, "user") == ["you: hi"]
 
 
@@ -907,3 +1072,31 @@ async def test_a_link_in_the_reply_opens_nothing_on_render_or_click(
         reply.post_message(Markdown.LinkClicked(reply, "https://e.example"))
         await pilot.pause()
         assert opened == []
+
+
+# Storage
+
+
+class SpyStorage:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+async def test_the_orchestrator_gets_the_storage_and_exit_closes_it_once() -> None:
+    storage = SpyStorage()
+    app = ChatApp(
+        CONFIG,
+        MODEL_1,
+        router_factory_for(CONFIG, Factory(REPLY)),
+        False,
+        storage,  # type: ignore[arg-type]
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._orchestrator is not None
+        assert app._orchestrator._storage is storage
+        assert storage.close_calls == 0
+    assert storage.close_calls == 1

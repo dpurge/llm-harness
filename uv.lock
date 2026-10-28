@@ -1028,6 +1028,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pygments" },
     { name = "pyyaml" },
+    { name = "qdrant-edge-py" },
     { name = "textual" },
 ]
 
@@ -1052,6 +1053,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.14.1" },
     { name = "pygments", specifier = ">=2.21.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
+    { name = "qdrant-edge-py", specifier = ">=0.9.0" },
     { name = "textual", specifier = ">=8.2.8" },
 ]
 
@@ -1938,6 +1940,21 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/da/92/1446574745d74df0c92e6aa4a7b0b3130706a4142b2d1a5869f2eaa423c6/pyyaml-6.0.3-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:16249ee61e95f858e83976573de0f5b2893b3677ba71c9dd36b9cf8be9ac6d65", size = 829923, upload-time = "2025-09-25T21:32:54.537Z" },
     { url = "https://files.pythonhosted.org/packages/f0/7a/1c7270340330e575b92f397352af856a8c06f230aa3e76f86b39d01b416a/pyyaml-6.0.3-cp314-cp314t-win_amd64.whl", hash = "sha256:4ad1906908f2f5ae4e5a8ddfce73c320c2a1429ec52eafd27138b7f1cbe341c9", size = 174062, upload-time = "2025-09-25T21:32:55.767Z" },
     { url = "https://files.pythonhosted.org/packages/f1/12/de94a39c2ef588c7e6455cfbe7343d3b2dc9d6b6b2f40c4c6565744c873d/pyyaml-6.0.3-cp314-cp314t-win_arm64.whl", hash = "sha256:ebc55a14a21cb14062aa4162f906cd962b28e2e9ea38f9b4391244cd8de4ae0b", size = 149341, upload-time = "2025-09-25T21:32:56.828Z" },
+]
+
+[[package]]
+name = "qdrant-edge-py"
+version = "0.9.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/39/8c/e059cdf79b9d3e2f797a6af13f1a22cb21ce5f39013d884e3835de5076de/qdrant_edge_py-0.9.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:d6b11f36455450a4215d7b528cce44be8cd19bf9f974738c864632967b536f51", size = 12775948, upload-time = "2026-10-22T12:54:44.629Z" },
+    { url = "https://files.pythonhosted.org/packages/3b/40/54627eff9afffff3bf918b8af0319cbede0eff0205a436c173eee0094002/qdrant_edge_py-0.9.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:7500651fa855462c96149a501dac4187ad9e73a91a9306ef20f827969f34ea8e", size = 11391293, upload-time = "2026-10-22T12:54:47.126Z" },
+    { url = "https://files.pythonhosted.org/packages/34/a5/7cfb5c877e418f20dec397bc09919ce1fcb7bc253f324f267e980c740dad/qdrant_edge_py-0.9.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:5ca5b0b3c0118610b8ac86b6cc962bb39fa220cc0487853a68664add7ba57c7e", size = 13832373, upload-time = "2026-10-22T12:54:49.417Z" },
+    { url = "https://files.pythonhosted.org/packages/38/b8/0e69f881da00d699483fa6d2dec19db682bbeb78706615a4d4b545397321/qdrant_edge_py-0.9.0-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:a285d655ee065d4bba81c638977098a137a3c614cdfffc4cc3974f485f72b1f2", size = 12990497, upload-time = "2026-10-22T12:54:52.009Z" },
+    { url = "https://files.pythonhosted.org/packages/30/75/0aa96e41a9e8c0e7c054e940d815ef53d7c9d0c71ce4d350ac65102eac3b/qdrant_edge_py-0.9.0-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:7bc734ea493d1f92e6b8af74bc68c4f903b2ca90593f899cd1b998cd12744da4", size = 13843316, upload-time = "2026-10-22T12:54:54.7Z" },
+    { url = "https://files.pythonhosted.org/packages/b4/44/43d7efb72a39fe5bb87926d99334d13524f9d52db090ba8471d91d3ad34b/qdrant_edge_py-0.9.0-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:b4757eaad2ec37f42fa3626881f66d13551b2dc20fee0cd9bc032b8abd54a900", size = 13184713, upload-time = "2026-10-22T12:54:57.289Z" },
+    { url = "https://files.pythonhosted.org/packages/24/34/cb4586e179425b1a81b642e0aefddf1f3e386a8b4e4a8fa9105da228d358/qdrant_edge_py-0.9.0-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:d1ec708b3806fcd18b664e6262422e8ef216ce16e76105075ae8e921671459c7", size = 14071841, upload-time = "2026-10-22T12:54:59.928Z" },
+    { url = "https://files.pythonhosted.org/packages/56/1d/9a5b31feccfcfd2542c1a6ac1221b258afadc50353f780d8ff62e23dd562/qdrant_edge_py-0.9.0-cp310-abi3-win_amd64.whl", hash = "sha256:78bafbe31a7f24a6e8428626b37408b4bbdf4c8a1e1044b102ace6a14d6b4d8c", size = 12624322, upload-time = "2026-10-22T12:55:02.48Z" },
 ]
 
 [[package]]

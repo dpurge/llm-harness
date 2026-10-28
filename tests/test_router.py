@@ -13,7 +13,6 @@ from pydantic import ValidationError
 
 from llm_harness.config import ConfigError, HarnessConfig, ModelConfig, ProviderConfig
 from llm_harness.router import ModelRouter, make_router_factory
-from llm_harness.session import ChatSession
 from llm_harness.store import CallRecord, Store
 from llm_harness.types import (
     ChatRequest,
@@ -826,34 +825,31 @@ async def test_seconds_come_from_the_injected_timer(tmp_path: Path):
     assert world.rows("seconds") == [(2.5,), (2.5,)]
 
 
-# --- ChatSession through the router ---------------------------------------
+# --- one turn through the router ------------------------------------------
 
 
-async def test_session_rolls_back_history_when_every_candidate_fails(tmp_path: Path):
+async def test_every_candidate_failing_ends_the_turn_with_one_error(tmp_path: Path):
     world = two_models(
         tmp_path,
         PerCallProvider(failing("connection")),
         PerCallProvider(failing("auth")),
     )
-    session = ChatSession(world.router("a"), "a-remote")
-    events = [e async for e in session.send("hello")]
+    events = await run(world.router("a"))
     assert isinstance(events[-1], ErrorEvent)
-    assert session.history == []
+    assert sum(isinstance(e, (Done, ErrorEvent)) for e in events) == 1
 
 
-async def test_session_keeps_history_after_a_fallback_ending_in_done(tmp_path: Path):
+async def test_a_fallback_ending_in_done_streams_switch_report_and_the_reply(
+    tmp_path: Path,
+):
     world = two_models(
         tmp_path, PerCallProvider(failing("connection")), PerCallProvider(OK)
     )
-    session = ChatSession(world.router("a"), "a-remote")
-    events = [e async for e in session.send("hello")]
+    events = await run(world.router("a"))
     assert any(isinstance(e, ModelSwitch) for e in events)
     assert any(isinstance(e, UsageReport) for e in events)
     assert isinstance(events[-1], Done)
-    assert session.history == [
-        Message(role="user", content="hello"),
-        Message(role="assistant", content="ok"),
-    ]
+    assert "".join(e.text for e in events if isinstance(e, TextDelta)) == "ok"
 
 
 # --- store problems and privacy -------------------------------------------
@@ -934,6 +930,38 @@ async def test_router_factory_builds_routers_for_a_model_and_manual_flag(
     assert a.requests[0].think is True
     automatic = factory(pick(world.config, "a"), False)
     assert isinstance(automatic, ModelRouter)
+
+
+@pytest.mark.parametrize(
+    ("tags_kwargs", "expected_model"),
+    [({}, "b"), ({"required_tags": frozenset({"orchestrator"})}, "c")],
+)
+async def test_router_factory_passes_required_tags_to_the_fallback_chain(
+    tmp_path: Path, tags_kwargs: dict[str, Any], expected_model: str
+):
+    world = World(
+        tmp_path,
+        {
+            "a": PerCallProvider(failing("connection")),
+            "b": PerCallProvider(OK),
+            "c": PerCallProvider(OK),
+        },
+        model_dict("a", 9, "chat", "default"),
+        model_dict("b", 5, "chat"),
+        model_dict("c", 1, "orchestrator"),
+    )
+    factory = make_router_factory(
+        world.config,
+        world.factory,
+        None,
+        world.store,
+        clock=world.clock,
+        timer=world.timer,
+        **tags_kwargs,
+    )
+    events = await run(factory(pick(world.config, "a"), False))  # type: ignore[arg-type]
+    switches = [e for e in events if isinstance(e, ModelSwitch)]
+    assert [s.to_model_id for s in switches] == [expected_model]
 
 
 def test_new_events_are_frozen_and_reject_extra_fields():

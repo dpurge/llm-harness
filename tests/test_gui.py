@@ -5,6 +5,7 @@ server sends (element types and text props), not how the page looks.
 """
 
 import asyncio
+import inspect
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -19,18 +20,20 @@ from llm_harness.config import ConfigError, HarnessConfig, ProviderConfig
 from llm_harness.gui.app import register_page, run_gui
 from llm_harness.gui.security import LoopbackOnlyMiddleware
 from llm_harness.markdown_render import sanitize_html
+from llm_harness.orchestrator import Orchestrator
 from llm_harness.redact import REDACTED
-from llm_harness.session import ChatSession
 from llm_harness.store import Store
 from llm_harness.types import (
     Done,
     ErrorEvent,
+    StatusEvent,
     StreamEvent,
     TextDelta,
     ThinkingDelta,
     Usage,
     UsageEvent,
 )
+from tests.fake_steps import ScriptedSteps, as_step_reply, reply_events
 from tests.fakes import ScriptedProvider, router_factory_for
 
 CONFIG = HarnessConfig.model_validate(
@@ -79,7 +82,7 @@ MISSING_KEY_MESSAGE = "environment variable MISSING_KEY is not set"
 
 class RecordingProvider(ScriptedProvider):
     def __init__(self, events: list[StreamEvent], **kwargs: Any) -> None:
-        super().__init__(events, **kwargs)
+        super().__init__(as_step_reply(events), **kwargs)
         self.close_calls = 0
 
     async def aclose(self) -> None:
@@ -103,6 +106,18 @@ class Factory:
 
 
 CANARY = "sk-CANARY-123456789"
+RESPOND_HELLO = {"type": "respond", "text": "Hello"}
+ASK_FILE = {"type": "ask_user", "question": "Which file?"}
+
+
+class StepFactory:
+    """One ScriptedSteps provider serving full step replies, for every model."""
+
+    def __init__(self, scripts: list[list[StreamEvent]]) -> None:
+        self.provider = ScriptedSteps(scripts)
+
+    def __call__(self, config: ProviderConfig) -> ScriptedSteps:
+        return self.provider
 
 
 class BoomFactory(Factory):
@@ -154,16 +169,16 @@ def middleware_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, dict]]:
 
 
 @pytest.fixture
-def sessions(monkeypatch: pytest.MonkeyPatch) -> list[ChatSession]:
-    """Every ChatSession the page builds, in creation order."""
-    created: list[ChatSession] = []
+def orchestrators(monkeypatch: pytest.MonkeyPatch) -> list[Orchestrator]:
+    """Every Orchestrator the page builds, in creation order."""
+    created: list[Orchestrator] = []
 
-    class RecordingSession(ChatSession):
+    class RecordingOrchestrator(Orchestrator):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             created.append(self)
 
-    monkeypatch.setattr(gui_app, "ChatSession", RecordingSession)
+    monkeypatch.setattr(gui_app, "Orchestrator", RecordingOrchestrator)
     return created
 
 
@@ -296,7 +311,12 @@ async def test_thinking_is_in_a_collapsed_expansion_not_in_the_reply(
     await open_chat(user, factory)
     await send(user, "hi")
     with user.client:
-        (expansion,) = ElementFilter(kind=ui.expansion, local_scope=False)
+        # Only the chat log: the State and Trace tabs have expansions of their own.
+        (expansion,) = [
+            child
+            for child in widget(user, "log").descendants()
+            if isinstance(child, ui.expansion)
+        ]
     assert expansion.props["label"] == "Thinking"
     assert expansion.value is False
     (thinking,) = elements(user, "thinking")
@@ -309,21 +329,26 @@ async def test_thinking_is_in_a_collapsed_expansion_not_in_the_reply(
 async def test_no_expansion_without_thinking_deltas(user: User) -> None:
     await open_chat(user, Factory(REPLY))
     await send(user, "hi")
-    await user.should_not_see(kind=ui.expansion)
+    with user.client:
+        assert not [
+            child
+            for child in widget(user, "log").descendants()
+            if isinstance(child, ui.expansion)
+        ]
 
 
 async def test_usage_line_follows_the_reply(user: User) -> None:
     usage = UsageEvent(usage=Usage(input_tokens=3, output_tokens=7))
     await open_chat(user, Factory([*REPLY[:-1], usage, REPLY[-1]]))
     await send(user, "hi")
-    echo, reply, usage_line = log_texts(user)
-    assert (echo, reply) == ("you: hi", para("Hello"))
+    echo, status, reply, usage_line = log_texts(user)
+    assert (echo, status, reply) == ("you: hi", "step 1: answering", para("Hello"))
     assert usage_line.startswith("[m1 tokens in=3 out=7 $0.00 ")
     assert usage_line.endswith("s | session $0.00]")
 
 
 async def test_error_event_shows_an_error_block_and_restores_the_input(
-    user: User, sessions: list[ChatSession]
+    user: User, orchestrators: list[Orchestrator]
 ) -> None:
     factory = Factory(
         [TextDelta(text="par"), ErrorEvent(kind="connection", message="boom")]
@@ -333,23 +358,76 @@ async def test_error_event_shows_an_error_block_and_restores_the_input(
     assert texts(user, "error") == ["error (connection): boom"]
     assert widget(user, "prompt").value == "hi"
     assert widget(user, "prompt").enabled
-    assert sessions[0].history == []
+    assert orchestrators[0].has_completed_turn is False
 
 
 async def test_stop_cancels_the_turn_and_restores_the_input(
-    user: User, sessions: list[ChatSession]
+    user: User, orchestrators: list[Orchestrator]
 ) -> None:
-    factory = Factory([TextDelta(text="par"), *REPLY], hang_after=1)
+    factory = Factory([ThinkingDelta(text="par"), *REPLY], hang_after=1)
     await open_chat(user, factory)
     user.find(marker="prompt").type("hi").trigger("keydown.enter")
-    await wait_for(lambda: replies(user) == [para("par")])
+    await wait_for(lambda: texts(user, "thinking") == ["par"])
     user.find(marker="stop").click()
     await wait_for(lambda: widget(user, "prompt").enabled)
     assert texts(user, "note") == ["cancelled"]
     assert widget(user, "prompt").value == "hi"
     assert not widget(user, "stop").enabled
-    assert sessions[0].history == []
+    assert orchestrators[0].has_completed_turn is False
     assert factory.providers[0].closed
+
+
+def spy_on_prompt_methods(user: User) -> list[tuple[str, bool]]:
+    """Record each "focus" call on the prompt: (name, was the prompt enabled).
+
+    Other `run_method` calls (NiceGUI's own `updateValue`) are not what is pinned.
+    """
+    prompt = widget(user, "prompt")
+    calls: list[tuple[str, bool]] = []
+
+    def record(name: str, *args: Any, **kwargs: Any) -> None:
+        if name == "focus":
+            calls.append((name, prompt.enabled))
+
+    prompt.run_method = record
+    return calls
+
+
+async def test_prompt_is_focused_once_after_a_normal_turn(user: User) -> None:
+    await open_chat(user, Factory(REPLY))
+    calls = spy_on_prompt_methods(user)
+    await send(user, "hi")
+    assert calls == [("focus", True)]
+
+
+async def test_prompt_is_focused_once_after_an_error(user: User) -> None:
+    factory = Factory([ErrorEvent(kind="connection", message="boom")])
+    await open_chat(user, factory)
+    calls = spy_on_prompt_methods(user)
+    await send(user, "hi")
+    assert calls == [("focus", True)]
+
+
+async def test_prompt_is_focused_once_after_stop(user: User) -> None:
+    await open_chat(user, Factory([ThinkingDelta(text="par"), *REPLY], hang_after=1))
+    calls = spy_on_prompt_methods(user)
+    user.find(marker="prompt").type("hi").trigger("keydown.enter")
+    await wait_for(lambda: texts(user, "thinking") == ["par"])
+    assert calls == []
+    user.find(marker="stop").click()
+    await wait_for(lambda: widget(user, "prompt").enabled)
+    assert calls == [("focus", True)]
+
+
+async def test_prompt_is_not_focused_when_the_page_is_closed(user: User) -> None:
+    factory = Factory(REPLY, hang_after=0)
+    await open_chat(user, factory)
+    calls = spy_on_prompt_methods(user)
+    user.find(marker="prompt").type("hi").trigger("keydown.enter")
+    await wait_for(lambda: not widget(user, "prompt").enabled)
+    user.client.delete()
+    await wait_for(lambda: factory.providers[0].close_calls == 1)
+    assert calls == []
 
 
 async def test_controls_are_disabled_during_a_turn_and_enabled_after(
@@ -379,25 +457,41 @@ async def test_input_is_enabled_again_after_a_normal_turn(user: User) -> None:
 # History and the think flag
 
 
-async def test_turn_two_carries_the_whole_history(user: User) -> None:
+def request_text(request) -> str:
+    return "\n".join(m.content for m in request.messages)
+
+
+async def test_the_page_never_sends_a_transcript_only_state(user: User) -> None:
+    first = f"remember {CANARY}"
     factory = Factory(REPLY)
+    await open_chat(user, factory)
+    await send(user, first)
+    await send(user, "two")
+    requests = factory.providers[0].requests
+    assert [m.role for m in requests[-1].messages] == ["system", "user"]
+    assert CANARY in request_text(requests[0])
+    assert CANARY not in request_text(requests[1])
+    assert "Hello" not in request_text(requests[1])
+
+
+async def test_text_kept_in_the_state_is_sent_again_on_the_next_turn(
+    user: User,
+) -> None:
+    kept = {"findings": {"$append": [{"text": CANARY, "source": "user"}]}}
+    reply = reply_events(RESPOND_HELLO, {"goal": "g", **kept})
+    factory = StepFactory([reply, reply_events(RESPOND_HELLO)])
     await open_chat(user, factory)
     await send(user, "one")
     await send(user, "two")
-    messages = factory.providers[0].requests[-1].messages
-    assert [(m.role, m.content) for m in messages] == [
-        ("user", "one"),
-        ("assistant", "Hello"),
-        ("user", "two"),
-    ]
+    assert CANARY in request_text(factory.provider.requests[1])
 
 
-async def test_thinking_is_not_added_to_history(
-    user: User, sessions: list[ChatSession]
-) -> None:
-    await open_chat(user, Factory([ThinkingDelta(text="secret"), *REPLY]))
-    await send(user, "hi")
-    assert [m.content for m in sessions[0].history] == ["hi", "Hello"]
+async def test_thinking_is_not_sent_again_on_the_next_turn(user: User) -> None:
+    factory = Factory([ThinkingDelta(text="secret-thought"), *REPLY])
+    await open_chat(user, factory)
+    await send(user, "one")
+    await send(user, "two")
+    assert "secret-thought" not in request_text(factory.providers[0].requests[1])
 
 
 @pytest.mark.parametrize("flag", [None, True, False])
@@ -428,6 +522,43 @@ async def test_selector_lists_exactly_the_models_yaml_names(user: User) -> None:
     assert select.value == "m1"
 
 
+EMBEDDING_CONFIG = HarnessConfig.model_validate(
+    {
+        "providers": {"local": {"type": "ollama", "base_url": "http://x"}},
+        "models": [
+            {
+                "id": "bge-m3-local",
+                "name": "BGE M3",
+                "provider": "local",
+                "model": "bge-m3",
+                "tags": ["embedding"],
+                "priority": 1,
+            },
+            {
+                "id": "chat1",
+                "name": "Chat One",
+                "provider": "local",
+                "model": "chat-model",
+                "tags": ["default"],
+                "priority": 1,
+            },
+        ],
+    }
+)
+
+
+async def test_selector_hides_embedding_models(user: User) -> None:
+    chat = EMBEDDING_CONFIG.models[1]
+    register_page(
+        EMBEDDING_CONFIG,
+        chat,
+        router_factory_for(EMBEDDING_CONFIG, Factory(REPLY)),
+        False,
+    )
+    await user.open("/")
+    assert widget(user, "model").options == {"chat1": "Chat One"}
+
+
 async def test_selector_starts_on_the_initial_model(user: User) -> None:
     factory = Factory(REPLY)
     await open_chat(user, factory, model=MODEL_2)
@@ -456,13 +587,13 @@ async def test_selector_with_history_notifies_and_keeps_the_session_until_new_ch
 ) -> None:
     factory = Factory(REPLY)
     await open_chat(user, factory)
-    await send(user, "one")
+    await send(user, f"one {CANARY}")
     choose(user, "m2")
     await wait_for(lambda: "applies to the next new chat" in user.notify.messages)
     assert len(factory.providers) == 1
     await send(user, "two")
     assert factory.providers[0].requests[-1].model == "provider-model-1"
-    assert len(factory.providers[0].requests[-1].messages) == 3
+    assert len(factory.providers[0].requests[-1].messages) == 2
 
     user.find(marker="new-chat").click()
     await wait_for(lambda: len(factory.providers) == 2)
@@ -471,17 +602,20 @@ async def test_selector_with_history_notifies_and_keeps_the_session_until_new_ch
     await send(user, "three")
     request = factory.providers[1].requests[-1]
     assert request.model == "provider-model-2"
-    assert [m.content for m in request.messages] == ["three"]
+    assert "three" in request_text(request)
+    assert CANARY not in request_text(request)
 
 
 async def test_new_chat_with_the_same_model_starts_a_fresh_history(user: User) -> None:
     factory = Factory(REPLY)
     await open_chat(user, factory)
-    await send(user, "one")
+    await send(user, f"one {CANARY}")
     user.find(marker="new-chat").click()
     await wait_for(lambda: len(factory.providers) == 2)
     await send(user, "two")
-    assert [m.content for m in factory.providers[1].requests[-1].messages] == ["two"]
+    request = factory.providers[1].requests[-1]
+    assert "two" in request_text(request)
+    assert CANARY not in request_text(request)
 
 
 async def test_config_error_on_selector_change_is_shown_and_reverted(
@@ -511,7 +645,7 @@ async def test_config_error_on_new_chat_keeps_the_session_and_the_log(
     assert texts(user, "user") == ["you: one"]
     assert factory.providers[0].close_calls == 0
     await send(user, "two")
-    assert len(factory.providers[0].requests[-1].messages) == 3
+    assert len(factory.providers[0].requests[-1].messages) == 2
 
 
 async def test_a_failing_initial_model_shows_an_error_and_recovers(user: User) -> None:
@@ -531,7 +665,7 @@ async def test_a_failing_initial_model_shows_an_error_and_recovers(user: User) -
 
 
 async def test_unexpected_stream_exception_is_one_masked_line_and_the_page_goes_on(
-    user: User, sessions: list[ChatSession]
+    user: User, orchestrators: list[Orchestrator]
 ) -> None:
     factory = FlakyFactory()
     await open_chat(user, factory)
@@ -544,9 +678,9 @@ async def test_unexpected_stream_exception_is_one_masked_line_and_the_page_goes_
     assert widget(user, "prompt").value == "hello"
     assert widget(user, "prompt").enabled
     assert widget(user, "send").enabled
-    assert sessions[0].history == []
+    assert orchestrators[0].has_completed_turn is False
     await send(user, "again")
-    assert replies(user) == [para("par"), para("Hello")]
+    assert replies(user) == [para("Hello")]
     assert widget(user, "prompt").value == ""
 
 
@@ -569,7 +703,7 @@ async def test_unexpected_provider_factory_exception_keeps_the_current_session(
     assert widget(user, "prompt").enabled
     assert factory.providers[0].close_calls == 0
     await send(user, "second")
-    assert len(factory.providers[0].requests[-1].messages) == 3
+    assert len(factory.providers[0].requests[-1].messages) == 2
 
 
 async def test_unexpected_factory_exception_on_the_first_model_is_shown_too(
@@ -774,6 +908,130 @@ async def test_control_characters_are_stripped_from_error_messages(user: User) -
     assert texts(user, "error") == ["error (bad_request): a[31mbc"]
 
 
+# Status lines, ask_user and the selector lock
+
+
+class HostileStatusOrchestrator:
+    """Yields one StatusEvent whose text is full of markup and control characters."""
+
+    TEXT = f"{SCRIPT}{BOLD}**x**[b]y[/b]\x1b[31m\x07z"
+    CLEAN = f"{SCRIPT}{BOLD}**x**[b]y[/b][31mz"
+
+    def __init__(
+        self, router: Any, model: Any, user_id: str | None = None, storage: Any = None
+    ) -> None:
+        self.has_completed_turn = False
+        # What the State and Trace tabs read after each status event.
+        self.state = Orchestrator(router, model).state
+        self.pending_question = None
+        self.last_trace = None
+
+    async def send(self, text: str):
+        yield StatusEvent(step=2, action_type="respond", text=self.TEXT)
+        yield TextDelta(text="ok")
+        yield Done()
+
+
+async def test_a_status_event_is_one_muted_plain_label(user: User) -> None:
+    await open_chat(user, Factory(REPLY))
+    await send(user, "hi")
+    (line,) = elements(user, "status")
+    assert isinstance(line, ui.label)
+    assert line.text == "step 1: answering"
+    assert "innerHTML" not in line.props
+    assert "llm-secondary" in line.classes and "text-grey" in line.classes
+
+
+async def test_a_hostile_status_text_stays_literal_and_sanitised(
+    user: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gui_app, "Orchestrator", HostileStatusOrchestrator)
+    await open_chat(user, Factory(REPLY))
+    await send(user, "hi")
+    (line,) = elements(user, "status")
+    assert isinstance(line, ui.label)
+    assert line.text == f"step 2: {HostileStatusOrchestrator.CLEAN}"
+    assert "\x1b" not in line.text and "\x07" not in line.text
+    with user.client:
+        content_elements = [
+            e for e in user.client.elements.values() if isinstance(e, ContentElement)
+        ]
+        assert content_elements == elements(user, "reply")
+    await user.should_not_see(kind=ui.markdown)
+
+
+async def test_the_status_line_uses_the_same_size_classes_as_the_other_notes(
+    user: User,
+) -> None:
+    usage = UsageEvent(usage=Usage(input_tokens=3, output_tokens=7))
+    await open_chat(user, Factory([*REPLY[:-1], usage, REPLY[-1]]))
+    await send(user, "hi")
+    (status,) = elements(user, "status")
+    (usage_line,) = elements(user, "usage")
+    assert set(status.classes) == set(usage_line.classes)
+    assert {"llm-secondary", "text-grey", "whitespace-pre-wrap"} <= set(status.classes)
+    assert not [
+        c
+        for c in status.classes
+        if c.startswith(("max-w", "h-", "max-h", "text-xs", "text-sm", "text-caption"))
+    ]
+    assert "mx-auto" not in status.classes
+    # The shared secondary size is 16px (at least 15px) on an 18px base.
+    assert ".llm-secondary { font-size: 16px; }" in gui_app._PAGE_CSS
+    assert ".llm-page { font-size: 18px; }" in gui_app._PAGE_CSS
+
+
+async def test_the_status_line_code_uses_a_label_never_html_or_markdown() -> None:
+    source = inspect.getsource(gui_app.ChatPage._run_turn)
+    branch = source.split("isinstance(event, StatusEvent)")[1].split("elif")[0]
+    assert "self._show(" in branch and '"status"' in branch and "_DIM" in branch
+    assert "ui.html" not in branch and "ui.markdown" not in branch
+
+
+async def test_the_ask_user_question_is_shown_as_the_assistant_reply(
+    user: User,
+) -> None:
+    factory = StepFactory([reply_events(ASK_FILE, {"goal": "g"})])
+    await open_chat(user, factory)
+    await send(user, "fix it")
+    assert replies(user) == [para("Which file?")]
+    assert texts(user, "status") == ["step 1: asking the user"]
+    assert texts(user, "error") == []
+
+
+async def test_the_selector_stays_free_after_a_failed_first_turn(
+    user: User, orchestrators: list[Orchestrator]
+) -> None:
+    factory = Factory([ErrorEvent(kind="auth", message="bad key")])
+    await open_chat(user, factory)
+    await send(user, "hi")
+    assert orchestrators[0].has_completed_turn is False
+    choose(user, "m2")
+    await wait_for(lambda: len(factory.providers) == 2)
+    assert user.notify.messages == []
+
+
+async def test_the_selector_locks_after_a_completed_turn(
+    user: User, orchestrators: list[Orchestrator]
+) -> None:
+    factory = Factory(REPLY)
+    await open_chat(user, factory)
+    assert orchestrators[0].has_completed_turn is False
+    await send(user, "hi")
+    assert orchestrators[0].has_completed_turn is True
+    choose(user, "m2")
+    await wait_for(lambda: "applies to the next new chat" in user.notify.messages)
+    assert len(factory.providers) == 1
+
+
+async def test_an_ask_user_turn_also_locks_the_selector(
+    user: User, orchestrators: list[Orchestrator]
+) -> None:
+    await open_chat(user, StepFactory([reply_events(ASK_FILE, {"goal": "g"})]))
+    await send(user, "fix it")
+    assert orchestrators[0].has_completed_turn is True
+
+
 # Fallback notes, the usage line and the manual flag
 
 FALLBACK_CONFIG = HarnessConfig.model_validate(
@@ -924,8 +1182,8 @@ async def test_closing_the_page_closes_every_provider_the_router_built(
 # One session per client
 
 
-async def test_two_clients_have_separate_sessions_and_histories(
-    user: User, create_user: Callable[[], User], sessions: list[ChatSession]
+async def test_two_clients_have_separate_orchestrators_and_states(
+    user: User, create_user: Callable[[], User], orchestrators: list[Orchestrator]
 ) -> None:
     factory = Factory(REPLY)
     register_page(CONFIG, MODEL_1, router_factory_for(CONFIG, factory), False)
@@ -933,18 +1191,18 @@ async def test_two_clients_have_separate_sessions_and_histories(
     await user.open("/")
     await second.open("/")
     assert len(factory.providers) == 2
-    assert len(sessions) == 2 and sessions[0] is not sessions[1]
+    assert len(orchestrators) == 2 and orchestrators[0] is not orchestrators[1]
 
     await send(user, "from first")
-    assert [m.content for m in sessions[0].history] == ["from first", "Hello"]
-    assert sessions[1].history == []
+    assert orchestrators[0].has_completed_turn is True
+    assert orchestrators[1].has_completed_turn is False
     assert texts(second, "user") == []
 
     await send(second, "from second")
-    assert [m.content for m in sessions[1].history] == ["from second", "Hello"]
-    assert [m.content for m in sessions[0].history] == ["from first", "Hello"]
+    assert orchestrators[1].has_completed_turn is True
     request = factory.providers[1].requests[-1]
-    assert [m.content for m in request.messages] == ["from second"]
+    assert "from second" in request_text(request)
+    assert "from first" not in request_text(request)
     assert texts(user, "user") == ["you: from first"]
 
 
@@ -965,7 +1223,7 @@ async def test_deleting_the_client_closes_its_provider_only(
 
 
 async def test_deleting_the_client_during_a_turn_cancels_it_and_closes_the_provider(
-    user: User, sessions: list[ChatSession]
+    user: User, orchestrators: list[Orchestrator]
 ) -> None:
     factory = Factory(REPLY, hang_after=0)
     await open_chat(user, factory)
@@ -974,7 +1232,7 @@ async def test_deleting_the_client_during_a_turn_cancels_it_and_closes_the_provi
     user.client.delete()
     await wait_for(lambda: factory.providers[0].close_calls == 1)
     assert factory.providers[0].closed
-    assert sessions[0].history == []
+    assert orchestrators[0].has_completed_turn is False
 
 
 # /quit
@@ -990,7 +1248,7 @@ def shutdowns(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
 
 @pytest.mark.parametrize("command", ["/quit", " /QUIT "])
 async def test_quit_shuts_down_without_a_model_call(
-    user: User, shutdowns: list[bool], sessions: list[ChatSession], command: str
+    user: User, shutdowns: list[bool], orchestrators: list[Orchestrator], command: str
 ) -> None:
     factory = Factory(REPLY)
     await open_chat(user, factory)
@@ -998,13 +1256,13 @@ async def test_quit_shuts_down_without_a_model_call(
     await wait_for(lambda: shutdowns == [True])
     assert "Shutting down" in user.notify.messages
     assert factory.providers[0].requests == []
-    assert sessions[0].history == []
+    assert orchestrators[0].has_completed_turn is False
     assert texts(user, "user") == []
     assert widget(user, "prompt").value == ""
 
 
 async def test_quit_while_a_turn_hangs_cancels_it_then_shuts_down(
-    user: User, shutdowns: list[bool], sessions: list[ChatSession]
+    user: User, shutdowns: list[bool], orchestrators: list[Orchestrator]
 ) -> None:
     factory = Factory(REPLY, hang_after=0)
     await open_chat(user, factory)
@@ -1017,7 +1275,7 @@ async def test_quit_while_a_turn_hangs_cancels_it_then_shuts_down(
         await page._on_send()
     assert factory.providers[0].closed
     assert shutdowns == [True]
-    assert sessions[0].history == []
+    assert orchestrators[0].has_completed_turn is False
     assert widget(user, "prompt").value == ""
 
 
@@ -1149,3 +1407,45 @@ async def test_a_deleted_client_is_no_longer_tracked(user: User) -> None:
     assert len(gui_app._open_pages) == 1
     user.client.delete()
     await wait_for(lambda: not gui_app._open_pages)
+
+
+class SpyStorage:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+async def test_run_gui_closes_the_storage_after_the_pages_on_shutdown(
+    user: User, monkeypatch: pytest.MonkeyPatch, middleware_calls: list
+) -> None:
+    storage = SpyStorage()
+    handlers: list[Any] = []
+    monkeypatch.setattr(ui, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app, "on_shutdown", handlers.append)
+    run_gui(
+        CONFIG,
+        MODEL_1,
+        router_factory_for(CONFIG, Factory(REPLY)),
+        False,
+        storage=storage,  # type: ignore[arg-type]
+    )
+    assert handlers == [gui_app._close_open_pages, storage.close]
+    await handlers[1]()
+    assert storage.close_calls == 1
+
+
+async def test_the_page_orchestrator_gets_the_storage(
+    user: User, orchestrators: list[Orchestrator]
+) -> None:
+    storage = SpyStorage()
+    register_page(
+        CONFIG,
+        MODEL_1,
+        router_factory_for(CONFIG, Factory(REPLY)),
+        False,
+        storage,  # type: ignore[arg-type]
+    )
+    await user.open("/")
+    assert orchestrators[0]._storage is storage

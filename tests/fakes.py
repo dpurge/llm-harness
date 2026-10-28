@@ -1,9 +1,10 @@
-"""Test doubles shared by session and adapter tests."""
+"""Test doubles shared by adapter, router, front-end and live tests."""
 
 import asyncio
 from collections.abc import AsyncIterator
 
 from llm_harness.config import HarnessConfig, ModelConfig
+from llm_harness.embeddings import EmbeddingError
 from llm_harness.providers import ProviderFactory
 from llm_harness.providers.base import ChatProvider
 from llm_harness.router import RouterFactory, make_router_factory
@@ -12,6 +13,7 @@ from llm_harness.types import (
     ChatRequest,
     Done,
     ErrorEvent,
+    Message,
     ModelSwitch,
     Notice,
     StreamEvent,
@@ -73,6 +75,16 @@ def router_factory_for(
     )
 
 
+async def single_turn(
+    provider: ChatProvider, model: str, text: str, *, think: bool | None = None
+) -> list[StreamEvent]:
+    """One user message straight through a provider: no history, no orchestrator."""
+    request = ChatRequest(
+        model=model, messages=[Message(role="user", content=text)], think=think
+    )
+    return [event async for event in provider.stream_chat(request)]
+
+
 def assert_stream_contract(events: list[StreamEvent]) -> None:
     """Assert the adapter contract, plus the router's extra events.
 
@@ -104,3 +116,26 @@ def assert_stream_contract(events: list[StreamEvent]) -> None:
         assert reports[0] == len(body) - 1, "usage report must be just before terminal"
     if usages:
         assert usages[0] == len(body) - 1 - len(reports), "usage must come last"
+
+
+class FakeEmbedder:
+    """Deterministic EmbeddingProvider: vector i of a text is built from its
+    length and position; records calls; can be scripted to raise."""
+
+    def __init__(self, *, size: int = 4, raises: EmbeddingError | None = None) -> None:
+        self.size = size
+        self.raises = raises
+        self.calls: list[tuple[str, list[str], int | None]] = []
+        self.closed = False
+
+    async def embed(
+        self, model: str, texts: list[str], dimensions: int | None
+    ) -> list[list[float]]:
+        self.calls.append((model, list(texts), dimensions))
+        if self.raises is not None:
+            raise self.raises
+        size = dimensions if dimensions is not None else self.size
+        return [[float(len(text) + i) for i in range(size)] for text in texts]
+
+    async def aclose(self) -> None:
+        self.closed = True

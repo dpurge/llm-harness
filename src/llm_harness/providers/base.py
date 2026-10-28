@@ -19,3 +19,20 @@ class ChatProvider(Protocol):
     def stream_chat(self, req: ChatRequest) -> AsyncIterator[StreamEvent]: ...
 
     async def aclose(self) -> None: ...
+
+
+class EmbeddingProvider(Protocol):
+    """Turns texts into vectors; separate from ChatProvider so an adapter can
+    offer either.
+
+    Contract: one vector per input text, in input order. `dimensions` is
+    passed to the SDK only when not None. Adapters raise EmbeddingError (typed
+    ErrorKind, redacted message) for SDK failures; programming errors still
+    raise.
+    """
+
+    async def embed(
+        self, model: str, texts: list[str], dimensions: int | None
+    ) -> list[list[float]]: ...
+
+    async def aclose(self) -> None: ...

@@ -12,6 +12,7 @@ from llm_harness.routing import BackoffEntry
 from llm_harness.store import CallRecord, Store, default_db_path
 
 T0 = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)
+LEDGER_TABLES = {"llm_calls", "model_backoff", "schema_versions"}
 
 
 def call(model_id: str = "m", **fields) -> CallRecord:
@@ -61,9 +62,9 @@ def test_constructor_does_not_touch_the_disk(db: Path):
 def test_first_use_creates_directory_file_and_schema(db: Path):
     assert Store(db).backoff_entries() == {}
     assert db.is_file()
-    assert query(db, "PRAGMA user_version") == [(1,)]
+    assert query(db, "SELECT * FROM schema_versions") == [("ledger", 1)]
     tables = query(db, "SELECT name FROM sqlite_master WHERE type = 'table'")
-    assert {name for (name,) in tables} == {"llm_calls", "model_backoff"}
+    assert {name for (name,) in tables} == LEDGER_TABLES
     columns = query(db, "SELECT name FROM pragma_table_info('llm_calls')")
     assert [name for (name,) in columns] == [
         "id",
@@ -221,7 +222,7 @@ def test_two_first_time_openers_both_work(db: Path):
         [lambda s=s, i=i: fail(s, model_id=f"m{i}") for i, s in enumerate(stores)]
     )
     assert set(stores[0].backoff_entries()) == {"m0", "m1"}
-    assert query(db, "PRAGMA user_version") == [(1,)]
+    assert query(db, "SELECT * FROM schema_versions") == [("ledger", 1)]
 
 
 def test_a_second_store_on_the_same_file_sees_the_data(db: Path):
@@ -292,7 +293,7 @@ def test_injection_in_a_model_id_is_stored_literally(db: Path):
     assert store.backoff_entries()[evil].failures == 1
     assert query(db, "SELECT model_id FROM llm_calls") == [(evil,)]
     tables = query(db, "SELECT name FROM sqlite_master WHERE type = 'table'")
-    assert {name for (name,) in tables} == {"llm_calls", "model_backoff"}
+    assert {name for (name,) in tables} == LEDGER_TABLES
 
 
 GARBAGE = bytes(range(256)) * 16
@@ -360,3 +361,118 @@ def test_notice_names_only_the_exception_type_not_its_message(db: Path):
     notice = store.pop_notice()
     assert notice is not None
     assert "not a database" not in notice
+
+
+# The ledger schema exactly as shipped before `schema_versions` existed; copied
+# literally so a change to `_MIGRATIONS` cannot silently change this fixture.
+OLD_LLM_CALLS = """CREATE TABLE llm_calls (
+            id INTEGER PRIMARY KEY,
+            time TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            input_tokens INTEGER NULL,
+            output_tokens INTEGER NULL,
+            reasoning_tokens INTEGER NULL,
+            cost_usd REAL NULL,
+            seconds REAL NOT NULL,
+            outcome TEXT NOT NULL CHECK(outcome IN ('ok','error','cancelled')),
+            error_kind TEXT NULL,
+            fallback_from TEXT NULL
+        )"""
+OLD_MODEL_BACKOFF = """CREATE TABLE model_backoff (
+            model_id TEXT PRIMARY KEY,
+            failures INTEGER NOT NULL,
+            until TEXT NOT NULL
+        )"""
+
+
+def write_old_format_file(db: Path, user_version: int = 1) -> None:
+    db.parent.mkdir(exist_ok=True)
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute(OLD_LLM_CALLS)
+        conn.execute(OLD_MODEL_BACKOFF)
+        conn.executemany(
+            "INSERT INTO llm_calls (time, model_id, provider_id, input_tokens, "
+            "output_tokens, reasoning_tokens, cost_usd, seconds, outcome, "
+            "error_kind, fallback_from) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("2026-10-27T12:00:00.000000+00:00", "m1", "p", 1, 2, 3, 0.5, 1.5)
+                + ("ok", None, "m0"),
+                ("2026-10-27T12:01:00.000000+00:00", "m2", "p", None, None, None)
+                + (None, 0.1, "error", "connection", None),
+                ("2026-10-27T12:02:00.000000+00:00", "m1", "q", 7, 8, None)
+                + (1.25, 2.0, "cancelled", None, "m2"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO model_backoff VALUES (?, ?, ?)",
+            [
+                ("m2", 3, "2026-10-27T12:04:00.000000+00:00"),
+                ("m9", 1, "2026-10-27T12:05:00.000000+00:00"),
+            ],
+        )
+        conn.execute(f"PRAGMA user_version = {user_version}")
+        conn.commit()
+
+
+def ledger_rows(db: Path) -> tuple[list[tuple], list[tuple]]:
+    return (
+        query(db, "SELECT * FROM llm_calls ORDER BY id"),
+        query(db, "SELECT * FROM model_backoff ORDER BY model_id"),
+    )
+
+
+def test_an_old_populated_file_is_adopted_without_touching_its_rows(db: Path):
+    write_old_format_file(db)
+    before = ledger_rows(db)
+    assert len(before[0]) == 3 and len(before[1]) == 2
+    assert set(Store(db).backoff_entries()) == {"m2", "m9"}
+    assert ledger_rows(db) == before
+    assert query(db, "SELECT * FROM schema_versions") == [("ledger", 1)]
+    # Additive: an older build still finds the version it expects.
+    assert query(db, "PRAGMA user_version") == [(1,)]
+    tables = query(db, "SELECT name FROM sqlite_master WHERE type = 'table'")
+    assert {name for (name,) in tables} == LEDGER_TABLES
+
+
+def test_reopening_an_adopted_file_is_a_no_op(db: Path):
+    write_old_format_file(db)
+    Store(db).backoff_entries()
+    before = (ledger_rows(db), query(db, "SELECT * FROM schema_versions"))
+    store = Store(db)
+    assert store.backoff_entries() != {}
+    assert (ledger_rows(db), query(db, "SELECT * FROM schema_versions")) == before
+    assert store.pop_notice() is None
+
+
+def test_an_adopted_file_accepts_new_writes(db: Path):
+    write_old_format_file(db)
+    before = ledger_rows(db)[0]
+    fail(Store(db), model_id="m3")
+    assert ledger_rows(db)[0][:3] == before
+    assert len(ledger_rows(db)[0]) == 4
+
+
+def test_a_legacy_user_version_too_new_disables_the_store(db: Path):
+    write_old_format_file(db, user_version=5)
+    before = ledger_rows(db)
+    assert_disabled_with_one_notice(Store(db), db, "SchemaTooNewError")
+    assert ledger_rows(db) == before
+    assert query(db, "PRAGMA user_version") == [(5,)]
+
+
+def test_two_stores_adopting_an_old_file_at_once_both_work(db: Path):
+    write_old_format_file(db)
+    before = ledger_rows(db)
+    stores = [Store(db), Store(db)]
+    run_in_threads([lambda s=s: s.backoff_entries() for s in stores])
+    assert all(s.pop_notice() is None for s in stores)
+    assert ledger_rows(db) == before
+    assert query(db, "SELECT * FROM schema_versions") == [("ledger", 1)]
+
+
+def test_schema_too_new_error_is_importable_from_the_store_module():
+    from llm_harness.storage.relational import SchemaTooNewError
+    from llm_harness.store import SchemaTooNewError as reexported
+
+    assert reexported is SchemaTooNewError

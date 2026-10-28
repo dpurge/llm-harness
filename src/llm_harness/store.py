@@ -2,10 +2,9 @@
 
 Synchronous on purpose; async callers use `asyncio.to_thread`. Only ids, token
 counts, costs, times and error kinds are stored, never prompts, replies, error
-messages or keys. This module owns the database's `PRAGMA user_version`.
+messages or keys. Runs on `SqliteRelationalStore` as the `ledger` namespace.
 """
 
-import os
 import sqlite3
 import threading
 from contextlib import closing
@@ -14,13 +13,22 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
+from llm_harness.config import default_data_dir
 from llm_harness.routing import BackoffEntry, backoff_delay
+from llm_harness.storage.relational import (
+    Migration,
+    SchemaTooNewError,
+    SqliteRelationalStore,
+)
+
+__all__ = ["SchemaTooNewError"]  # re-exported: it moved to storage.relational
 
 BackoffAction = Literal["fail", "reset", "keep"]
 
-# Entry i upgrades user_version i to i + 1. One statement per element because
-# `execute` runs a single statement and `executescript` would end our transaction.
-_MIGRATIONS: tuple[tuple[str, ...], ...] = (
+# Entry i upgrades ledger version i to i + 1. Files written before schema_versions
+# existed carry the version in `PRAGMA user_version`; `migrate_sync` adopts it
+# (additively: it only records the row and leaves user_version untouched).
+_MIGRATIONS: tuple[Migration, ...] = (
     (
         """CREATE TABLE llm_calls (
             id INTEGER PRIMARY KEY,
@@ -43,12 +51,12 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         )""",
     ),
 )
-_KNOWN_VERSION = len(_MIGRATIONS)
-_BUSY_TIMEOUT_SECONDS = 5
+_NAMESPACE = "ledger"
 
 
-class SchemaTooNewError(Exception):
-    """The database was written by a newer version of this program."""
+def expected_schema_versions() -> dict[str, int]:
+    """The schema version this build expects per namespace, for read-only diagnostics."""
+    return {_NAMESPACE: len(_MIGRATIONS)}
 
 
 @dataclass(frozen=True)
@@ -67,7 +75,7 @@ class CallRecord:
 
 
 def default_db_path() -> Path:
-    return Path.home() / ".local" / "share" / "llm-harness" / "harness.db"
+    return default_data_dir() / "harness.db"
 
 
 def _iso(moment: datetime) -> str:
@@ -83,8 +91,9 @@ def _parse(text: str) -> datetime:
 class Store:
     def __init__(self, path: Path) -> None:
         self._path = path
+        self._relational = SqliteRelationalStore(path)
         self._lock = threading.Lock()  # guards the three fields below
-        self._prepared = False
+        self._migrated = False
         self._disabled = False
         self._notice: str | None = None
 
@@ -151,55 +160,16 @@ class Store:
             )
 
     def _connect(self) -> sqlite3.Connection:
-        self._prepare_files()
-        conn = sqlite3.connect(
-            self._path, timeout=_BUSY_TIMEOUT_SECONDS, isolation_level=None
-        )
-        try:
-            self._migrate(conn)
-        except BaseException:
-            conn.close()
-            raise
-        return conn
-
-    def _prepare_files(self) -> None:
         with self._lock:
-            if self._prepared:
-                return
-        directory = self._path.parent
-        os.makedirs(directory, mode=0o700, exist_ok=True)
-        os.chmod(directory, 0o700)
-        # Create the file ourselves so it never exists with a looser mode.
-        os.close(os.open(self._path, os.O_CREAT | os.O_WRONLY, 0o600))
-        os.chmod(self._path, 0o600)
-        with self._lock:
-            self._prepared = True
-
-    @staticmethod
-    def _user_version(conn: sqlite3.Connection) -> int:
-        return conn.execute("PRAGMA user_version").fetchone()[0]
-
-    def _migrate(self, conn: sqlite3.Connection) -> None:
-        version = self._user_version(conn)
-        if version > _KNOWN_VERSION:
-            raise SchemaTooNewError(f"user_version {version}")
-        if version == _KNOWN_VERSION:
-            return
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            # Another process may have migrated while we waited for the lock.
-            version = self._user_version(conn)
-            if version > _KNOWN_VERSION:
-                raise SchemaTooNewError(f"user_version {version}")
-            for index in range(version, _KNOWN_VERSION):
-                for statement in _MIGRATIONS[index]:
-                    conn.execute(statement)
-                # PRAGMA takes no bound parameters; `index` is our own int.
-                conn.execute(f"PRAGMA user_version = {index + 1}")
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
-        conn.execute("COMMIT")
+            migrated = self._migrated
+        if not migrated:
+            # Concurrent first callers may both migrate; the second is a no-op.
+            self._relational.migrate_sync(
+                _NAMESPACE, _MIGRATIONS, adopt_user_version=True
+            )
+            with self._lock:
+                self._migrated = True
+        return self._relational.connect_sync()
 
     @staticmethod
     def _insert_call(conn: sqlite3.Connection, call: CallRecord) -> None:

@@ -4,9 +4,9 @@ import argparse
 import asyncio
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import TextIO
+from typing import Protocol, TextIO
 
 from llm_harness import store as store_module
 from llm_harness.config import (
@@ -19,23 +19,28 @@ from llm_harness.config import (
     MissingConfigError,
     ModelConfig,
     default_config_dir,
+    default_data_dir,
     load_config,
     permission_warnings,
     resolve_think,  # noqa: F401 - still importable from here
-    select_model,
+    select_orchestrator_model,
     write_examples,
 )
 from llm_harness.display import format_switch, format_usage_report, sanitize_text
+from llm_harness.orchestrator import Orchestrator
 from llm_harness.providers import ProviderFactory, build_provider
 from llm_harness.providers.base import ChatProvider
 from llm_harness.router import RouterFactory, make_router_factory
-from llm_harness.session import ChatSession
+from llm_harness.storage import Storage, open_storage
+from llm_harness.storage.status import storage_status
 from llm_harness.store import Store
 from llm_harness.types import (
     Done,
     ErrorEvent,
     ModelSwitch,
     Notice,
+    StatusEvent,
+    StreamEvent,
     TextDelta,
     ThinkingDelta,
     UsageReport,
@@ -47,9 +52,28 @@ _EXAMPLE_TEXT = {CONFIG_FILE: EXAMPLE_CONFIG_TOML, MODELS_FILE: EXAMPLE_MODELS_Y
 _EXIT_COMMANDS = frozenset({"/exit", "/quit"})
 
 # (config, initial model, router factory, was --model given) -> exit code
-TuiRunner = Callable[[HarnessConfig, ModelConfig, RouterFactory, bool], int]
+
+
+class TuiRunner(Protocol):
+    def __call__(
+        self,
+        config: HarnessConfig,
+        model: ModelConfig,
+        router_factory: RouterFactory,
+        is_manual: bool,
+        *,
+        storage: Storage | None = None,
+    ) -> int: ...
+
+
 # The web GUI runner has the same shape as the terminal UI runner.
 GuiRunner = TuiRunner
+
+
+class _Sender(Protocol):
+    """What the plain loop drives: an Orchestrator."""
+
+    def send(self, text: str) -> AsyncIterator[StreamEvent]: ...
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -59,6 +83,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--plain", action="store_true", help="line-based chat; works over pipes"
     )
     mode.add_argument("--gui", action="store_true", help="web GUI in the browser")
+    mode.add_argument(
+        "--storage-status",
+        action="store_true",
+        help="show the state of the three stores and exit; changes nothing",
+    )
     parser.add_argument("--model", metavar="ID", help="model id from models.yaml")
     thinking = parser.add_mutually_exclusive_group()
     thinking.add_argument(
@@ -81,13 +110,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _handle_missing_config(
-    exc: MissingConfigError, config_dir: Path, stdin: TextIO, stderr: TextIO
+    exc: MissingConfigError,
+    config_dir: Path,
+    stdin: TextIO,
+    stderr: TextIO,
+    *,
+    offer_examples: bool = True,
 ) -> int:
     print(exc, file=stderr)
     for path in exc.missing:
         print(f"\nExample {path.name}:\n{_EXAMPLE_TEXT[path.name]}", file=stderr)
-    # Never prompt or write without a person at the terminal.
-    if not stdin.isatty():
+    # Never prompt or write without a person at the terminal; a read-only command
+    # never writes at all.
+    if not offer_examples or not stdin.isatty():
         return 1
     stderr.write(f"Write example files to {config_dir}? [y/N] ")
     stderr.flush()
@@ -136,12 +171,12 @@ async def _read_line(stdin: TextIO) -> str:
 
 async def _chat_loop(
     router: ChatProvider,
-    model_id: str,
     stdin: TextIO,
     stdout: TextIO,
     stderr: TextIO,
+    *,
+    session: _Sender,
 ) -> int:
-    session = ChatSession(router, model_id)
     try:
         while True:
             if stdin.isatty():
@@ -161,8 +196,23 @@ async def _chat_loop(
         await router.aclose()
 
 
+async def _chat_loop_then_close(
+    router: ChatProvider,
+    stdin: TextIO,
+    stdout: TextIO,
+    stderr: TextIO,
+    orchestrator: Orchestrator,
+    storage: Storage,
+) -> int:
+    """Run the chat; the storage is closed inside the loop, so Ctrl-C closes it too."""
+    try:
+        return await _chat_loop(router, stdin, stdout, stderr, session=orchestrator)
+    finally:
+        await storage.close()
+
+
 async def _run_turn(
-    session: ChatSession, text: str, stdout: TextIO, stderr: TextIO
+    session: _Sender, text: str, stdout: TextIO, stderr: TextIO
 ) -> bool:
     """Stream one reply; return False when the provider reported an error."""
     report: UsageReport | None = None
@@ -200,6 +250,11 @@ async def _run_turn(
             print_note(format_switch(event))
         elif isinstance(event, Notice):
             print_note(sanitize_text(event.text))
+        elif isinstance(event, StatusEvent):
+            status = f"[step {event.step}: {sanitize_text(event.text)}]"
+            if stderr.isatty():
+                status = f"{_DIM}{status}{_RESET}"
+            print_note(status)
         elif isinstance(event, UsageReport):
             # Printed at Done, after the reply's final newline.
             report = event
@@ -223,11 +278,13 @@ def _run_tui_lazily(
     model: ModelConfig,
     router_factory: RouterFactory,
     is_manual: bool,
+    *,
+    storage: Storage | None = None,
 ) -> int:
     # Imported here so --plain and --help never load textual.
     from llm_harness.tui.app import run_tui
 
-    return run_tui(config, model, router_factory, is_manual)
+    return run_tui(config, model, router_factory, is_manual, storage=storage)
 
 
 def _run_gui_lazily(
@@ -235,32 +292,62 @@ def _run_gui_lazily(
     model: ModelConfig,
     router_factory: RouterFactory,
     is_manual: bool,
+    *,
+    storage: Storage | None = None,
 ) -> int:
     # Imported here so --plain, --help and the TUI never load nicegui.
     from llm_harness.gui.app import run_gui
 
-    return run_gui(config, model, router_factory, is_manual)
+    return run_gui(config, model, router_factory, is_manual, storage=storage)
 
 
-def _load_config_and_model(
-    config_dir: Path, model_id: str | None, stdin: TextIO, stderr: TextIO
-) -> tuple[HarnessConfig, ModelConfig] | int:
-    """Load the config and pick the model; an int is the exit code to return."""
+def _load_config(
+    config_dir: Path,
+    stdin: TextIO,
+    stderr: TextIO,
+    *,
+    offer_examples: bool = True,
+) -> HarnessConfig | int:
+    """Load the config; an int is the exit code to return."""
     try:
         config = load_config(config_dir)
     except MissingConfigError as exc:
-        return _handle_missing_config(exc, config_dir, stdin, stderr)
+        return _handle_missing_config(
+            exc, config_dir, stdin, stderr, offer_examples=offer_examples
+        )
     except ConfigError as exc:
         print(f"error: {exc}", file=stderr)
         return 1
 
     for warning in permission_warnings(config_dir):
         print(warning, file=stderr)
+    return config
+
+
+def _load_config_and_model(
+    config_dir: Path,
+    model_id: str | None,
+    stdin: TextIO,
+    stderr: TextIO,
+) -> tuple[HarnessConfig, ModelConfig] | int:
+    """Load the config and pick the model; an int is the exit code to return."""
+    config = _load_config(config_dir, stdin, stderr)
+    if isinstance(config, int):
+        return config
     try:
-        return config, select_model(config, model_id)
+        return config, select_orchestrator_model(config, model_id)
     except ConfigError as exc:
         print(f"error: {exc}", file=stderr)
         return 1
+
+
+def _relational_path(config: HarnessConfig, data_dir: Path | None) -> Path:
+    """The ledger file: `[storage.relational] path`, else under the data directory."""
+    if config.storage.relational.path is not None:
+        return config.storage.relational.path
+    if data_dir is None:
+        return store_module.default_db_path()
+    return data_dir / "harness.db"
 
 
 def main(
@@ -281,7 +368,8 @@ def main(
     args = _build_parser().parse_args(argv)
 
     # The web GUI talks to a browser, so only the terminal UI needs a TTY.
-    if not args.plain and not args.gui and not (stdin.isatty() and stdout.isatty()):
+    needs_terminal = not (args.plain or args.gui or args.storage_status)
+    if needs_terminal and not (stdin.isatty() and stdout.isatty()):
         print(
             "The terminal UI needs a terminal for input and output; "
             "use --plain over pipes.",
@@ -290,25 +378,48 @@ def main(
         return 2
 
     config_dir = config_dir if config_dir is not None else default_config_dir()
+    if args.storage_status:
+        # Needs no model, so a config without a default model still works.
+        status_config = _load_config(config_dir, stdin, stderr, offer_examples=False)
+        if isinstance(status_config, int):
+            return status_config
+        lines = asyncio.run(
+            storage_status(
+                status_config,
+                relational_path=_relational_path(status_config, data_dir),
+                data_dir=data_dir if data_dir is not None else default_data_dir(),
+            )
+        )
+        print("\n".join(lines), file=stdout)
+        return 0
+
+    # Every front end (plain, terminal UI, web GUI) drives the orchestrator.
     loaded = _load_config_and_model(config_dir, args.model, stdin, stderr)
     if isinstance(loaded, int):
         return loaded
     config, model = loaded
 
-    # One store and one router factory per process; nothing touches the disk
-    # until the first turn.
-    db_path = (
-        store_module.default_db_path() if data_dir is None else data_dir / "harness.db"
+    # One storage, one ledger and one router factory per process; nothing touches
+    # the disk until first use.
+    db_path = _relational_path(config, data_dir)
+    storage = open_storage(
+        config.storage,
+        data_dir if data_dir is not None else default_data_dir(),
+        relational_path=db_path,
     )
     router_factory = make_router_factory(
-        config, provider_factory, args.think, Store(db_path)
+        config,
+        provider_factory,
+        args.think,
+        Store(db_path),
+        required_tags=frozenset({"orchestrator"}),
     )
     is_manual = bool(args.model)
 
     if args.gui:
-        return run_gui(config, model, router_factory, is_manual)
+        return run_gui(config, model, router_factory, is_manual, storage=storage)
     if not args.plain:
-        return run_tui(config, model, router_factory, is_manual)
+        return run_tui(config, model, router_factory, is_manual, storage=storage)
 
     try:
         router = router_factory(model, is_manual)
@@ -317,7 +428,12 @@ def main(
         return 1
 
     try:
-        return asyncio.run(_chat_loop(router, model.model, stdin, stdout, stderr))
+        orchestrator = Orchestrator(
+            router, model, user_id=config.user_id, storage=storage
+        )
+        return asyncio.run(
+            _chat_loop_then_close(router, stdin, stdout, stderr, orchestrator, storage)
+        )
     except KeyboardInterrupt:
         print(file=stderr)
         return 130

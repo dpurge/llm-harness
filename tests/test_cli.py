@@ -28,9 +28,10 @@ from llm_harness.config import (
     ProviderConfig,
     load_config,
 )
+from llm_harness.orchestrator import Orchestrator
 from llm_harness.providers.base import ChatProvider
 from llm_harness.router import RouterFactory
-from llm_harness.session import ChatSession
+from llm_harness.storage import Storage
 from llm_harness.store import CallRecord, Store
 from llm_harness.types import (
     ChatRequest,
@@ -46,8 +47,25 @@ from llm_harness.types import (
     UsageEvent,
     UsageReport,
 )
-from tests.fakes import ScriptedProvider
+from tests.fake_steps import as_step_reply
+from tests.fakes import ScriptedProvider as RawScriptedProvider
 
+
+class ScriptedProvider(RawScriptedProvider):
+    """Serves plain-text replies as valid orchestrator step replies.
+
+    `--plain` always drives an Orchestrator, whose model answers in JSON. Wrapping
+    at the provider seam keeps these tests about the plain renderer and the router
+    wiring; test_cli_orchestrator.py covers the JSON replies themselves.
+    """
+
+    def __init__(self, events: list[StreamEvent], **kwargs: Any) -> None:
+        super().__init__(as_step_reply(events), **kwargs)
+
+
+STEP_MODEL = ModelConfig(
+    id="m", name="M", provider="p", model="pm", tags=["orchestrator"], priority=1
+)
 CANARY_KEY = "sk-CANARY-123456789"
 CANARY_PROMPT = "PROMPT-CANARY-42"
 
@@ -63,7 +81,7 @@ models:
     name: M1
     provider: local
     model: provider-model-id
-    tags: [default]
+    tags: [default, orchestrator]
     priority: 1
   - id: m2
     name: M2
@@ -186,6 +204,7 @@ class FakeTuiRunner:
     def __init__(self, code: int = 0) -> None:
         self.code = code
         self.calls: list[tuple[HarnessConfig, ModelConfig, RouterFactory, bool]] = []
+        self.storages: list[Storage | None] = []
 
     def __call__(
         self,
@@ -193,8 +212,11 @@ class FakeTuiRunner:
         model: ModelConfig,
         router_factory: RouterFactory,
         is_manual: bool,
+        *,
+        storage: Storage | None = None,
     ) -> int:
         self.calls.append((config, model, router_factory, is_manual))
+        self.storages.append(storage)
         return self.code
 
 
@@ -279,6 +301,71 @@ def test_tui_path_reports_an_unknown_model_without_starting(config_dir: Path) ->
     assert result.code == 1
     assert "m1" in result.err and "m2" in result.err
     assert runner.calls == []
+
+
+def with_embedding_model(config_dir: Path) -> None:
+    models = config_dir / MODELS_FILE
+    models.write_text(
+        models.read_text()
+        + """\
+  - id: bge-m3-local
+    name: BGE M3
+    provider: local
+    model: bge-m3
+    tags: [embedding]
+    priority: 1
+"""
+    )
+
+
+def test_model_flag_naming_an_embedding_model_fails_before_any_chat(
+    config_dir: Path,
+) -> None:
+    with_embedding_model(config_dir)
+    runner = FakeTuiRunner()
+    result = run_tui_cli(config_dir, ["--model", "bge-m3-local"], runner)
+    assert result.code == 1
+    assert result.err.startswith("error:")
+    assert "bge-m3-local" in result.err and "embedding" in result.err
+    assert runner.calls == []
+
+
+def test_plain_model_flag_naming_an_embedding_model_fails_without_a_provider(
+    config_dir: Path,
+) -> None:
+    with_embedding_model(config_dir)
+
+    def factory(config: ProviderConfig) -> ChatProvider:
+        raise AssertionError("no provider may be built")
+
+    result = run_cli(
+        ["--plain", "--model", "bge-m3-local"],
+        config_dir,
+        stdin="hi\n",
+        factory=factory,
+    )
+    assert result.code == 1
+    assert result.err.startswith("error:")
+    assert "bge-m3-local" in result.err and "embedding" in result.err
+
+
+def test_unknown_model_flag_keeps_its_message_with_an_embedding_entry(
+    config_dir: Path,
+) -> None:
+    with_embedding_model(config_dir)
+    result = run_tui_cli(config_dir, ["--model", "nope"], FakeTuiRunner())
+    assert result.code == 1
+    assert result.err.startswith("error: unknown model 'nope'; valid ids: m1, m2")
+
+
+def test_model_flag_naming_a_chat_model_still_works_with_an_embedding_entry(
+    config_dir: Path,
+) -> None:
+    with_embedding_model(config_dir)
+    runner = FakeTuiRunner()
+    result = run_tui_cli(config_dir, ["--model", "m1"], runner)
+    assert result.code == 0
+    assert [model.id for _, model, _, _ in runner.calls] == ["m1"]
 
 
 def test_tui_path_warns_about_loose_config_permissions(config_dir: Path) -> None:
@@ -395,7 +482,12 @@ def test_the_default_gui_runner_delegates_to_run_gui(
     import llm_harness.gui.app as gui_app
 
     calls: list[tuple[Any, ...]] = []
-    monkeypatch.setattr(gui_app, "run_gui", lambda *args: calls.append(args) or 5)
+    keywords: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        gui_app,
+        "run_gui",
+        lambda *args, **kwargs: calls.append(args) or keywords.append(kwargs) or 5,
+    )
     provider, factory = scripted(*reply_events())
     result = run_cli(["--gui", "--no-think"], config_dir, factory=factory)
     assert result.code == 5
@@ -404,6 +496,7 @@ def test_the_default_gui_runner_delegates_to_run_gui(
     assert model.id == "m1"
     assert is_manual is False
     assert first_request_think(router_factory, model, provider) is False
+    assert isinstance(keywords[0]["storage"], Storage)
 
 
 def run_gui_cli(
@@ -535,8 +628,102 @@ def test_help_lists_every_option(
         run_cli(["--help"], tmp_path)
     assert info.value.code == 0
     help_text = capsys.readouterr().out
-    for option in ("--plain", "--gui", "--model", "--think", "--no-think"):
+    for option in (
+        "--plain",
+        "--gui",
+        "--storage-status",
+        "--model",
+        "--think",
+        "--no-think",
+    ):
         assert option in help_text
+
+
+# --storage-status
+
+
+def test_storage_status_prints_the_stores_and_creates_nothing(
+    config_dir: Path, tmp_path: Path
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    result = run_cli(["--storage-status"], config_dir, data_dir=data)
+    assert result.code == 0
+    assert result.err == ""
+    assert result.out.splitlines() == [
+        f"relational: sqlite  {data / 'harness.db'}",
+        "  file: not created yet (it is created on first use)",
+        "  schema: nothing to read yet",
+        f"vector: qdrant-edge  {data / 'vectors'}",
+        "  not created yet",
+        f"files: local  {data / 'files'}",
+        "  not created yet",
+    ]
+    assert list(data.iterdir()) == []
+
+
+def test_storage_status_needs_no_terminal_and_no_default_model(
+    config_dir: Path, tmp_path: Path
+) -> None:
+    (config_dir / MODELS_FILE).write_text(
+        MODELS_YAML.replace("[default, orchestrator]", "[]")
+    )
+    assert run_cli(["--plain"], config_dir, data_dir=tmp_path).code == 1
+    result = run_cli(["--storage-status"], config_dir, data_dir=tmp_path)
+    assert result.code == 0
+    assert "relational: sqlite" in result.out
+
+
+def test_storage_status_prints_the_custom_ledger_path_from_the_config(
+    config_dir: Path, tmp_path: Path
+) -> None:
+    ledger = tmp_path / "custom" / "ledger.db"
+    (config_dir / CONFIG_FILE).write_text(
+        f'{CONFIG_TOML}\n[storage.relational]\npath = "{ledger}"\n'
+    )
+    result = run_cli(["--storage-status"], config_dir, data_dir=tmp_path / "data")
+    assert result.code == 0
+    assert f"relational: sqlite  {ledger}" in result.out
+    assert not ledger.parent.exists()
+
+
+def test_storage_status_uses_the_default_ledger_path_without_a_data_dir(
+    config_dir: Path,
+) -> None:
+    result = run_cli(["--storage-status"], config_dir)
+    assert result.code == 0
+    assert f"relational: sqlite  {store_module.default_db_path()}" in result.out
+
+
+def test_storage_status_with_a_broken_config_fails_with_an_error(
+    config_dir: Path, tmp_path: Path
+) -> None:
+    (config_dir / CONFIG_FILE).write_text("[providers.local\n")
+    result = run_cli(["--storage-status"], config_dir, data_dir=tmp_path)
+    assert result.code == 1
+    assert result.err.startswith("error: ")
+    assert result.out == ""
+
+
+def test_storage_status_with_a_missing_config_never_offers_to_write_examples(
+    tmp_path: Path,
+) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    result = run_cli(
+        ["--storage-status"], empty, stdin="y\n", stdin_tty=True, data_dir=tmp_path
+    )
+    assert result.code == 1
+    assert result.out == ""
+    assert "Write example files" not in result.err
+    assert list(empty.iterdir()) == []
+
+
+@pytest.mark.parametrize("other", ["--plain", "--gui"])
+def test_storage_status_excludes_the_other_modes(other: str, tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as info:
+        run_cli(["--storage-status", other], tmp_path)
+    assert info.value.code == 2
 
 
 def test_think_and_no_think_are_mutually_exclusive(
@@ -687,15 +874,21 @@ def test_prompt_is_shown_only_when_stdin_is_a_tty(config_dir: Path) -> None:
     assert typed.out.startswith("you> ")
 
 
-def test_second_request_carries_whole_history(config_dir: Path) -> None:
+def test_second_request_carries_the_state_not_the_first_line(
+    config_dir: Path,
+) -> None:
     provider, factory = scripted(*FULL_REPLY)
-    run_cli(["--plain"], config_dir, stdin="one\ntwo\n", factory=factory)
-    assert [(m.role, m.content) for m in provider.requests[-1].messages] == [
-        ("user", "one"),
-        ("assistant", "Hello"),
-        ("user", "two"),
-    ]
-    assert provider.requests[-1].model == "provider-model-id"
+    run_cli(
+        ["--plain"],
+        config_dir,
+        stdin="FIRST-LINE-91\nSECOND-LINE-91\n",
+        factory=factory,
+    )
+    last = provider.requests[-1]
+    sent = "\n".join(message.content for message in last.messages)
+    assert "SECOND-LINE-91" in sent
+    assert "FIRST-LINE-91" not in sent
+    assert last.model == "provider-model-id"
 
 
 def thinking_models_yaml(thinking_line: str) -> str:
@@ -753,7 +946,7 @@ def test_control_characters_are_removed_but_newline_and_tab_kept(
     )
     result = run_cli(["--plain"], config_dir, stdin="hi\n", factory=factory)
     assert result.out == "x]0;titley\n\tz\n"
-    assert result.err.startswith("a[31mbcd\n[m1 tokens ? $? ")
+    assert result.err.startswith("a[31mbcd\n[step 1: answering]\n[m1 tokens ? $? ")
     assert "\x1b" not in result.out + result.err
 
 
@@ -767,6 +960,8 @@ def test_error_event_stops_the_loop_and_later_lines_are_not_sent(
     assert result.code == 1
     assert "error (auth): bad key" in result.err
     assert len(provider.requests) == 1
+    # The orchestrator discards the text of a failed attempt: nothing partial shows.
+    assert "partial" not in result.out
 
 
 def test_exit_command_ends_cleanly_before_later_lines(config_dir: Path) -> None:
@@ -875,8 +1070,10 @@ def test_usage_line_is_on_its_own_line_after_open_thinking(config_dir: Path) -> 
     result = thinking_run(
         config_dir, ThinkingDelta(text="pong."), TextDelta(text="pong"), USAGE, Done()
     )
-    assert result.err.startswith("pong.\n[m1 tokens in=1 out=2 $0.00 ")
-    assert result.err.count("\n") == 2
+    assert result.err.startswith(
+        "pong.\n[step 1: answering]\n[m1 tokens in=1 out=2 $0.00 "
+    )
+    assert result.err.count("\n") == 3
 
 
 def test_open_thinking_is_closed_after_the_reset_code_on_a_tty(
@@ -885,20 +1082,22 @@ def test_open_thinking_is_closed_after_the_reset_code_on_a_tty(
     result = thinking_run(
         config_dir, ThinkingDelta(text="pong."), USAGE, Done(), tty=True
     )
-    assert result.err.startswith("\x1b[2mpong.\x1b[0m\n[m1 tokens in=1 ")
+    assert result.err.startswith(
+        "\x1b[2mpong.\x1b[0m\n\x1b[2m[step 1: answering]\x1b[0m\n[m1 tokens in=1 "
+    )
 
 
 def test_thinking_ending_in_newline_gets_no_extra_blank_line(config_dir: Path) -> None:
     result = thinking_run(
         config_dir, ThinkingDelta(text="pong.\n"), TextDelta(text="x"), USAGE, Done()
     )
-    assert result.err.startswith("pong.\n[m1 tokens ")
+    assert result.err.startswith("pong.\n[step 1: answering]\n[m1 tokens ")
 
 
 def test_no_thinking_means_no_stray_newline_on_stderr(config_dir: Path) -> None:
     result = thinking_run(config_dir, TextDelta(text="x"), USAGE, Done())
-    assert result.err.startswith("[m1 tokens ")
-    assert result.err.count("\n") == 1
+    assert result.err.startswith("[step 1: answering]\n[m1 tokens ")
+    assert result.err.count("\n") == 2
 
 
 def test_error_after_thinking_is_on_its_own_line(config_dir: Path) -> None:
@@ -952,13 +1151,13 @@ models:
     name: Dead
     provider: dead
     model: dead-id
-    tags: [default, chat]
+    tags: [default, chat, orchestrator]
     priority: 200
   - id: live-model
     name: Live
     provider: local
     model: live-id
-    tags: [chat, default]
+    tags: [chat, default, orchestrator]
     priority: 100
     price:
       input_per_mtok: 1000
@@ -1036,8 +1235,9 @@ def test_dead_first_model_falls_back_with_a_note_and_a_usage_line_on_stderr(
     result = fallback.run([])
     assert result.code == 0
     assert result.out == "pong\n"
-    note, usage = result.err.splitlines()
+    note, status, usage = result.err.splitlines()
     assert note == SWITCH_NOTE
+    assert status == "[step 1: answering]"
     assert usage.startswith("[live-model tokens in=3 out=7 $0.02 ")
     assert usage.endswith("s | session $0.02]")
 
@@ -1062,7 +1262,7 @@ def test_the_session_total_grows_and_the_next_turn_skips_the_model_in_backoff(
 ) -> None:
     result = fallback.run([], stdin="one\ntwo\n")
     lines = result.err.splitlines()
-    assert [line for line in lines if line.startswith("[")] == [
+    assert [line for line in lines if line.startswith("[") and "[step" not in line] == [
         line for line in lines if "session" in line
     ]
     totals = [line.rsplit("| ", 1)[1] for line in lines if "session" in line]
@@ -1161,12 +1361,13 @@ async def test_a_note_closes_an_open_thinking_line_first() -> None:
         report,
         Done(),
     ]
-    session = ChatSession(ScriptedProvider(events), "m")
+    session = Orchestrator(ScriptedProvider(events), STEP_MODEL)
     err = io.StringIO()
     assert await _run_turn(session, "hi", io.StringIO(), err)
     assert err.getvalue() == (
         "hmm\na unavailable (connection); using b\n"
         "again\nnote[31m\n"
+        "[step 1: answering]\n"
         "[b tokens ? $? 1.0s | session $0.00+?]\n"
     )
 
@@ -1220,12 +1421,20 @@ def test_ctrl_c_does_not_wait_for_a_blocked_read_when_the_loop_closes(
     thread_errors: list[Any] = []
     monkeypatch.setattr(threading, "excepthook", thread_errors.append)
 
+    provider = ScriptedProvider([])
+
     async def interrupted_chat() -> None:
         asyncio.get_running_loop().set_exception_handler(
             lambda _loop, context: loop_errors.append(context)
         )
         chat = asyncio.create_task(
-            _chat_loop(ScriptedProvider([]), "m", stdin, io.StringIO(), io.StringIO())
+            _chat_loop(
+                provider,
+                stdin,
+                io.StringIO(),
+                io.StringIO(),
+                session=Orchestrator(provider, STEP_MODEL),
+            )
         )
         await wait_until_started(stdin)
         chat.cancel()

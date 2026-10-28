@@ -9,6 +9,7 @@ import ollama
 import pytest
 
 from llm_harness.config import ProviderConfig
+from llm_harness.embeddings import EmbeddingError
 from llm_harness.providers.ollama import OllamaProvider, create
 from llm_harness.types import (
     ChatRequest,
@@ -134,6 +135,21 @@ async def test_think_is_forwarded_as_given(think: bool | None) -> None:
     client = FakeClient(FakeStream([chunk(done=True)]))
     await collect(client, think)
     assert client.calls[0]["think"] is think
+
+
+async def test_response_schema_is_forwarded_as_format() -> None:
+    schema = {"type": "object", "properties": {"a": {"type": "string"}}}
+    client = FakeClient(FakeStream([chunk(done=True)]))
+    provider = OllamaProvider(client)  # type: ignore[arg-type]
+    req = request().model_copy(update={"response_schema": schema})
+    [event async for event in provider.stream_chat(req)]
+    assert client.calls[0]["format"] == schema
+
+
+async def test_format_is_absent_without_a_response_schema() -> None:
+    client = FakeClient(FakeStream([chunk(done=True)]))
+    await collect(client)
+    assert "format" not in client.calls[0]
 
 
 async def test_event_order_thinking_text_usage_done() -> None:
@@ -354,3 +370,113 @@ async def test_real_sdk_connection_refused_is_one_connection_error() -> None:
         await provider.aclose()
     assert [type(e) for e in events] == [ErrorEvent]
     assert events[0].kind == "connection"  # type: ignore[union-attr]
+
+
+class FakeEmbedClient:
+    """Stands in for ollama.AsyncClient.embed; records the exact kwargs."""
+
+    def __init__(
+        self,
+        embeddings: list[list[float]] | None = None,
+        *,
+        raises: Exception | None = None,
+    ) -> None:
+        self.embeddings = embeddings if embeddings is not None else [[0.5, 1.5]]
+        self.raises = raises
+        self.calls: list[dict[str, Any]] = []
+
+    async def embed(self, **kwargs: Any) -> ollama.EmbedResponse:
+        self.calls.append(kwargs)
+        if self.raises is not None:
+            raise self.raises
+        return ollama.EmbedResponse(embeddings=self.embeddings)
+
+
+async def embed_with(
+    client: FakeEmbedClient, texts: list[str], dimensions: int | None = None
+) -> list[list[float]]:
+    provider = OllamaProvider(client)  # type: ignore[arg-type]
+    return await provider.embed("bge-m3", texts, dimensions)
+
+
+async def test_embed_without_dimensions_sends_no_dimensions_argument() -> None:
+    client = FakeEmbedClient([[1.0], [2.0]])
+    vectors = await embed_with(client, ["a", "b"])
+    assert vectors == [[1.0], [2.0]]
+    assert client.calls == [{"model": "bge-m3", "input": ["a", "b"]}]
+    assert "dimensions" not in client.calls[0]
+
+
+async def test_embed_with_dimensions_sends_them() -> None:
+    client = FakeEmbedClient([[1.0]])
+    await embed_with(client, ["a"], dimensions=256)
+    assert client.calls[0]["dimensions"] == 256
+
+
+@pytest.mark.parametrize(
+    ("status", "kind"),
+    [
+        (400, "bad_request"),
+        (401, "auth"),
+        (403, "auth"),
+        (404, "not_found"),
+        (429, "rate_limit"),
+        (500, "unknown"),
+    ],
+)
+async def test_embed_response_error_status_maps_to_kind(status: int, kind: str) -> None:
+    client = FakeEmbedClient(raises=ollama.ResponseError("boom", status))
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(client, ["a"])
+    assert info.value.kind == kind
+    assert str(info.value) == f"boom (status code: {status})"
+
+
+async def test_embed_request_error_is_bad_request() -> None:
+    client = FakeEmbedClient(raises=ollama.RequestError("bad input"))
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(client, ["a"])
+    assert info.value.kind == "bad_request"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectError("All connection attempts failed"),
+        httpx.ReadTimeout("slow"),
+        ConnectionError("refused"),
+    ],
+)
+async def test_embed_unreachable_server_is_a_connection_error(
+    exc: Exception,
+) -> None:
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(FakeEmbedClient(raises=exc), ["a"])
+    assert info.value.kind == "connection"
+
+
+async def test_embed_error_message_is_redacted() -> None:
+    secret = "sk-abcdefghij1234567890"
+    text = f"bad key {secret} with Bearer tok123456 at http://u:hunter2@host/x"
+    client = FakeEmbedClient(raises=ollama.ResponseError(text, 401))
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(client, ["a"])
+    message = str(info.value)
+    assert secret not in message
+    assert "tok123456" not in message
+    assert "hunter2" not in message
+    assert "[REDACTED:api_key]" in message
+
+
+async def test_embed_vector_count_mismatch_is_unknown() -> None:
+    client = FakeEmbedClient([[1.0]])
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(client, ["a", "b"])
+    assert info.value.kind == "unknown"
+    assert "1" in str(info.value) and "2" in str(info.value)
+
+
+async def test_embed_programming_errors_are_not_wrapped() -> None:
+    client = FakeEmbedClient(raises=TypeError("our bug"))
+    with pytest.raises(TypeError, match="our bug"):
+        await embed_with(client, ["a"])

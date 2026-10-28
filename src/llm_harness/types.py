@@ -1,6 +1,6 @@
 """Neutral, provider-independent chat types."""
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -23,6 +23,9 @@ class ChatRequest(_Frozen):
     model: str
     messages: list[Message]
     think: bool | None = None
+    # A JSON schema the provider SHOULD enforce on the reply text; only the
+    # Ollama adapter honours it so far, the others ignore it.
+    response_schema: dict[str, Any] | None = None
 
 
 class Usage(_Frozen):
@@ -82,6 +85,14 @@ class Notice(_Frozen):
     text: str
 
 
+class StatusEvent(_Frozen):
+    """The orchestrator finished a valid step; `text` is a short one-line summary."""
+
+    step: int
+    action_type: str
+    text: str
+
+
 StreamEvent = (
     ThinkingDelta
     | TextDelta
@@ -91,4 +102,5 @@ StreamEvent = (
     | ModelSwitch
     | UsageReport
     | Notice
+    | StatusEvent
 )

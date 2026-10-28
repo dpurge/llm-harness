@@ -311,6 +311,7 @@ def make_router_factory(
     think_flag: bool | None,
     store: Store | None,
     *,
+    required_tags: frozenset[str] = frozenset({"chat"}),
     clock: Callable[[], datetime] = _utc_now,
     timer: Callable[[], float] = time.monotonic,
 ) -> RouterFactory:
@@ -322,6 +323,7 @@ def make_router_factory(
             think_flag=think_flag,
             provider_factory=provider_factory,
             store=store,
+            required_tags=required_tags,
             clock=clock,
             timer=timer,
         )

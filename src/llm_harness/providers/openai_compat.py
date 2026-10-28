@@ -8,6 +8,7 @@ import openai
 from openai.types.chat import ChatCompletionChunk
 
 from llm_harness.config import ConfigError, ProviderConfig
+from llm_harness.embeddings import EmbeddingError
 from llm_harness.providers.base import ChatProvider
 from llm_harness.providers.environment import hidden_environment
 from llm_harness.redact import Secret, redact
@@ -132,6 +133,30 @@ class OpenAICompatProvider:
         except openai.OpenAIError as exc:
             message = redact(str(exc), secrets=self._secrets)
             yield ErrorEvent(kind=_error_kind(exc), message=message)
+
+    async def embed(
+        self, model: str, texts: list[str], dimensions: int | None
+    ) -> list[list[float]]:
+        # `dimensions` is sent only when set, so the model keeps its own size.
+        # encoding_format="float" is explicit: left unset, the SDK asks for
+        # base64, which OpenAI-compatible servers need not support.
+        extra = {} if dimensions is None else {"dimensions": dimensions}
+        try:
+            response = await self._client.embeddings.create(
+                model=model, input=texts, encoding_format="float", **extra
+            )
+        except openai.OpenAIError as exc:
+            message = redact(str(exc), secrets=self._secrets)
+            raise EmbeddingError(_error_kind(exc), message) from exc
+        # The API documents `index` per item, so order is restored from it.
+        ordered = sorted(response.data, key=lambda item: item.index)
+        vectors = [[float(x) for x in item.embedding] for item in ordered]
+        if len(vectors) != len(texts):
+            raise EmbeddingError(
+                "unknown",
+                f"the server returned {len(vectors)} vectors for {len(texts)} texts",
+            )
+        return vectors
 
     async def aclose(self) -> None:
         await self._client.close()

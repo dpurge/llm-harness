@@ -22,9 +22,8 @@ from llm_harness.config import (
     resolve_api_key,
 )
 from llm_harness.providers.vertex import VertexProvider, create
-from llm_harness.session import ChatSession
-from llm_harness.types import Done, StreamEvent, TextDelta, UsageEvent
-from tests.fakes import assert_stream_contract
+from llm_harness.types import Done, TextDelta, UsageEvent
+from tests.fakes import assert_stream_contract, single_turn
 
 pytestmark = pytest.mark.live
 
@@ -89,12 +88,9 @@ async def test_live_vertex_streams_text_and_usage() -> None:
     adapter = create(provider_config, resolve_api_key(provider_config))
     assert isinstance(adapter, VertexProvider)
     adapter._client = CappedOutput(adapter._client)  # type: ignore[assignment]
-    session = ChatSession(adapter, model.model, think=None)
-    events: list[StreamEvent] = []
     try:
         async with asyncio.timeout(30):
-            async for event in session.send("Say ready"):
-                events.append(event)
+            events = await single_turn(adapter, model.model, "Say ready", think=None)
     finally:
         await adapter.aclose()
 

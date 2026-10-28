@@ -7,9 +7,11 @@ from typing import Any
 import httpx2
 import openai
 import pytest
+from openai.types import CreateEmbeddingResponse
 from openai.types.chat import ChatCompletionChunk
 
 from llm_harness.config import ConfigError, ProviderConfig
+from llm_harness.embeddings import EmbeddingError
 from llm_harness.providers.openai_compat import OpenAICompatProvider, create
 from llm_harness.redact import Secret
 from llm_harness.types import (
@@ -181,6 +183,16 @@ async def test_request_is_mapped_and_streamed() -> None:
             "stream_options": {"include_usage": True},
         }
     ]
+
+
+async def test_response_schema_is_ignored() -> None:
+    client = finished()
+    provider = make_provider(client)
+    req = request().model_copy(update={"response_schema": {"type": "object"}})
+    [event async for event in provider.stream_chat(req)]
+    plain = finished()
+    await collect(plain)
+    assert client.calls == plain.calls
 
 
 @pytest.mark.parametrize(
@@ -560,3 +572,147 @@ async def test_real_sdk_connection_refused_is_one_connection_error() -> None:
         await provider.aclose()
     assert [type(e) for e in events] == [ErrorEvent]
     assert events[0].kind == "connection"  # type: ignore[union-attr]
+
+
+# --- embeddings --------------------------------------------------------------
+
+
+class _Embeddings:
+    def __init__(self, owner: "FakeEmbedClient") -> None:
+        self._owner = owner
+
+    async def create(self, **kwargs: Any) -> CreateEmbeddingResponse:
+        self._owner.calls.append(kwargs)
+        if self._owner.raises is not None:
+            raise self._owner.raises
+        return CreateEmbeddingResponse.model_validate(
+            {
+                "object": "list",
+                "model": "m",
+                "usage": {"prompt_tokens": 1, "total_tokens": 1},
+                "data": [
+                    {"object": "embedding", "index": index, "embedding": vector}
+                    for index, vector in self._owner.items
+                ],
+            }
+        )
+
+
+class FakeEmbedClient:
+    """Stands in for openai.AsyncOpenAI.embeddings; records the exact kwargs.
+
+    `items` are (index, vector) pairs returned in the given order.
+    """
+
+    def __init__(
+        self,
+        items: list[tuple[int, list[float]]] | None = None,
+        *,
+        raises: Exception | None = None,
+    ) -> None:
+        self.items = items if items is not None else [(0, [0.5, 1.5])]
+        self.raises = raises
+        self.calls: list[dict[str, Any]] = []
+        self.embeddings = _Embeddings(self)
+
+
+async def embed_with(
+    client: FakeEmbedClient,
+    texts: list[str],
+    dimensions: int | None = None,
+    secrets: list[str] | None = None,
+) -> list[list[float]]:
+    provider = make_provider(client, secrets=secrets)  # type: ignore[arg-type]
+    return await provider.embed("text-embed", texts, dimensions)
+
+
+async def test_embed_without_dimensions_sends_no_dimensions_argument() -> None:
+    client = FakeEmbedClient([(0, [1.0]), (1, [2.0])])
+    vectors = await embed_with(client, ["a", "b"])
+    assert vectors == [[1.0], [2.0]]
+    assert client.calls == [
+        {"model": "text-embed", "input": ["a", "b"], "encoding_format": "float"}
+    ]
+    assert "dimensions" not in client.calls[0]
+
+
+async def test_embed_with_dimensions_sends_them() -> None:
+    client = FakeEmbedClient([(0, [1.0])])
+    await embed_with(client, ["a"], dimensions=256)
+    assert client.calls[0]["dimensions"] == 256
+
+
+async def test_embed_returns_vectors_in_input_order() -> None:
+    client = FakeEmbedClient([(2, [3.0]), (0, [1.0]), (1, [2.0])])
+    vectors = await embed_with(client, ["a", "b", "c"])
+    assert vectors == [[1.0], [2.0], [3.0]]
+
+
+@pytest.mark.parametrize(
+    ("cls", "status", "kind"),
+    [
+        (openai.AuthenticationError, 401, "auth"),
+        (openai.PermissionDeniedError, 403, "auth"),
+        (openai.NotFoundError, 404, "not_found"),
+        (openai.RateLimitError, 429, "rate_limit"),
+        (openai.BadRequestError, 400, "bad_request"),
+        (openai.APIStatusError, 500, "unknown"),
+    ],
+)
+async def test_embed_status_errors_map_to_kind(
+    cls: type[openai.APIStatusError], status: int, kind: str
+) -> None:
+    client = FakeEmbedClient(raises=status_error(cls, status, "boom"))
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(client, ["a"])
+    assert info.value.kind == kind
+    assert str(info.value) == "boom"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        openai.APIConnectionError(request=httpx2.Request("POST", "http://x")),
+        openai.APITimeoutError(httpx2.Request("POST", "http://x")),
+    ],
+)
+async def test_embed_connection_and_timeout_errors_are_connection(
+    exc: Exception,
+) -> None:
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(FakeEmbedClient(raises=exc), ["a"])
+    assert info.value.kind == "connection"
+
+
+async def test_embed_other_sdk_errors_are_unknown() -> None:
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(FakeEmbedClient(raises=openai.OpenAIError("odd")), ["a"])
+    assert info.value.kind == "unknown"
+
+
+async def test_embed_error_message_is_redacted() -> None:
+    key = "my-plain-key-value"
+    shape = "sk-abcdefghij1234567890"
+    text = f"bad key {key} and {shape} Bearer tok123456"
+    client = FakeEmbedClient(raises=status_error(openai.AuthenticationError, 401, text))
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(client, ["a"], secrets=[key])
+    message = str(info.value)
+    assert key not in message
+    assert shape not in message
+    assert "tok123456" not in message
+    assert "[REDACTED:api_key]" in message
+
+
+async def test_embed_vector_count_mismatch_is_unknown() -> None:
+    client = FakeEmbedClient([(0, [1.0])])
+    with pytest.raises(EmbeddingError) as info:
+        await embed_with(client, ["a", "b"])
+    assert info.value.kind == "unknown"
+    assert "1" in str(info.value) and "2" in str(info.value)
+
+
+async def test_embed_programming_errors_are_not_wrapped() -> None:
+    client = FakeEmbedClient(raises=TypeError("our bug"))
+    with pytest.raises(TypeError, match="our bug"):
+        await embed_with(client, ["a"])

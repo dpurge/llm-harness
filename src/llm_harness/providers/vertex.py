@@ -10,6 +10,7 @@ from google.auth import exceptions as auth_exceptions
 from google.genai import errors, types
 
 from llm_harness.config import ProviderConfig
+from llm_harness.embeddings import EmbeddingError
 from llm_harness.providers.base import ChatProvider
 from llm_harness.providers.environment import hidden_environment
 from llm_harness.redact import Secret, redact
@@ -63,6 +64,27 @@ _HIDDEN_VARIABLES = (
     "GOOGLE_GENAI_REPLAYS_DIRECTORY",
     "GOOGLE_GENAI_REPLAY_ID",
 )
+
+
+# Order matters in `_error_kind`: TransportError is a GoogleAuthError subclass.
+_SDK_ERRORS = (
+    errors.APIError,
+    auth_exceptions.GoogleAuthError,
+    *_CONNECTION_ERRORS,
+    aiohttp.ClientError,
+)
+
+
+def _error_kind(exc: BaseException) -> ErrorKind:
+    if isinstance(exc, errors.APIError):
+        return _STATUS_KINDS.get(exc.code, "unknown")
+    if isinstance(exc, auth_exceptions.TransportError):
+        return "connection"
+    if isinstance(exc, auth_exceptions.GoogleAuthError):
+        return "auth"
+    if isinstance(exc, _CONNECTION_ERRORS):
+        return "connection"
+    return "unknown"  # the remaining aiohttp.ClientError subclasses
 
 
 def _error(kind: ErrorKind, exc: BaseException | str) -> ErrorEvent:
@@ -151,16 +173,36 @@ class VertexProvider:
                 yield _error("unknown", _NO_FINISH_REASON)
             else:
                 yield Done(finish_reason=finish_reason)
-        except errors.APIError as exc:
-            yield _error(_STATUS_KINDS.get(exc.code, "unknown"), exc)
-        except auth_exceptions.TransportError as exc:
-            yield _error("connection", exc)
-        except auth_exceptions.GoogleAuthError as exc:
-            yield _error("auth", exc)
-        except _CONNECTION_ERRORS as exc:
-            yield _error("connection", exc)
-        except aiohttp.ClientError as exc:
-            yield _error("unknown", exc)
+        except _SDK_ERRORS as exc:
+            yield _error(_error_kind(exc), exc)
+
+    async def embed(
+        self, model: str, texts: list[str], dimensions: int | None
+    ) -> list[list[float]]:
+        # `dimensions` is set in the config only when given, so the model keeps
+        # its own size otherwise.
+        extra = (
+            {}
+            if dimensions is None
+            else {"config": types.EmbedContentConfig(output_dimensionality=dimensions)}
+        )
+        try:
+            response = await self._client.aio.models.embed_content(
+                model=model, contents=texts, **extra
+            )
+        except _SDK_ERRORS as exc:
+            raise EmbeddingError(_error_kind(exc), redact(str(exc))) from exc
+        vectors = [
+            [float(x) for x in embedding.values]
+            for embedding in response.embeddings or []
+            if embedding.values is not None
+        ]
+        if len(vectors) != len(texts):
+            raise EmbeddingError(
+                "unknown",
+                f"Vertex returned {len(vectors)} vectors for {len(texts)} texts",
+            )
+        return vectors
 
     async def aclose(self) -> None:
         await self._client.aio.aclose()
