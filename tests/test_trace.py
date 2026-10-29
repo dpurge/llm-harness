@@ -5,6 +5,7 @@ from contextlib import aclosing
 
 import pytest
 
+from llm_harness.config import ConfigError
 from llm_harness.context import build_request
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.trace import Span, TraceRecorder
@@ -21,11 +22,16 @@ from llm_harness.types import (
 from tests.fake_steps import reply_events
 from tests.test_orchestrator import (
     CALL_TOOL,
+    CHILD_FINDING,
+    CHILD_RESPOND,
+    RESEARCHER,
     RESPOND,
     SET_GOAL,
     StubTool,
     call,
+    delegate,
     make,
+    make_delegating,
     model_cfg,
     registry,
     run,
@@ -218,7 +224,7 @@ async def test_tool_call_holds_name_arguments_and_result_and_errors_set_status()
         "result": "tool search result: found it",
     }
     assert unknown.status == "error"
-    assert unknown.attributes["result"].startswith("unknown tool missing;")
+    assert unknown.attributes["result"].startswith("tool missing is not available;")
     assert failing.status == "error"
     assert failing.attributes["result"] == "tool boom failed: RuntimeError: it broke"
 
@@ -402,3 +408,194 @@ async def test_events_are_identical_with_and_without_a_recorder() -> None:
     assert await run(recorded, "hi") == await run(silent, "hi")
     assert trace_of(recorded)
     assert silent.last_trace is None
+
+
+async def test_subagent_span_parents_its_child_steps_and_calls() -> None:
+    # Nothing in the orchestrator opens a subagent span yet (a later step does);
+    # this drives the recorder directly.
+    recorder = TraceRecorder(TickClock())
+    recorder.reset()
+    with (
+        recorder.span("turn", "turn 1") as turn,
+        recorder.span("step", "step 1", turn) as step,
+        recorder.span("subagent", "researcher", step) as sub,
+    ):
+        sub.attributes["state"] = {"goal": "find it"}
+        with (
+            recorder.span("step", "step 1", sub) as child,
+            recorder.span("llm_call", "model", child),
+        ):
+            pass
+    spans = recorder.spans
+    assert spans is not None
+    assert [(s.id, s.parent_id, s.kind) for s in spans] == [
+        ("s1", None, "turn"),
+        ("s2", "s1", "step"),
+        ("s3", "s2", "subagent"),
+        ("s4", "s3", "step"),
+        ("s5", "s4", "llm_call"),
+    ]
+
+
+def test_a_large_state_attribute_is_kept_whole() -> None:
+    recorder = TraceRecorder(TickClock())
+    recorder.reset()
+    state = {"notes": ["line " * 200] * 10, "goal": "g"}
+    with (
+        recorder.span("turn", "turn 1") as turn,
+        recorder.span("subagent", "researcher", turn) as sub,
+    ):
+        sub.attributes["state"] = state
+    spans = recorder.spans
+    assert spans is not None
+    assert spans[1].attributes["state"] == state
+
+
+def _adoptable_child() -> tuple[Span, ...]:
+    child = TraceRecorder(TickClock())
+    child.reset()
+    with (
+        child.span("turn", "turn 1") as turn,
+        child.span("step", "step 1", turn) as step,
+        child.span("llm_call", "model", step) as llm,
+    ):
+        llm.attributes["model"] = "m"
+        step.status = "rejected"
+    spans = child.spans
+    assert spans is not None
+    return spans
+
+
+def test_adopt_remaps_ids_links_the_root_to_the_parent_and_shifts_offsets() -> None:
+    child = _adoptable_child()
+    recorder = TraceRecorder(TickClock())
+    recorder.reset()
+    with (
+        recorder.span("turn", "turn 1") as turn,
+        recorder.span("step", "step 1", turn) as step,
+        recorder.span("subagent", "researcher", step) as sub,
+    ):
+        recorder.adopt(child, sub, 10.0)
+    spans = recorder.spans
+    assert spans is not None
+    assert [(s.id, s.parent_id, s.kind) for s in spans] == [
+        ("s1", None, "turn"),
+        ("s2", "s1", "step"),
+        ("s3", "s2", "subagent"),
+        ("s4", "s3", "turn"),
+        ("s5", "s4", "step"),
+        ("s6", "s5", "llm_call"),
+    ]
+    adopted = spans[3:]
+    assert [s.start_ms for s in adopted] == [round(c.start_ms + 10.0, 3) for c in child]
+    assert [(s.name, s.status, s.duration_ms) for s in adopted] == [
+        (c.name, c.status, c.duration_ms) for c in child
+    ]
+    assert adopted[2].attributes == {"model": "m"}
+    assert adopted[1].status == "rejected"
+
+
+def test_adopted_ids_never_collide_with_spans_opened_afterwards() -> None:
+    recorder = TraceRecorder(TickClock())
+    recorder.reset()
+    with recorder.span("turn", "turn 1") as turn:
+        with recorder.span("subagent", "researcher", turn) as sub:
+            recorder.adopt(_adoptable_child(), sub, 0.0)
+        with recorder.span("step", "step 2", turn):
+            pass
+    spans = recorder.spans
+    assert spans is not None
+    ids = [s.id for s in spans]
+    assert len(ids) == len(set(ids)) == 6
+
+
+def test_adopt_keeps_the_child_spans_in_opening_order_after_the_parent_span() -> None:
+    recorder = TraceRecorder(TickClock())
+    recorder.reset()
+    with recorder.span("turn", "turn 1") as turn:
+        with recorder.span("subagent", "researcher", turn) as sub:
+            recorder.adopt(_adoptable_child(), sub, 0.0)
+        with recorder.span("step", "step 2", turn):
+            pass
+    spans = recorder.spans
+    assert spans is not None
+    assert [s.kind for s in spans] == [
+        "turn",
+        "subagent",
+        "turn",
+        "step",
+        "llm_call",
+        "step",
+    ]
+
+
+def test_a_disabled_recorder_adopts_nothing() -> None:
+    recorder = TraceRecorder(TickClock(), enabled=False)
+    recorder.reset()
+    with recorder.span("turn", "turn 1") as turn:
+        recorder.adopt(_adoptable_child(), turn, 5.0)
+    assert recorder.spans is None
+
+
+def test_span_handle_start_ms_is_the_spans_offset() -> None:
+    recorder = TraceRecorder(TickClock())
+    recorder.reset()
+    with (
+        recorder.span("turn", "turn 1") as turn,
+        recorder.span("step", "step 1", turn) as step,
+    ):
+        started = step.start_ms
+    spans = recorder.spans
+    assert spans is not None
+    assert started == spans[1].start_ms > 0
+
+
+async def test_delegation_nests_the_childs_trace_under_a_subagent_span() -> None:
+    orchestrator, _, _, _ = make_delegating(
+        [reply_events(delegate(brief="find it"), SET_GOAL), reply_events(RESPOND)],
+        [[reply_events(CHILD_RESPOND, CHILD_FINDING)]],
+        recorder=TraceRecorder(TickClock()),
+    )
+    await run(orchestrator, "go")
+    spans = trace_of(orchestrator)
+    ids = [s.id for s in spans]
+    assert len(ids) == len(set(ids))
+    by_id = {s.id: s for s in spans}
+    (sub,) = of_kind(spans, "subagent")
+    assert sub.name == "researcher"
+    assert by_id[sub.parent_id].kind == "step"
+    assert sub.attributes["subagent"] == "researcher"
+    assert sub.attributes["outcome"] == "responded"
+    children = [s for s in spans if s.parent_id == sub.id]
+    assert [c.kind for c in children] == ["turn"]
+    child_steps = [s for s in spans if s.parent_id == children[0].id]
+    assert [c.kind for c in child_steps] == ["step"]
+    child_calls = [s for s in spans if s.parent_id == child_steps[0].id]
+    assert [c.kind for c in child_calls] == ["llm_call"]
+    # Parent and child spans are all attached to one tree rooted at the turn.
+    roots = [s for s in spans if s.parent_id is None]
+    assert len(roots) == 1
+    descendants = spans[spans.index(sub) + 1 :]
+    assert all(span.start_ms >= sub.start_ms for span in descendants)
+    state = sub.attributes["state"]
+    assert state["goal"] == "find it"
+    assert state["findings"] == [{"text": "Paris is the capital", "source": "atlas"}]
+    assert state["turn"] == 1 and state["step"] == 1
+
+
+async def test_a_factory_that_fails_leaves_an_error_subagent_span_without_children() -> (
+    None
+):
+    def factory(child):
+        raise ConfigError("nope")
+
+    orchestrator, _ = make_traced(
+        [reply_events(delegate(), SET_GOAL), reply_events(RESPOND)],
+        subagents=(RESEARCHER,),
+        subagent_factory=factory,
+    )
+    await run(orchestrator, "go")
+    spans = trace_of(orchestrator)
+    (sub,) = of_kind(spans, "subagent")
+    assert sub.status == "error"
+    assert [s for s in spans if s.parent_id == sub.id] == []

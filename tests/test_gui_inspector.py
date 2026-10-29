@@ -17,6 +17,8 @@ from nicegui.elements.upload import Upload
 from nicegui.testing import User
 
 import llm_harness.gui.app as gui_app
+from llm_harness.builtin_tools import build_tool_registry
+from llm_harness.config import AgentConfig
 from llm_harness.context import MAX_OBSERVATION_CHARS, build_request
 from llm_harness.gui import inspector
 from llm_harness.gui.inspector import span_children, span_title
@@ -615,7 +617,7 @@ async def test_the_trace_tab_shows_the_span_tree_of_the_last_turn(user: User) ->
         "s2": "ok",
         "s3": "rejected",
         "s4": "ok",
-        "s5": "error",  # no tool registry: "unknown tool"
+        "s5": "error",  # no tool registry: "not available"
         "s6": "ok",
         "s7": "ok",
     }
@@ -650,7 +652,7 @@ async def test_span_details_show_every_attribute_in_collapsed_fields(
     # tool call: arguments and result
     assert field_text(user, "s5", "arguments") == "{}"
     assert field_text(user, "s5", "result") == spans["s5"].attributes["result"]
-    assert "unknown tool" in field_text(user, "s5", "result")
+    assert "is not available" in field_text(user, "s5", "result")
     details = widget_in(user, "s3", "trace-details").text
     assert "kind: llm_call" in details and "status: rejected" in details
     assert "model: provider-model-1" in details
@@ -1213,3 +1215,43 @@ def test_the_transfer_code_never_puts_file_content_into_html_or_a_log() -> None:
     source = (GUI_DIR / "inspector.py").read_text("utf-8")
     for forbidden in ("ui.html", "ui.markdown", "sanitize=", "logging", "print("):
         assert forbidden not in source
+
+
+AGENT = AgentConfig(
+    id="boss",
+    name="Boss",
+    description="Leads.",
+    tags=["orchestrator"],
+    model_tags=[],
+)
+
+
+async def test_the_state_tab_lists_the_agents_before_the_first_message(
+    user: User,
+) -> None:
+    agent = AGENT
+    config = CONFIG.model_copy(update={"agents": [agent]})
+    test_gui.register_page(
+        config, MODEL_1, router_factory_for(config, Factory(REPLY), None), False
+    )
+    await user.open("/")
+    assert label_text(user, "state-agents").startswith("Boss [boss] (orchestrator)")
+
+
+async def test_the_state_tab_shows_the_tools_of_the_orchestrator(user: User) -> None:
+    config = CONFIG.model_copy(update={"agents": [AGENT]})
+    tools = build_tool_registry(config.agents)
+    test_gui.register_page(
+        config,
+        MODEL_1,
+        router_factory_for(config, Factory(REPLY), None),
+        False,
+        tools=tools,
+    )
+    await user.open("/")
+    text = label_text(user, "state-tools")
+    assert text.startswith(
+        "tool_search\n  tags: orchestrator\n  Find the tools you may use"
+    )
+    assert "listing sent in every request: ~" in text
+    assert "full schemas of these tools would be: ~" in text

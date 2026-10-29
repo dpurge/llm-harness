@@ -5,8 +5,10 @@ A personal harness for trying LLMs from Ollama, OpenAI-compatible APIs
 terminal UI and a web GUI, and shows the model's thinking text when the model
 provides it. Every message goes through an orchestrator that keeps a small typed
 state instead of the chat history (see Orchestrator). It falls back to another
-model when one fails and records what each call cost. Real tools and subagents
-do not exist yet.
+model when one fails and records what each call cost. The orchestrator can hand
+a task to a subagent declared in `agents.yaml` (see Subagents). The only tool is
+`tool_search`, which finds the tools an agent may use; real tools do not exist
+yet.
 
 ## Quick start
 
@@ -28,9 +30,9 @@ again.
 
 ## Configuration
 
-Two files under `~/.config/llm-harness/`. These are the example files the
-program offers to write (`EXAMPLE_CONFIG_TOML` and `EXAMPLE_MODELS_YAML` in
-`src/llm_harness/config.py`).
+Three files under `~/.config/llm-harness/`. These are the example files the
+program offers to write (`EXAMPLE_CONFIG_TOML`, `EXAMPLE_MODELS_YAML` and
+`EXAMPLE_AGENTS_YAML` in `src/llm_harness/config.py`).
 
 `config.toml` - connection settings, one `[providers.<id>]` table per provider,
 and an optional `user_id`:
@@ -193,6 +195,67 @@ models:
   tag is a free label.
 - `priority`: a higher number wins. Two `orchestrator` models, or two
   `embedding` models, at the same top priority are an error.
+
+### Agents
+
+`agents.yaml` - who can do work (no secrets). It sits next to `models.yaml`;
+when it is missing the program stops and offers to write the example, like for
+the other two files.
+
+```yaml
+# llm-harness agents: who can do work. No secrets here.
+# Lines that start with "# " are notes.
+#
+# Every entry has these keys:
+#   id           short unique name.
+#   name         the label people see.
+#   description  what the agent is for, in one sentence.
+#   tags         a list of lowercase labels without spaces. Exactly one agent
+#                must carry the tag orchestrator: it reads your prompt and
+#                assembles the reply.
+#   model_tags   the tags a model in models.yaml must carry (all of them)
+#                for this agent. At least one chat model must match.
+#   examples     optional. Example requests the agent handles.
+#   tools        optional. Names of tools the agent may use.
+#   deny         optional. Names of tools the agent may never use.
+agents:
+  - id: orchestrator
+    name: Orchestrator
+    description: Reads the user's prompt, keeps the goal, and assembles the reply.
+    tags: [orchestrator]
+    model_tags: [orchestrator]
+
+  - id: researcher
+    name: Researcher
+    description: Looks up facts and reports what it found with its sources.
+    tags: [research]
+    model_tags: [chat]
+    tools: [tool_search]
+    examples:
+      - Find out when the Eiffel Tower was built.
+      - Look up the latest stable version of Python.
+```
+
+Rules:
+
+- Exactly one agent carries the tag `orchestrator`. Today the orchestrator
+  takes its id and tags from that agent; its model is still chosen by the model
+  tag `orchestrator` in `models.yaml`.
+- `tags` and `model_tags` are lowercase, have no spaces and no repeats. Every
+  agent's `model_tags` must be carried together by at least one chat model in
+  `models.yaml` (an `embedding` model does not count), otherwise the program
+  stops, for example `invalid agents.yaml: agent 'writer': no chat model
+  carries all of model_tags ['writer', 'cheap']`.
+- Agent ids are unique, and a tool name cannot be in both `tools` and `deny`.
+  A name in `tools` or `deny` must be a known tool (today only `tool_search`),
+  otherwise the program stops, for example `error: invalid agents.yaml: agent
+  'orchestrator': tools names unknown tool 'nope'; known tools: tool_search`.
+  An agent may use the tools whose tags meet its own `tags`, plus those in
+  `tools`, minus those in `deny`.
+- An agent other than the orchestrator that has at least one entry in `examples`
+  is a subagent the orchestrator may delegate to; without `examples` it is never
+  offered (see Subagents). `model_tags` also chooses the subagent's model.
+- The `State` tab of the inspector lists the agents.
 
 ### Embedding models
 
@@ -396,8 +459,19 @@ can change only `goal`, `findings` and `plan`.
 The model answers with one JSON object with exactly two keys: `state_patch` and
 `action`. The action is one of `respond` (the answer, ends the turn), `ask_user`
 (a question, ends the turn; your next message is the answer), `call_tool` and
-`delegate`. No tools or subagents exist yet, so `call_tool` reports an unknown
-tool and `delegate` answers that it is not available yet.
+`delegate`. `delegate` hands a brief to a subagent (see Subagents); when no
+subagent factory is configured it answers that it is not available yet.
+
+Tools: every request lists the tools the orchestrator may use under `## Tools`,
+one `name: description` line each. To learn a tool's arguments the model calls
+`tool_search` (`query`, optional `k` from 1 to 10), which ranks the tools it may
+use by the words of the query (a match in the name counts 3, in a tag 2, in the
+description 1) and answers with each match's description, tags and argument
+schema. A `call_tool` for a tool that is not in the list is not run: the model
+is told `tool <name> is not available; available tools: ...`; arguments that do
+not fit the tool's schema are not run either: `invalid arguments for tool
+<name>: <field>: <message>` (the values are never repeated). The only tool today
+is `tool_search`, tagged `orchestrator`.
 
 - Each step prints a status line: `[step 1: answering]` on stderr in `--plain`;
   the terminal UI and the GUI show `step 1: answering` as a note.
@@ -412,6 +486,41 @@ tool and `delegate` answers that it is not available yet.
 - The state is capped at 8000 characters; a patch that would exceed it is
   rejected.
 
+## Subagents
+
+A subagent is an agent in `agents.yaml` that is not the orchestrator and has a
+non-empty `examples` list. The example file has one, `researcher` (tag
+`research`, `model_tags: [chat]`, tool `tool_search`, two examples). Every
+request lists the subagents under `## Subagents`, one line each:
+`id: description (e.g. example; example)`; the section is left out when there is
+none. The model delegates with the action `delegate` (`subagent` is the id,
+`brief` a short self-contained task).
+
+- The subagent is a second orchestrator loop with its own typed state. Its goal
+  is preset from the brief. It sees only the brief, the parent's environment
+  block (date and time, user name, computer name, `user_id`) and the listing of
+  its own tools (the same rule as for the orchestrator: tags, `tools`, minus
+  `deny`); it never sees the chat or the parent's state.
+- Its model is the highest-priority non-embedding model that carries all of the
+  agent's `model_tags` (equal top priority is an error); the fallback chain,
+  backoff and ledger work as for the orchestrator.
+- Limits: depth 1 (a `delegate` from a subagent is answered with `delegate is
+  not available to subagents`), 5 steps and 2 retries per reply, one subagent at
+  a time.
+- What comes back is one observation: its `respond` text followed by its
+  findings as `- text (source: s)` lines (cut to the same length cap as other
+  observations). If it asks a question, the observation is `needs: <question>`;
+  the user is not asked by the subagent. A step limit, an error or a failure to
+  start (`subagent <id> could not start: ...`) also come back as observations
+  and never fail the turn. An unknown id, or an agent without `examples`, gets
+  `unknown subagent <id>; available subagents: a, b`.
+- The user sees the subagent's thinking text, notes, model switches and usage
+  lines as for the orchestrator; its own reply text is not shown.
+- Cost: the subagent's calls add to the same session total as the orchestrator's,
+  so the total in the usage line never decreases. The total starts at $0 for
+  each new chat, model change or GUI client. The ledger records every call but
+  does not say which agent made it.
+
 ## Context inspector (GUI and terminal UI)
 
 The web GUI and the terminal UI have three tabs: `Chat`, `State` and `Trace`.
@@ -421,13 +530,21 @@ the prompt gets the focus back.
 
 - `State` shows the orchestrator state in collapsible sections: goal, findings,
   plan and environment (date and time, user name, computer name and `user_id`,
-  or `user_id: (not set)`), plus the turn and step counters. Below them is a preview
-  of the next request, built by the same code that builds the real one, with
+  or `user_id: (not set)`), the agents from `agents.yaml` (name, id, tags,
+  model tags and description) and the tools the orchestrator may use (name,
+  tags, description and an estimated schema size, then the estimated size of the
+  one-line listing sent in every request against the full schemas; 4 characters
+  count as 1 token, so these are estimates), plus the turn and step counters. Below them is a preview
+  of the next request, built by the same code that builds the real one (so it
+  includes the `## Subagents` section when there are subagents), with
   the character counts of the system message, the state JSON and the
   observation (the text typed in the prompt). In the terminal UI the system
   message and the state JSON start collapsed.
 - `Trace` shows the calls of the LAST turn as nested expansions: turn, then
-  step, then `llm_call` or `tool_call`. Each title reads
+  step, then `llm_call`, `tool_call` or `subagent`. A `subagent` span (collapsed
+  by default, like `llm_call` and `tool_call`) holds the subagent's own steps and
+  calls, and its details show the agent id, the outcome and the subagent's final
+  state. Each title reads
   `kind: name | status | N ms`. Open one to see its full, untruncated details:
   the messages sent, thinking text, reply, rejection reason, tool arguments and
   result, usage, `cost_usd`, `seconds`, `model` and `reported_model`. Secrets
@@ -551,6 +668,14 @@ known whether it accepts the `thinking` settings as sent.
   this.
 - `error: several orchestrator models share the top priority <n>: <ids>` appears
   before the app starts. Give one of them a higher `priority`.
+- `invalid agents.yaml: ...` appears before the app starts and names the agent
+  and the rule: no agent or several with the tag `orchestrator`, a duplicate id,
+  or `model_tags` that no chat model carries together. Fix `agents.yaml` or
+  `models.yaml`. A config made before agents existed has no `agents.yaml`: answer
+  `y` to the offer to write the example.
+- `tool <name> is not available; available tools: ...` and `invalid arguments
+  for tool <name>: ...` are observations the model receives, not errors shown to
+  you; if the model keeps repeating them, a stronger model may help (advice, not tested).
 - `error (unknown): the orchestrator reply was rejected 3 times; last error:
   <text>` means the model did not follow the JSON contract in 3 attempts; try a
   stronger model or `--model`. State from earlier valid steps is kept.
@@ -580,8 +705,12 @@ reachable.
 
 - The model sees no earlier messages, only the state; what the state does not
   hold is forgotten.
-- No tools and no subagents yet: the model is told not to use `call_tool` or
-  `delegate`, and `delegate` is answered with `delegate is not available yet`.
+- Subagents: depth 1 only, no grant or revoke of tools per delegation, no
+  parallel delegation, and a subagent's state is not kept between turns. The
+  State tab has no section for a subagent (see the Trace tab). A subagent may
+  fall back to a model tagged `default` outside its `model_tags`. No real model
+  run of delegation was done; the tests use scripted fake models.
+- Tools are only `tool_search`; there are no web, RAG or memory tools yet.
 - Usage and backoff are only saved if the SQLite file can be used; the new note
   and usage lines were not looked at in a real browser or terminal.
 - OpenAI is untested.

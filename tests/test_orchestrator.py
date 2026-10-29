@@ -4,8 +4,10 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import BaseModel, ConfigDict
 
-from llm_harness.config import ModelConfig
+from llm_harness.config import AgentConfig, ConfigError, ModelConfig
+from llm_harness.context import MAX_OBSERVATION_CHARS
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.state import RunState
 from llm_harness.tools import ToolContext, ToolRegistry
@@ -305,7 +307,7 @@ async def test_call_tool_forever_stops_at_the_step_cap() -> None:
     assert orchestrator.state.goal == "say hello"
     assert (
         observation(provider.requests[1])
-        == "unknown tool search; available tools: none"
+        == "tool search is not available; available tools: none"
     )
 
 
@@ -323,6 +325,10 @@ async def test_delegate_gets_a_not_available_observation_then_can_respond() -> N
     assert orchestrator.state.step == 2
 
 
+class AnyArguments(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
 class StubTool:
     """Test-only tool: returns a fixed text, or raises/hangs when told to."""
 
@@ -330,6 +336,9 @@ class StubTool:
         self, name: str = "search", result: str = "found it", *, error=None, hang=False
     ) -> None:
         self.name = name
+        self.description = f"Stub tool {name}."
+        self.tags: list[str] = []
+        self.input_model = AnyArguments
         self._result = result
         self._error = error
         self._hang = hang
@@ -337,7 +346,7 @@ class StubTool:
         self.contexts: list[ToolContext] = []
 
     async def run(self, arguments: dict[str, object], ctx: ToolContext) -> str:
-        self.calls.append(arguments)
+        self.calls.append(arguments.model_dump())
         self.contexts.append(ctx)
         if self._hang:
             await asyncio.Event().wait()
@@ -389,8 +398,66 @@ async def test_a_tool_run_gets_the_storage_user_agent_id_and_tags() -> None:
         user_id="ann",
         agent_id="orchestrator",
         tags=frozenset({"orchestrator"}),
+        allowed_tools=frozenset({"search"}),
     )
     assert ctx.storage is storage
+
+
+async def test_a_tool_run_gets_the_agent_id_and_tags_of_the_given_agent() -> None:
+    stub = StubTool()
+    stub.tags = ["lead"]
+    agent = AgentConfig(
+        id="boss",
+        name="Boss",
+        description="Leads.",
+        tags=["orchestrator", "lead"],
+        model_tags=[],
+    )
+    orchestrator, _ = make(
+        [reply_events(call("search"), SET_GOAL), reply_events(RESPOND)],
+        tools=registry(stub),
+        agent=agent,
+    )
+    await run(orchestrator, "hi")
+    (ctx,) = stub.contexts
+    assert (ctx.agent_id, ctx.tags) == ("boss", frozenset({"orchestrator", "lead"}))
+
+
+async def test_every_request_lists_the_agents_tools_by_name_and_description() -> None:
+    allowed, other = StubTool("search"), StubTool("other")
+    allowed.tags = ["lead"]
+    agent = AgentConfig(
+        id="boss", name="Boss", description="Leads.", tags=["lead"], model_tags=[]
+    )
+    orchestrator, provider = make(
+        [reply_events(RESPOND, SET_GOAL)],
+        tools=registry(allowed, other),
+        agent=agent,
+    )
+    await run(orchestrator, "hi")
+    user = provider.requests[0].messages[1].content
+    assert "## Tools\n\nsearch: Stub tool search.\n\n## Observation" in user
+    assert "other" not in user
+
+
+async def test_a_tool_run_gets_the_tools_of_the_agent_as_allowed_tools() -> None:
+    allowed, other = StubTool("search"), StubTool("other")
+    allowed.tags = ["lead"]
+    agent = AgentConfig(
+        id="boss",
+        name="Boss",
+        description="Leads.",
+        tags=["orchestrator", "lead"],
+        model_tags=[],
+    )
+    orchestrator, _ = make(
+        [reply_events(call("search"), SET_GOAL), reply_events(RESPOND)],
+        tools=registry(allowed, other),
+        agent=agent,
+    )
+    await run(orchestrator, "hi")
+    (ctx,) = allowed.contexts
+    assert ctx.allowed_tools == frozenset({"search"})
 
 
 async def test_a_tool_run_without_storage_gets_none() -> None:
@@ -412,9 +479,103 @@ async def test_unknown_tool_observation_lists_available_names_sorted() -> None:
     events = await run(orchestrator, "hi")
     assert (
         observation(provider.requests[1])
-        == "unknown tool nope; available tools: alpha, zeta"
+        == "tool nope is not available; available tools: alpha, zeta"
     )
     assert events[-1] == Done()
+
+
+class Typed(BaseModel):
+    count: int
+    label: str = "x"
+
+
+async def test_a_tool_outside_the_agents_set_is_not_run_and_the_loop_continues() -> (
+    None
+):
+    allowed, other = StubTool("search"), StubTool("other")
+    allowed.tags = ["lead"]
+    agent = AgentConfig(
+        id="boss",
+        name="Boss",
+        description="Leads.",
+        tags=["lead"],
+        model_tags=[],
+    )
+    orchestrator, provider = make(
+        [reply_events(call("other"), SET_GOAL), reply_events(RESPOND)],
+        tools=registry(allowed, other),
+        agent=agent,
+    )
+    events = await run(orchestrator, "hi")
+    assert other.calls == [] and allowed.calls == []
+    assert (
+        observation(provider.requests[1])
+        == "tool other is not available; available tools: search"
+    )
+    assert events[-1] == Done()
+
+
+async def test_an_agent_without_tools_is_told_there_are_none() -> None:
+    stub = StubTool()
+    agent = AgentConfig(
+        id="boss", name="Boss", description="Leads.", tags=["x"], model_tags=[]
+    )
+    orchestrator, provider = make(
+        [reply_events(call("search"), SET_GOAL), reply_events(RESPOND)],
+        tools=registry(stub),
+        agent=agent,
+    )
+    await run(orchestrator, "hi")
+    assert (
+        observation(provider.requests[1])
+        == "tool search is not available; available tools: none"
+    )
+
+
+async def test_valid_arguments_reach_the_tool_as_the_input_model() -> None:
+    stub = StubTool()
+    stub.input_model = Typed
+    orchestrator, provider = make(
+        [reply_events(call("search", count=3), SET_GOAL), reply_events(RESPOND)],
+        tools=registry(stub),
+    )
+    await run(orchestrator, "hi")
+    assert stub.calls == [{"count": 3, "label": "x"}]
+    assert observation(provider.requests[1]) == "tool search result: found it"
+
+
+async def test_invalid_arguments_are_not_run_and_never_echo_the_values() -> None:
+    stub = StubTool()
+    stub.input_model = Typed
+    secret = "sk-abcdefgh12345678"
+    orchestrator, provider = make(
+        [
+            reply_events(call("search", count=secret, extra=1), SET_GOAL),
+            reply_events(call("search"), SET_GOAL),
+            reply_events(RESPOND),
+        ],
+        tools=registry(stub),
+    )
+    events = await run(orchestrator, "hi")
+    assert stub.calls == []
+    first = observation(provider.requests[1])
+    assert first.startswith("invalid arguments for tool search: count: ")
+    assert secret not in everything(provider.requests[1])
+    assert secret not in first
+    assert observation(provider.requests[2]) == (
+        "invalid arguments for tool search: count: Field required"
+    )
+    assert events[-1] == Done()
+
+
+async def test_a_refused_call_marks_its_trace_span_as_an_error() -> None:
+    orchestrator, _ = make(
+        [reply_events(call("nope"), SET_GOAL), reply_events(RESPOND)],
+        tools=registry(StubTool()),
+    )
+    await run(orchestrator, "hi")
+    spans = [s for s in (orchestrator.last_trace or ()) if s.kind == "tool_call"]
+    assert [s.status for s in spans] == ["error"]
 
 
 async def test_failing_tool_gives_failed_observation_and_the_loop_continues() -> None:
@@ -829,3 +990,276 @@ async def test_the_next_turn_overwrites_a_restored_user_id() -> None:
     assert orchestrator.state.environment.user_id == "mallory"
     await run(orchestrator, "hi")
     assert orchestrator.state.environment.user_id == "ann"
+
+
+# --- delegate: the parent runs one child agent (scripted parent and child) ---
+
+
+def agent(
+    agent_id: str, *, tags: list[str] | None = None, examples: list[str] | None = None
+) -> AgentConfig:
+    return AgentConfig(
+        id=agent_id,
+        name=agent_id.title(),
+        description=f"{agent_id} does its work.",
+        tags=tags if tags is not None else [agent_id],
+        model_tags=["chat"],
+        examples=examples if examples is not None else [f"{agent_id} example"],
+    )
+
+
+RESEARCHER = agent("researcher")
+ANALYST = agent("analyst")
+WRITER = agent("writer", examples=[])
+ORCHESTRATOR_AGENT = agent("orchestrator", tags=["orchestrator"])
+CHILD_RESPOND = {"type": "respond", "text": "Paris"}
+CHILD_FINDING = {
+    "findings": {"$append": [{"text": "Paris is the capital", "source": "atlas"}]}
+}
+STEP_LIMIT_CHILD = [reply_events(call("search"))] * 5
+
+
+def delegate(subagent: str = "researcher", brief: str = "find the capital") -> dict:
+    return {"type": "delegate", "subagent": subagent, "brief": brief}
+
+
+def make_delegating(
+    parent_scripts: list[list[StreamEvent]],
+    child_scripts: list[list[list[StreamEvent]]],
+    *,
+    agents: tuple[AgentConfig, ...] = (RESEARCHER,),
+    **kwargs: object,
+) -> tuple[Orchestrator, ScriptedSteps, list[ScriptedSteps], list[AgentConfig]]:
+    """A parent whose factory hands out one scripted child provider per call."""
+    children = [ScriptedSteps(scripts) for scripts in child_scripts]
+    created: list[AgentConfig] = []
+
+    def factory(child: AgentConfig) -> tuple[ScriptedSteps, ModelConfig]:
+        created.append(child)
+        return children[len(created) - 1], model_cfg()
+
+    orchestrator, provider = make(
+        parent_scripts, subagents=agents, subagent_factory=factory, **kwargs
+    )
+    return orchestrator, provider, children, created
+
+
+async def test_delegation_result_and_findings_reach_the_next_request_then_respond() -> (
+    None
+):
+    orchestrator, parent, children, _ = make_delegating(
+        [reply_events(delegate(), SET_GOAL), reply_events(RESPOND)],
+        [[reply_events(CHILD_RESPOND, CHILD_FINDING)]],
+    )
+    events = await run(orchestrator, "capital?")
+    assert observation(parent.requests[1]) == (
+        "Paris\n- Paris is the capital (source: atlas)"
+    )
+    assert isinstance(events[-1], Done)
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert len(children[0].requests) == 1
+    assert "find the capital" in everything(children[0].requests[0])
+
+
+async def test_an_over_long_child_result_reaches_the_next_request_truncated() -> None:
+    long_text = "x" * (MAX_OBSERVATION_CHARS + 50)
+    orchestrator, parent, _, _ = make_delegating(
+        [reply_events(delegate(), SET_GOAL), reply_events(RESPOND)],
+        [[reply_events({"type": "respond", "text": long_text})]],
+    )
+    await run(orchestrator, "go")
+    seen = observation(parent.requests[1])
+    assert seen == (
+        "x" * MAX_OBSERVATION_CHARS + "\n[observation truncated: 50 characters removed]"
+    )
+
+
+async def test_a_short_child_result_is_not_truncated() -> None:
+    orchestrator, parent, _, _ = make_delegating(
+        [reply_events(delegate(), SET_GOAL), reply_events(RESPOND)],
+        [[reply_events(CHILD_RESPOND)]],
+    )
+    await run(orchestrator, "go")
+    assert observation(parent.requests[1]) == "Paris"
+
+
+async def test_a_child_that_never_responds_gives_a_step_limit_observation() -> None:
+    orchestrator, parent, children, _ = make_delegating(
+        [reply_events(delegate(), SET_GOAL), reply_events(RESPOND)],
+        [STEP_LIMIT_CHILD],
+    )
+    events = await run(orchestrator, "go")
+    assert observation(parent.requests[1]).startswith(
+        "subagent researcher reached its step limit of 5"
+    )
+    assert len(children[0].requests) == 5
+    assert isinstance(events[-1], Done)
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+
+
+async def test_the_parent_step_cap_stays_8_when_every_child_hits_its_limit() -> None:
+    orchestrator, parent, _, created = make_delegating(
+        [reply_events(delegate(), SET_GOAL)] * 8,
+        [STEP_LIMIT_CHILD] * 8,
+    )
+    events = await run(orchestrator, "go")
+    assert len(parent.requests) == 8
+    assert len(created) == 8
+    last = events[-1]
+    assert isinstance(last, ErrorEvent)
+    assert "step cap of 8" in last.message
+
+
+async def test_a_child_ask_user_gives_needs_and_the_user_is_not_asked() -> None:
+    orchestrator, parent, _, _ = make_delegating(
+        [reply_events(delegate(), SET_GOAL), reply_events(RESPOND)],
+        [[reply_events(ASK)]],
+    )
+    events = await run(orchestrator, "go")
+    assert observation(parent.requests[1]) == "needs: What do you want?"
+    assert orchestrator.pending_question is None
+    assert [e for e in events if isinstance(e, TextDelta)] == [TextDelta(text="hello")]
+
+
+async def test_a_child_provider_error_is_an_observation_not_a_parent_error() -> None:
+    orchestrator, parent, _, _ = make_delegating(
+        [reply_events(delegate(), SET_GOAL), reply_events(RESPOND)],
+        [[[ErrorEvent(kind="unknown", message="boom")]]],
+    )
+    events = await run(orchestrator, "go")
+    assert observation(parent.requests[1]) == "subagent researcher failed: boom"
+    assert isinstance(events[-1], Done)
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+
+
+@pytest.mark.parametrize("target", ["orchestrator", "writer", "nobody"])
+async def test_an_unknown_or_ineligible_subagent_lists_the_sorted_valid_ids(
+    target: str,
+) -> None:
+    orchestrator, parent, _, created = make_delegating(
+        [reply_events(delegate(target), SET_GOAL), reply_events(RESPOND)],
+        [],
+        agents=(RESEARCHER, WRITER, ORCHESTRATOR_AGENT, ANALYST),
+    )
+    await run(orchestrator, "go")
+    assert observation(parent.requests[1]) == (
+        f"unknown subagent {target}; available subagents: analyst, researcher"
+    )
+    assert created == []
+
+
+async def test_unknown_subagent_with_no_targets_says_none() -> None:
+    orchestrator, parent, _, _ = make_delegating(
+        [reply_events(delegate("nobody"), SET_GOAL), reply_events(RESPOND)],
+        [],
+        agents=(WRITER,),
+    )
+    await run(orchestrator, "go")
+    assert observation(parent.requests[1]).endswith("available subagents: none")
+
+
+async def test_the_request_lists_only_eligible_subagents() -> None:
+    orchestrator, parent, _, _ = make_delegating(
+        [reply_events(RESPOND, SET_GOAL)],
+        [],
+        agents=(RESEARCHER, WRITER, ORCHESTRATOR_AGENT),
+    )
+    await run(orchestrator, "go")
+    user = parent.requests[0].messages[1].content
+    assert (
+        "## Subagents\n\nresearcher: researcher does its work. (e.g. researcher example)"
+        in user
+    )
+    assert "writer:" not in user
+    assert "orchestrator:" not in user
+
+
+async def test_without_the_subagents_option_the_request_has_no_subagents_section() -> (
+    None
+):
+    orchestrator, provider = make([reply_events(RESPOND, SET_GOAL)])
+    await run(orchestrator, "go")
+    assert "## Subagents" not in provider.requests[0].messages[1].content
+
+
+async def test_without_a_factory_delegate_is_still_not_available_yet() -> None:
+    orchestrator, provider = make(
+        [reply_events(delegate(), SET_GOAL), reply_events(RESPOND)],
+        subagents=(RESEARCHER,),
+    )
+    await run(orchestrator, "go")
+    assert observation(provider.requests[1]) == "delegate is not available yet"
+
+
+async def test_a_factory_error_is_a_could_not_start_observation_and_is_redacted() -> (
+    None
+):
+    def factory(child: AgentConfig) -> tuple[ScriptedSteps, ModelConfig]:
+        raise ConfigError("no chat model; key sk-abcdefgh12345678")
+
+    orchestrator, provider = make(
+        [reply_events(delegate(), SET_GOAL), reply_events(RESPOND)],
+        subagents=(RESEARCHER,),
+        subagent_factory=factory,
+    )
+    events = await run(orchestrator, "go")
+    seen = observation(provider.requests[1])
+    assert seen.startswith("subagent researcher could not start: no chat model")
+    assert "sk-abcdefgh12345678" not in seen
+    assert isinstance(events[-1], Done)
+
+
+async def test_child_display_events_are_forwarded_and_its_answer_is_not() -> None:
+    report = UsageReport(
+        model_id="m1",
+        usage=None,
+        cost_usd=None,
+        seconds=0.1,
+        session_cost_usd=0.0,
+        session_cost_incomplete=False,
+    )
+    child_script = reply_events(CHILD_RESPOND, None, Notice(text="child note"))
+    child_script.insert(-1, report)
+    orchestrator, _, _, _ = make_delegating(
+        [reply_events(delegate(), SET_GOAL), reply_events(RESPOND)],
+        [[child_script]],
+    )
+    events = await run(orchestrator, "go")
+    assert Notice(text="child note") in events
+    assert report in events
+    assert [e for e in events if isinstance(e, TextDelta)] == [TextDelta(text="hello")]
+    assert [e for e in events if isinstance(e, Done)] == [Done()]
+
+
+async def test_each_delegation_gets_its_own_provider_from_the_factory() -> None:
+    orchestrator, parent, children, created = make_delegating(
+        [
+            reply_events(delegate(brief="first"), SET_GOAL),
+            reply_events(delegate(brief="second")),
+            reply_events(RESPOND),
+        ],
+        [
+            [reply_events(CHILD_RESPOND)],
+            [reply_events({"type": "respond", "text": "Lyon"})],
+        ],
+    )
+    await run(orchestrator, "go")
+    assert created == [RESEARCHER, RESEARCHER]
+    assert children[0] is not children[1]
+    assert [len(child.requests) for child in children] == [1, 1]
+    assert observation(parent.requests[1]) == "Paris"
+    assert observation(parent.requests[2]) == "Lyon"
+
+
+async def test_closing_the_stream_during_a_child_closes_the_child_provider() -> None:
+    orchestrator, _, children, _ = make_delegating(
+        [reply_events(delegate(), SET_GOAL)],
+        [[reply_events(CHILD_RESPOND, None, Notice(text="child note"))]],
+    )
+    stream = orchestrator.send("go")
+    async for event in stream:
+        if event == Notice(text="child note"):
+            break
+    await stream.aclose()
+    assert children[0].closed
+    assert orchestrator._busy is False

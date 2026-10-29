@@ -5,8 +5,15 @@ import re
 from importlib.resources import files
 from pathlib import Path
 
-from llm_harness.config import ModelConfig
-from llm_harness.context import MAX_OBSERVATION_CHARS, build_request
+from llm_harness.config import AgentConfig, ModelConfig
+from llm_harness.context import (
+    MAX_OBSERVATION_CHARS,
+    _system_prompt,
+    build_request,
+    delegation_targets,
+    subagent_instructions,
+    subagent_lines,
+)
 from llm_harness.state import (
     DEFAULT_MAX_CHARS,
     Environment,
@@ -16,6 +23,7 @@ from llm_harness.state import (
     reply_schema,
 )
 from tests.test_state import NOW
+from tests.test_tools import FakeTool
 
 CANARY = "CANARY-7f3a91"
 INSTRUCTIONS = (files("llm_harness") / "prompts" / "orchestrator.md").read_text("utf-8")
@@ -65,9 +73,9 @@ def test_request_has_system_then_user_message_with_expected_content() -> None:
     assert Reply.model_json_schema()["title"] in system
     assert state.model_dump_json() in user
     assert "tool said hi" in user
-    # nothing but the state and the observation, plus their two headings
+    # nothing but the state, the (empty) tool list and the observation, plus headings
     rest = user.replace(state.model_dump_json(), "").replace("tool said hi", "")
-    assert rest.split() == ["##", "State", "##", "Observation"]
+    assert rest.split() == ["##", "State", "##", "Tools", "(none)", "##", "Observation"]
 
 
 def test_canary_in_an_old_observation_never_reaches_later_requests() -> None:
@@ -199,3 +207,185 @@ def test_prompt_file_is_packaged_data_and_not_empty() -> None:
     prompt = files("llm_harness") / "prompts" / "orchestrator.md"
     assert prompt.is_file()
     assert prompt.read_text("utf-8").strip()
+
+
+def test_the_user_message_lists_the_tools_between_state_and_observation() -> None:
+    tools = [FakeTool("alpha", "Does a."), FakeTool("beta", "Does b.")]
+    user = (
+        build_request(make_state(), "obs", model_cfg(), tools=tools).messages[1].content
+    )
+    assert (
+        "\n\n## Tools\n\nalpha: Does a.\nbeta: Does b.\n\n## Observation\n\nobs" in user
+    )
+    assert (
+        user.index("## State") < user.index("## Tools") < user.index("## Observation")
+    )
+
+
+def test_the_user_message_says_none_when_there_are_no_tools() -> None:
+    user = build_request(make_state(), "obs", model_cfg()).messages[1].content
+    assert "## Tools\n\n(none)\n\n## Observation" in user
+
+
+def test_tool_schemas_never_enter_the_request() -> None:
+    from pydantic import BaseModel
+
+    class Secretive(BaseModel):
+        hidden_field_name: str
+
+    request = build_request(
+        make_state(), "obs", model_cfg(), tools=[FakeTool("t", input_model=Secretive)]
+    )
+    assert "hidden_field_name" not in "\n".join(m.content for m in request.messages)
+
+
+def test_the_instructions_point_to_tool_search_and_no_longer_say_no_tools_exist() -> (
+    None
+):
+    system = build_request(make_state(), "obs", model_cfg()).messages[0].content
+    assert "tool_search" in system and "## Tools" in system
+    assert "No tools exist yet" not in system
+
+
+def test_the_instructions_explain_delegate_and_no_longer_call_it_unavailable() -> None:
+    system = build_request(make_state(), "obs", model_cfg()).messages[0].content
+    assert "not available yet" not in system
+    assert "## Subagents" in system and "brief" in system
+
+
+SUBAGENT_PROMPT = (files("llm_harness") / "prompts" / "subagent.md").read_text("utf-8")
+
+
+def _schema_part(system: str) -> str:
+    return system[system.index("## Reply schema") :]
+
+
+def test_without_instructions_the_system_message_is_the_orchestrator_prompt() -> None:
+    default = build_request(make_state(), "obs", model_cfg())
+    explicit = build_request(make_state(), "obs", model_cfg(), instructions=None)
+    assert default == explicit
+    assert default.messages[0].content == _system_prompt()
+    assert default.messages[0].content.startswith(INSTRUCTIONS.rstrip())
+
+
+def test_given_instructions_replace_the_prompt_and_keep_both_schemas() -> None:
+    text = "# Custom\n\nDo the thing."
+    custom = build_request(make_state(), "obs", model_cfg(), instructions=text)
+    system = custom.messages[0].content
+    default = build_request(make_state(), "obs", model_cfg()).messages[0].content
+    assert system.startswith(text)
+    assert INSTRUCTIONS.rstrip() not in system
+    assert "## Reply schema" in system and "## State schema" in system
+    assert _schema_part(system) == _schema_part(default)
+    assert custom.response_schema == reply_schema()
+
+
+def test_instructions_do_not_change_the_user_message() -> None:
+    tools = [FakeTool("alpha", "Does a.")]
+    plain = build_request(make_state(goal="g"), "obs", model_cfg(), tools=tools)
+    custom = build_request(
+        make_state(goal="g"), "obs", model_cfg(), tools=tools, instructions="x"
+    )
+    assert texts(custom)[1] == texts(plain)[1]
+
+
+def test_subagent_instructions_fill_identity_and_keep_other_braces() -> None:
+    text = subagent_instructions("researcher", "Researcher", "Finds facts")
+    assert "subagent researcher (Researcher): Finds facts" in text
+    for placeholder in ("{agent_id}", "{agent_name}", "{description}"):
+        assert placeholder not in text
+    assert '{"state_patch": {"findings": {"$append"' in text
+
+
+def test_a_value_that_looks_like_a_placeholder_is_not_substituted_again() -> None:
+    text = subagent_instructions("a", "{description}", "{agent_id}")
+    assert "subagent a ({description}): {agent_id}" in text
+
+
+def test_the_subagent_prompt_covers_the_rules_a_subagent_must_follow() -> None:
+    assert "respond" in SUBAGENT_PROMPT
+    assert "ask_user" in SUBAGENT_PROMPT
+    assert "delegate is not available to subagents" in SUBAGENT_PROMPT
+    assert "at most 5 steps" in SUBAGENT_PROMPT
+    assert "state_patch" in SUBAGENT_PROMPT and "source" in SUBAGENT_PROMPT
+
+
+def agent(**overrides: object) -> AgentConfig:
+    fields: dict[str, object] = {
+        "id": "a",
+        "name": "A",
+        "description": "An agent.",
+        "tags": [],
+        "model_tags": [],
+    }
+    return AgentConfig.model_validate(fields | overrides)
+
+
+def _user(**kwargs: object) -> str:
+    return build_request(make_state(), "obs", model_cfg(), **kwargs).messages[1].content  # type: ignore[arg-type]
+
+
+def test_the_orchestrator_agent_is_never_a_delegation_target() -> None:
+    boss = agent(id="boss", tags=["orchestrator"], examples=["plan"])
+    assert delegation_targets([boss]) == []
+
+
+def test_an_agent_without_examples_is_not_a_delegation_target() -> None:
+    assert delegation_targets([agent(id="quiet")]) == []
+
+
+def test_targets_keep_the_given_order() -> None:
+    ids = ["z", "b", "m"]
+    agents = [agent(id=i, examples=["x"]) for i in ids]
+    agents.insert(1, agent(id="boss", tags=["orchestrator"], examples=["x"]))
+    assert [a.id for a in delegation_targets(agents)] == ids
+
+
+def test_subagent_lines_show_id_description_and_examples() -> None:
+    agents = [
+        agent(id="researcher", description="Finds facts.", examples=["look up a; b"]),
+        agent(id="coder", description="Writes code.", examples=["fix a bug", "add x"]),
+    ]
+    assert subagent_lines(agents) == (
+        "researcher: Finds facts. (e.g. look up a; b)\n"
+        "coder: Writes code. (e.g. fix a bug; add x)"
+    )
+
+
+def test_subagent_lines_say_none_without_targets() -> None:
+    assert subagent_lines([]) == "(none)"
+
+
+def test_the_user_message_lists_subagents_between_tools_and_observation() -> None:
+    user = _user(subagents=[agent(id="r", description="D.", examples=["e1", "e2"])])
+    assert (
+        "## Tools\n\n(none)\n\n## Subagents\n\nr: D. (e.g. e1; e2)\n\n## Observation"
+        in user
+    )
+    assert (
+        user.index("## Tools")
+        < user.index("## Subagents")
+        < user.index("## Observation")
+    )
+
+
+def test_no_subagents_leaves_the_user_message_unchanged() -> None:
+    assert _user(subagents=[]) == _user()
+    assert "## Subagents" not in _user()
+
+
+def test_only_ineligible_subagents_add_no_section() -> None:
+    ineligible = [
+        agent(id="boss", tags=["orchestrator"], examples=["x"]),
+        agent(id="q"),
+    ]
+    assert _user(subagents=ineligible) == _user()
+    assert "## Subagents" not in _user(subagents=ineligible)
+
+
+def test_subagents_do_not_change_the_system_message() -> None:
+    offered = [agent(id="r", examples=["e"])]
+    assert (
+        texts(build_request(make_state(), "obs", model_cfg(), subagents=offered))[0]
+        == texts(build_request(make_state(), "obs", model_cfg()))[0]
+    )

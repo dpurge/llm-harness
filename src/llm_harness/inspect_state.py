@@ -5,14 +5,21 @@ Pure: no nicegui, no textual. Every model-derived string goes through
 """
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from llm_harness.config import ModelConfig
-from llm_harness.context import MAX_OBSERVATION_CHARS, answer_observation, build_request
+from llm_harness.config import ORCHESTRATOR_TAG, AgentConfig, ModelConfig
+from llm_harness.context import (
+    MAX_OBSERVATION_CHARS,
+    answer_observation,
+    build_request,
+    tool_lines,
+)
 from llm_harness.display import sanitize_text
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.state import Finding, OrchestratorState, PlanStep
+from llm_harness.tools import Tool, estimate_tokens, schema_text
 from llm_harness.trace import Span
 
 
@@ -54,6 +61,45 @@ def environment_text(state: OrchestratorState, question: str | None) -> str:
     )
 
 
+def agent_text(agent: AgentConfig) -> str:
+    role = " (orchestrator)" if ORCHESTRATOR_TAG in agent.tags else ""
+    return (
+        f"{sanitize_text(agent.name)} [{sanitize_text(agent.id)}]{role}\n"
+        f"  tags: {sanitize_text(', '.join(agent.tags)) or '(none)'}\n"
+        f"  model_tags: {sanitize_text(', '.join(agent.model_tags)) or '(none)'}\n"
+        f"  {sanitize_text(agent.description)}"
+    )
+
+
+def agents_text(agents: Sequence[AgentConfig]) -> str:
+    return "\n\n".join(agent_text(agent) for agent in agents) or "(none)"
+
+
+def tool_text(tool: Tool) -> str:
+    return (
+        f"{sanitize_text(tool.name)}\n"
+        f"  tags: {sanitize_text(', '.join(tool.tags)) or '(none)'}\n"
+        f"  {sanitize_text(tool.description)}\n"
+        f"  schema ~{estimate_tokens(schema_text(tool))} tokens"
+    )
+
+
+def tools_text(tools: Sequence[Tool]) -> str:
+    """The tools the agent may use, and what listing them costs next to their schemas.
+
+    Token counts are estimates (4 characters per token), not tokenizer counts.
+    """
+    if not tools:
+        return "(none)"
+    listing = estimate_tokens(tool_lines(tools))
+    schemas = sum(estimate_tokens(schema_text(tool)) for tool in tools)
+    totals = (
+        f"listing sent in every request: ~{listing} tokens\n"
+        f"full schemas of these tools would be: ~{schemas} tokens"
+    )
+    return "\n\n".join([*(tool_text(tool) for tool in tools), totals])
+
+
 @dataclass(frozen=True)
 class RequestPreview:
     """The request the next send would build, as the text a panel shows."""
@@ -70,7 +116,13 @@ def build_preview(
 ) -> RequestPreview:
     """Preview of the next request, from the same `build_request` `send` calls."""
     observation = preview_observation(orchestrator, typed)
-    request = build_request(orchestrator.state, observation, model)
+    request = build_request(
+        orchestrator.state,
+        observation,
+        model,
+        tools=orchestrator.available_tools(),
+        subagents=orchestrator.subagents,
+    )
     system, user = request.messages
     cut = (
         f" (cut to {MAX_OBSERVATION_CHARS} in the request)"
@@ -90,7 +142,16 @@ def build_preview(
 
 # Attributes that can be long: each is shown in its own collapsed section, whole.
 # Every other attribute is one short line of the span's details.
-LONG_FIELDS = ("messages", "thinking", "reply", "rejection", "arguments", "result")
+# `state` (a subagent's final state) comes last: it summarises the whole run.
+LONG_FIELDS = (
+    "messages",
+    "thinking",
+    "reply",
+    "rejection",
+    "arguments",
+    "result",
+    "state",
+)
 OPEN_BY_DEFAULT = ("turn", "step")
 
 

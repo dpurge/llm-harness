@@ -27,6 +27,7 @@ from llm_harness.redact import Secret
 
 CONFIG_FILE = "config.toml"
 MODELS_FILE = "models.yaml"
+AGENTS_FILE = "agents.yaml"
 
 NonEmptyStr = Annotated[str, Field(min_length=1)]
 
@@ -160,6 +161,8 @@ class ModelConfig(_Frozen):
 
 
 USER_ID_MAX_LENGTH = 128
+
+ORCHESTRATOR_TAG = "orchestrator"
 
 
 def _check_user_id(value: object) -> str | None:
@@ -295,12 +298,70 @@ class StorageConfig(_Frozen):
     files: FilesConfig = FilesConfig()
 
 
+def _check_tag_list(values: list[str]) -> list[str]:
+    for value in values:
+        if not value or value != value.lower() or any(c.isspace() for c in value):
+            raise ValueError(
+                f"{value!r} must be non-empty, lowercase and contain no spaces"
+            )
+    duplicates = sorted({v for v in values if values.count(v) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate entries: {', '.join(duplicates)}")
+    return values
+
+
+class AgentConfig(_Frozen):
+    id: NonEmptyStr
+    name: NonEmptyStr
+    description: NonEmptyStr
+    tags: list[str]
+    model_tags: list[str]
+    examples: list[NonEmptyStr] = []
+    tools: list[NonEmptyStr] = []
+    deny: list[NonEmptyStr] = []
+
+    _tag_rules = field_validator("tags", "model_tags")(_check_tag_list)
+
+    @model_validator(mode="after")
+    def _check_tools_and_deny(self) -> Self:
+        both = sorted(set(self.tools) & set(self.deny))
+        if both:
+            raise ValueError(
+                f"agent {self.id!r} lists {', '.join(both)} in both tools and deny"
+            )
+        return self
+
+
+def _check_agents(agents: list[AgentConfig], models: list[ModelConfig]) -> None:
+    ids = [agent.id for agent in agents]
+    duplicates = sorted({i for i in ids if ids.count(i) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate agent ids: {', '.join(duplicates)}")
+    chat_tag_sets = [set(m.tags) for m in models if "embedding" not in m.tags]
+    for agent in agents:
+        wanted = set(agent.model_tags)
+        if not any(wanted <= tags for tags in chat_tag_sets):
+            raise ValueError(
+                f"agent {agent.id!r}: no chat model carries all of model_tags "
+                f"{agent.model_tags}"
+            )
+    if agents:
+        orchestrators = [a.id for a in agents if ORCHESTRATOR_TAG in a.tags]
+        if len(orchestrators) != 1:
+            found = ", ".join(orchestrators) or "none"
+            raise ValueError(
+                f"exactly one agent must carry the tag {ORCHESTRATOR_TAG!r}; "
+                f"found: {found}"
+            )
+
+
 class HarnessConfig(_Frozen):
     providers: dict[str, ProviderConfig]
     models: list[ModelConfig]
     # The same on every computer, so the orchestrator can tell whose state it is.
     user_id: str | None = None
     storage: StorageConfig = StorageConfig()
+    agents: list[AgentConfig] = []
 
     _user_id_rule = field_validator("user_id", mode="before")(_check_user_id)
 
@@ -315,6 +376,7 @@ class HarnessConfig(_Frozen):
                 raise ValueError(
                     f"model {model.id!r} uses unknown provider {model.provider!r}"
                 )
+        _check_agents(self.agents, self.models)
         return self
 
 
@@ -376,7 +438,10 @@ def _load_storage(raw: object) -> StorageConfig:
 def load_config(config_dir: Path) -> HarnessConfig:
     config_path = config_dir / CONFIG_FILE
     models_path = config_dir / MODELS_FILE
-    missing = [path for path in (config_path, models_path) if not path.is_file()]
+    agents_path = config_dir / AGENTS_FILE
+    missing = [
+        path for path in (config_path, models_path, agents_path) if not path.is_file()
+    ]
     if missing:
         raise MissingConfigError(missing)
 
@@ -404,18 +469,52 @@ def load_config(config_dir: Path) -> HarnessConfig:
         raise ConfigError(f"invalid {CONFIG_FILE}: {exc}") from None
     storage = _load_storage(toml_data.get("storage", {}))
 
-    yaml_data = _read_yaml(models_path)
+    models = _load_models(models_path)
+    agents = _load_agents(agents_path, models)
+    try:
+        return HarnessConfig(
+            providers=providers,
+            models=models,
+            user_id=user_id,
+            storage=storage,
+            agents=agents,
+        )
+    except ValidationError as exc:
+        raise _format_validation_error(MODELS_FILE, exc) from None
+
+
+def _load_models(path: Path) -> list[ModelConfig]:
+    yaml_data = _read_yaml(path)
     if not isinstance(yaml_data, dict) or set(yaml_data) != {"models"}:
         raise ConfigError(
             f"invalid {MODELS_FILE}: top level must be a mapping with only 'models'"
         )
     try:
-        models = TypeAdapter(list[ModelConfig]).validate_python(yaml_data["models"])
-        return HarnessConfig(
-            providers=providers, models=models, user_id=user_id, storage=storage
-        )
+        return TypeAdapter(list[ModelConfig]).validate_python(yaml_data["models"])
     except ValidationError as exc:
         raise _format_validation_error(MODELS_FILE, exc) from None
+
+
+def _load_agents(path: Path, models: list[ModelConfig]) -> list[AgentConfig]:
+    yaml_data = _read_yaml(path)
+    if not isinstance(yaml_data, dict) or set(yaml_data) != {"agents"}:
+        raise ConfigError(
+            f"invalid {AGENTS_FILE}: top level must be a mapping with only 'agents'"
+        )
+    try:
+        agents = TypeAdapter(list[AgentConfig]).validate_python(yaml_data["agents"])
+    except ValidationError as exc:
+        raise _format_validation_error(AGENTS_FILE, exc) from None
+    if not agents:
+        raise ConfigError(
+            f"invalid {AGENTS_FILE}: declare at least one agent, "
+            f"tagged {ORCHESTRATOR_TAG!r}"
+        )
+    try:
+        _check_agents(agents, models)
+    except ValueError as exc:
+        raise ConfigError(f"invalid {AGENTS_FILE}: {exc}") from None
+    return agents
 
 
 def resolve_api_key(provider: ProviderConfig) -> Secret | None:
@@ -466,6 +565,11 @@ def permission_warnings(config_dir: Path) -> list[str]:
 def resolve_think(flag: bool | None, model: ModelConfig) -> bool | None:
     """CLI flag > model `thinking` > None (the model's own default)."""
     return flag if flag is not None else model.thinking
+
+
+def find_orchestrator_agent(config: HarnessConfig) -> AgentConfig | None:
+    """The orchestrator agent, or None for a config built without agents (tests)."""
+    return next((a for a in config.agents if ORCHESTRATOR_TAG in a.tags), None)
 
 
 def _lookup_model(config: HarnessConfig, model_id: str) -> ModelConfig:
@@ -521,6 +625,22 @@ def select_orchestrator_model(
             "no model is tagged 'orchestrator'; tag one in models.yaml or use --model"
         )
     return _top_priority(candidates, "orchestrator")
+
+
+def select_agent_model(config: HarnessConfig, agent: AgentConfig) -> ModelConfig:
+    """The chat model for a subagent: top priority among those carrying all its model_tags."""
+    wanted = set(agent.model_tags)
+    candidates = [
+        model
+        for model in config.models
+        if "embedding" not in model.tags and wanted <= set(model.tags)
+    ]
+    if not candidates:
+        raise ConfigError(
+            f"no chat model carries all model_tags {agent.model_tags} "
+            f"of agent {agent.id!r}; tag one in models.yaml"
+        )
+    return _top_priority(candidates, f"agent {agent.id!r}")
 
 
 def select_embedding_model(config: HarnessConfig, model_id: str | None) -> ModelConfig:
@@ -671,9 +791,44 @@ models:
   # --- embedding example: end ---
 """
 
+EXAMPLE_AGENTS_YAML = """\
+# llm-harness agents: who can do work. No secrets here.
+# Lines that start with "# " are notes.
+#
+# Every entry has these keys:
+#   id           short unique name.
+#   name         the label people see.
+#   description  what the agent is for, in one sentence.
+#   tags         a list of lowercase labels without spaces. Exactly one agent
+#                must carry the tag orchestrator: it reads your prompt and
+#                assembles the reply.
+#   model_tags   the tags a model in models.yaml must carry (all of them)
+#                for this agent. At least one chat model must match.
+#   examples     optional. Example requests the agent handles.
+#   tools        optional. Names of tools the agent may use.
+#   deny         optional. Names of tools the agent may never use.
+agents:
+  - id: orchestrator
+    name: Orchestrator
+    description: Reads the user's prompt, keeps the goal, and assembles the reply.
+    tags: [orchestrator]
+    model_tags: [orchestrator]
+
+  - id: researcher
+    name: Researcher
+    description: Looks up facts and reports what it found with its sources.
+    tags: [research]
+    model_tags: [chat]
+    tools: [tool_search]
+    examples:
+      - Find out when the Eiffel Tower was built.
+      - Look up the latest stable version of Python.
+"""
+
 _EXAMPLES = {
     CONFIG_FILE: (EXAMPLE_CONFIG_TOML, 0o600),
     MODELS_FILE: (EXAMPLE_MODELS_YAML, 0o644),
+    AGENTS_FILE: (EXAMPLE_AGENTS_YAML, 0o644),
 }
 
 

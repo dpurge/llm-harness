@@ -29,9 +29,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - `user_id` key in `config.toml`, carried in the orchestrator state's environment block, shown to the model and in the State tab of the GUI and TUI inspectors.
 - `[storage]` table in `config.toml` (`relational`, `vector`, `files`) that chooses where data lives, and `llm-harness --storage-status`, which shows the state of the stores without changing anything; the local vector store (qdrant-edge) and file store behind it are internal for now.
 - Embedding models in `models.yaml`: the tag `embedding`, an optional `dimensions`, an `Embedder` with `embed` on the Ollama, OpenAI-compatible and Vertex adapters, and an opt-in live test (`uv run pytest -m live tests/test_live_ollama.py -k embed -rs`); nothing calls them yet.
+- `agents.yaml` next to `models.yaml`: agents with `id`, `name`, `description`, `tags`, `model_tags` and optional `examples`, `tools` and `deny`; exactly one agent carries the tag `orchestrator`, and the orchestrator takes its id and tags from it. The file is required: when it is missing the program stops and offers to write an example. The State tab of the GUI and the terminal UI lists the agents.
+- Typed tools and a tool registry: a tool has a name, a one-line description, tags and a typed input; an agent may use the tools whose tags meet its own plus those in its `tools`, minus its `deny`; an unknown tool name in `agents.yaml` stops startup. The orchestrator gets the tool `tool_search`; every request lists the orchestrator's tools by name and description, and `tool_search` returns their argument schemas. A `call_tool` outside the agent's tools, or with arguments that do not fit the schema, is not run and the model is told why. The State tab of the GUI and the terminal UI shows the tools and an estimate of the listing size against the full schemas.
+- Subagents: the orchestrator's `delegate` action now runs one child agent from `agents.yaml` (depth 1, at most 5 steps and 2 retries per reply, its own typed state with the goal preset from the brief, only its own tools, its model chosen by its `model_tags`); the result comes back as one observation (its answer plus findings with sources, `needs: <question>` when it asks, or a note that it hit its step limit or failed), and every request lists the available subagents under `## Subagents`.
+- Example agent `researcher` in the `agents.yaml` the program offers to write (tag `research`, `model_tags: [chat]`, tool `tool_search`, two examples).
+- Trace tab: a `subagent` span that holds the subagent's own steps and calls and its final state; the State tab's request preview shows the `## Subagents` section.
 
 ### Changed
 
+- `examples` in `agents.yaml` is now used: an agent other than the orchestrator with at least one example is offered to the orchestrator as a subagent, and one without examples is not.
+- `delegate` no longer answers `delegate is not available yet` when subagents are configured; the model is told to use the `## Subagents` list.
+- The session total in the usage line now includes the calls of subagents, and it never decreases within a session.
 - The GUI prompt gets the focus back when a turn ends.
 - All front ends now run through the orchestrator: replies appear whole when a step finishes, not word by word; thinking text still streams.
 - BREAKING for existing configs: at least one model in `models.yaml` needs the `orchestrator` tag; without it startup stops with `no model is tagged 'orchestrator'; tag one in models.yaml or use --model`.

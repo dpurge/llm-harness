@@ -18,6 +18,7 @@ import pytest
 
 from llm_harness.cli import main
 from llm_harness.config import (
+    AGENTS_FILE,
     CONFIG_FILE,
     MODELS_FILE,
     ConfigError,
@@ -88,6 +89,18 @@ def _write_config(directory: Path, local: ModelConfig, local_url: str | None) ->
     (directory / CONFIG_FILE).write_text(toml)
     (directory / CONFIG_FILE).chmod(0o600)
     (directory / MODELS_FILE).write_text(json.dumps(models))
+    agents = {
+        "agents": [
+            {
+                "id": "orchestrator",
+                "name": "Orchestrator",
+                "description": "Assembles the reply.",
+                "tags": ["orchestrator"],
+                "model_tags": [],
+            }
+        ]
+    }
+    (directory / AGENTS_FILE).write_text(json.dumps(agents))
 
 
 def _capped_provider(config: ProviderConfig) -> ChatProvider:

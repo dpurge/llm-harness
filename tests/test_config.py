@@ -7,8 +7,10 @@ import pytest
 from pydantic import TypeAdapter
 
 from llm_harness.config import (
+    EXAMPLE_AGENTS_YAML,
     EXAMPLE_CONFIG_TOML,
     EXAMPLE_MODELS_YAML,
+    AgentConfig,
     ConfigError,
     FilesConfig,
     HarnessConfig,
@@ -22,10 +24,12 @@ from llm_harness.config import (
     chat_models,
     default_config_dir,
     default_data_dir,
+    find_orchestrator_agent,
     load_config,
     permission_warnings,
     resolve_api_key,
     resolve_think,
+    select_agent_model,
     select_embedding_model,
     select_model,
     select_orchestrator_model,
@@ -63,13 +67,27 @@ def config_of(*models: dict[str, Any]) -> HarnessConfig:
     )
 
 
+AGENTS_WITHOUT_MODEL_TAGS = (
+    "agents:\n  - id: boss\n    name: Boss\n    description: Leads.\n"
+    "    tags: [orchestrator]\n    model_tags: []\n"
+)
+
+
+CHAT_MODEL_ENTRY = (
+    "  - id: chat\n    name: Chat\n    provider: local\n    model: y\n"
+    "    tags: [default]\n    priority: 1\n"
+)
+
+
 def write_config(
     tmp_path: Path,
     toml: str = EXAMPLE_CONFIG_TOML,
     models_yaml: str = EXAMPLE_MODELS_YAML,
+    agents_yaml: str = EXAMPLE_AGENTS_YAML,
 ) -> None:
     (tmp_path / "config.toml").write_text(toml)
     (tmp_path / "models.yaml").write_text(models_yaml)
+    (tmp_path / "agents.yaml").write_text(agents_yaml)
 
 
 def models_yaml_with(body: str) -> str:
@@ -357,7 +375,11 @@ def test_models_extra_key_in_file_names_file(tmp_path: Path):
 
 def test_unknown_provider_in_file_names_models_file(tmp_path: Path):
     body = "    tags: []\n    priority: 1\n"
-    write_config(tmp_path, models_yaml=models_yaml_with(body).replace("local", "nope"))
+    write_config(
+        tmp_path,
+        models_yaml=models_yaml_with(body).replace("local", "nope"),
+        agents_yaml=AGENTS_WITHOUT_MODEL_TAGS,
+    )
     assert "models.yaml" in str(load_error(tmp_path))
 
 
@@ -386,10 +408,14 @@ def test_yaml_python_tag_is_rejected_and_not_executed(tmp_path: Path):
 def test_missing_lists_both_files_when_dir_empty(tmp_path: Path):
     with pytest.raises(MissingConfigError) as info:
         load_config(tmp_path)
-    assert info.value.missing == [tmp_path / "config.toml", tmp_path / "models.yaml"]
+    assert info.value.missing == [
+        tmp_path / "config.toml",
+        tmp_path / "models.yaml",
+        tmp_path / "agents.yaml",
+    ]
 
 
-@pytest.mark.parametrize("absent", ["config.toml", "models.yaml"])
+@pytest.mark.parametrize("absent", ["config.toml", "models.yaml", "agents.yaml"])
 def test_missing_lists_only_absent_file(tmp_path: Path, absent: str):
     write_config(tmp_path)
     (tmp_path / absent).unlink()
@@ -404,10 +430,17 @@ def test_missing_lists_only_absent_file(tmp_path: Path, absent: str):
 
 def test_write_examples_round_trip(tmp_path: Path):
     config_dir = tmp_path / "new" / "dir"
-    missing = [config_dir / "config.toml", config_dir / "models.yaml"]
+    missing = [
+        config_dir / "config.toml",
+        config_dir / "models.yaml",
+        config_dir / "agents.yaml",
+    ]
     assert write_examples(config_dir, missing) == missing
     assert (config_dir / "config.toml").stat().st_mode & 0o777 == 0o600
     assert (config_dir / "models.yaml").stat().st_mode & 0o777 == 0o644
+    assert (config_dir / "agents.yaml").stat().st_mode & 0o777 == 0o644
+    found = find_orchestrator_agent(load_config(config_dir))
+    assert found is not None and found.id == "orchestrator"
     assert select_model(load_config(config_dir), None).id == "gemma-local"
 
 
@@ -606,6 +639,60 @@ def test_orchestrator_unknown_id_lists_valid_ids():
         select_orchestrator_model(cfg, "zzz")
 
 
+def agent_config(**overrides: Any) -> AgentConfig:
+    return AgentConfig.model_validate(
+        agent(id="sub", tags=["research"], model_tags=["chat"]) | overrides
+    )
+
+
+def test_agent_model_picks_highest_priority_carrying_all_tags():
+    cfg = config_of(
+        model(id="low", priority=1, tags=["chat", "cheap"]),
+        model(id="high", priority=5, tags=["chat", "cheap", "x"]),
+        model(id="top-missing-tag", priority=9, tags=["chat"]),
+    )
+    chosen = select_agent_model(cfg, agent_config(model_tags=["chat", "cheap"]))
+    assert chosen.id == "high"
+
+
+def test_agent_model_skips_a_model_missing_one_tag():
+    cfg = config_of(
+        model(id="partial", priority=9, tags=["chat"]),
+        model(id="full", priority=1, tags=["chat", "cheap"]),
+    )
+    chosen = select_agent_model(cfg, agent_config(model_tags=["chat", "cheap"]))
+    assert chosen.id == "full"
+
+
+def test_agent_model_never_chooses_an_embedding_model():
+    cfg = config_of(
+        model(id="emb", priority=9, tags=["embedding"]),
+        model(id="chat", priority=1, tags=["chat"]),
+    )
+    assert select_agent_model(cfg, agent_config(model_tags=[])).id == "chat"
+
+
+def test_agent_model_none_matching_names_the_agent_and_its_tags():
+    cfg = config_of(model(id="a", tags=["chat"]))
+    with pytest.raises(ConfigError, match=r"agent 'sub'.*\['nope'\]|\['nope'\].*'sub'"):
+        select_agent_model(cfg, agent_config(model_tags=["nope"]))
+
+
+def test_agent_model_only_embedding_models_is_an_error():
+    cfg = config_of(model(id="emb", tags=["embedding"]))
+    with pytest.raises(ConfigError, match="agent 'sub'"):
+        select_agent_model(cfg, agent_config(model_tags=[]))
+
+
+def test_agent_model_tie_at_top_priority_names_the_ids():
+    cfg = config_of(
+        model(id="a", priority=2, tags=["chat"]),
+        model(id="b", priority=2, tags=["chat"]),
+    )
+    with pytest.raises(ConfigError, match="a, b"):
+        select_agent_model(cfg, agent_config())
+
+
 def test_example_models_yaml_tags_the_example_model_orchestrator(tmp_path: Path):
     write_config(tmp_path)
     selected = select_orchestrator_model(load_config(tmp_path), None)
@@ -621,14 +708,22 @@ def test_dimensions_absent_is_none():
 
 def test_dimensions_valid_value_loads(tmp_path: Path):
     body = "    tags: [embedding]\n    priority: 1\n    dimensions: 256\n"
-    write_config(tmp_path, models_yaml=models_yaml_with(body))
+    write_config(
+        tmp_path,
+        models_yaml=models_yaml_with(body) + CHAT_MODEL_ENTRY,
+        agents_yaml=AGENTS_WITHOUT_MODEL_TAGS,
+    )
     assert load_config(tmp_path).models[0].dimensions == 256
 
 
 @pytest.mark.parametrize("value", [0, -1, -256])
 def test_dimensions_zero_or_negative_is_a_config_error(tmp_path: Path, value: int):
     body = f"    tags: [embedding]\n    priority: 1\n    dimensions: {value}\n"
-    write_config(tmp_path, models_yaml=models_yaml_with(body))
+    write_config(
+        tmp_path,
+        models_yaml=models_yaml_with(body) + CHAT_MODEL_ENTRY,
+        agents_yaml=AGENTS_WITHOUT_MODEL_TAGS,
+    )
     assert "dimensions" in str(load_error(tmp_path))
 
 
@@ -637,7 +732,11 @@ def test_embedding_with_a_chat_tag_is_a_config_error_naming_id_and_tag(
     tmp_path: Path, other: str
 ):
     body = f"    tags: [embedding, {other}]\n    priority: 1\n"
-    write_config(tmp_path, models_yaml=models_yaml_with(body))
+    write_config(
+        tmp_path,
+        models_yaml=models_yaml_with(body) + CHAT_MODEL_ENTRY,
+        agents_yaml=AGENTS_WITHOUT_MODEL_TAGS,
+    )
     message = str(load_error(tmp_path))
     assert "m1" in message
     assert other in message
@@ -651,7 +750,11 @@ def test_embedding_with_several_chat_tags_names_each():
 
 def test_embedding_tag_alone_loads(tmp_path: Path):
     body = "    tags: [embedding]\n    priority: 1\n"
-    write_config(tmp_path, models_yaml=models_yaml_with(body))
+    write_config(
+        tmp_path,
+        models_yaml=models_yaml_with(body) + CHAT_MODEL_ENTRY,
+        agents_yaml=AGENTS_WITHOUT_MODEL_TAGS,
+    )
     assert load_config(tmp_path).models[0].tags == ["embedding"]
 
 
@@ -853,7 +956,11 @@ def test_non_finite_price_is_a_config_error(tmp_path: Path, field: str, literal:
     body = (
         f"    tags: [default]\n    priority: 1\n    price:\n      {field}: {literal}\n"
     )
-    write_config(tmp_path, models_yaml=models_yaml_with(body))
+    write_config(
+        tmp_path,
+        models_yaml=models_yaml_with(body) + CHAT_MODEL_ENTRY,
+        agents_yaml=AGENTS_WITHOUT_MODEL_TAGS,
+    )
     assert field in str(load_error(tmp_path))
 
 
@@ -862,7 +969,11 @@ def test_float_priority_and_price_still_work(tmp_path: Path):
         "    tags: [default]\n    priority: 2.5\n"
         "    price:\n      input_per_mtok: 0.15\n      output_per_mtok: 0\n"
     )
-    write_config(tmp_path, models_yaml=models_yaml_with(body))
+    write_config(
+        tmp_path,
+        models_yaml=models_yaml_with(body) + CHAT_MODEL_ENTRY,
+        agents_yaml=AGENTS_WITHOUT_MODEL_TAGS,
+    )
     cfg = load_config(tmp_path)
     assert select_model(cfg, None).priority == 2.5
     assert cfg.models[0].price.input_per_mtok == 0.15
@@ -1151,3 +1262,179 @@ def test_example_config_with_storage_examples_still_loads(tmp_path: Path):
     write_config(tmp_path)
     assert load_config(tmp_path).storage == StorageConfig()
     assert "# [storage.vector]" in EXAMPLE_CONFIG_TOML
+
+
+def agent(**overrides: Any) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "id": "orchestrator",
+        "name": "Orchestrator",
+        "description": "Reads the prompt and assembles the reply.",
+        "tags": ["orchestrator"],
+        "model_tags": ["orchestrator"],
+    }
+    return {**fields, **overrides}
+
+
+def config_with_agents(
+    *agents: dict[str, Any], **model_overrides: Any
+) -> HarnessConfig:
+    return HarnessConfig.model_validate(
+        {
+            "providers": {"local": OLLAMA},
+            "models": [model(tags=["orchestrator", "cheap"], **model_overrides)],
+            "agents": list(agents),
+        }
+    )
+
+
+def test_agent_optional_lists_default_to_empty():
+    parsed = AgentConfig.model_validate(agent())
+    assert (parsed.examples, parsed.tools, parsed.deny) == ([], [], [])
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"id": ""},
+        {"name": ""},
+        {"description": ""},
+        {"unknown": 1},
+        {"tags": ["Upper"]},
+        {"tags": ["has space"]},
+        {"tags": [""]},
+        {"tags": ["a", "a"]},
+        {"model_tags": ["Upper"]},
+        {"model_tags": ["x", "x"]},
+        {"tools": ["a"], "deny": ["a"]},
+    ],
+)
+def test_agent_rejects_invalid_fields(overrides: dict[str, Any]):
+    with pytest.raises(ValueError):
+        AgentConfig.model_validate(agent(**overrides))
+
+
+def test_agent_tools_and_deny_clash_names_agent_and_tool():
+    with pytest.raises(ValueError, match="agent 'orchestrator' lists t in both"):
+        AgentConfig.model_validate(agent(tools=["t"], deny=["t"]))
+
+
+def test_valid_agents_load_and_orchestrator_is_selected():
+    config = config_with_agents(
+        agent(), agent(id="writer", tags=["writer"], model_tags=["cheap"])
+    )
+    assert [a.id for a in config.agents] == ["orchestrator", "writer"]
+    found = find_orchestrator_agent(config)
+    assert found is not None and found.id == "orchestrator"
+
+
+def test_agents_default_to_none():
+    assert config_of(model()).agents == []
+
+
+def test_duplicate_agent_ids_rejected():
+    with pytest.raises(ValueError, match="duplicate agent ids: orchestrator"):
+        config_with_agents(agent(), agent())
+
+
+def test_model_tags_must_be_carried_together_by_one_model():
+    with pytest.raises(ValueError, match="agent 'writer': no chat model"):
+        config_with_agents(
+            agent(), agent(id="writer", tags=["writer"], model_tags=["cheap", "big"])
+        )
+
+
+def test_embedding_models_do_not_satisfy_model_tags():
+    with pytest.raises(ValueError, match="agent 'orchestrator': no chat model"):
+        HarnessConfig.model_validate(
+            {
+                "providers": {"local": OLLAMA},
+                "models": [model(tags=["embedding", "cheap"])],
+                "agents": [agent(model_tags=["cheap"])],
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("agents", "found"),
+    [
+        ([agent(tags=["writer"])], "none"),
+        ([agent(), agent(id="second")], "orchestrator, second"),
+    ],
+)
+def test_exactly_one_orchestrator_agent_required(
+    agents: list[dict[str, Any]], found: str
+):
+    with pytest.raises(ValueError, match=f"exactly one agent.*found: {found}"):
+        config_with_agents(*agents)
+
+
+def test_find_orchestrator_agent_without_agents_is_none():
+    assert find_orchestrator_agent(config_of(model())) is None
+
+
+# --- agents.yaml -------------------------------------------------------------
+
+
+def agents_error(tmp_path: Path, agents_yaml: str) -> str:
+    write_config(tmp_path, agents_yaml=agents_yaml)
+    return str(load_error(tmp_path))
+
+
+def test_example_agents_load_with_the_real_loader(tmp_path: Path):
+    write_config(tmp_path)
+    config = load_config(tmp_path)
+    assert [a.id for a in config.agents] == ["orchestrator", "researcher"]
+    found = find_orchestrator_agent(config)
+    assert found is not None and found.model_tags == ["orchestrator"]
+
+
+def test_example_agents_contain_the_researcher(tmp_path: Path):
+    write_config(tmp_path)
+    config = load_config(tmp_path)
+    researcher = next(a for a in config.agents if a.id == "researcher")
+    assert researcher.tags == ["research"]
+    assert researcher.model_tags == ["chat"]
+    assert researcher.tools == ["tool_search"]
+    assert researcher.deny == []
+    assert len(researcher.examples) == 2
+    assert researcher.name and researcher.description
+
+
+def test_example_researcher_gets_the_example_chat_model(tmp_path: Path):
+    write_config(tmp_path)
+    config = load_config(tmp_path)
+    researcher = next(a for a in config.agents if a.id == "researcher")
+    assert select_agent_model(config, researcher).id == "gemma-local"
+
+
+@pytest.mark.parametrize(
+    "agents_yaml",
+    ["agents: []\n", "- id: x\n", "agents: []\nextra: 1\n", "other: []\n"],
+)
+def test_agents_top_level_and_empty_list_name_the_file(
+    tmp_path: Path, agents_yaml: str
+):
+    assert "invalid agents.yaml" in agents_error(tmp_path, agents_yaml)
+
+
+def test_agents_unknown_key_names_file_and_field(tmp_path: Path):
+    text = EXAMPLE_AGENTS_YAML.replace("    tags:", "    colour: red\n    tags:")
+    message = agents_error(tmp_path, text)
+    assert "invalid agents.yaml" in message and "colour" in message
+
+
+def test_agents_without_orchestrator_names_the_tag(tmp_path: Path):
+    text = EXAMPLE_AGENTS_YAML.replace("tags: [orchestrator]", "tags: [writer]")
+    message = agents_error(tmp_path, text)
+    assert "invalid agents.yaml" in message and "'orchestrator'" in message
+
+
+def test_agents_unsatisfiable_model_tags_name_the_agent(tmp_path: Path):
+    text = EXAMPLE_AGENTS_YAML.replace("model_tags: [orchestrator]", "model_tags: [x]")
+    message = agents_error(tmp_path, text)
+    assert "invalid agents.yaml" in message and "agent 'orchestrator'" in message
+
+
+@pytest.mark.parametrize("key", AgentConfig.model_fields, ids=str)
+def test_every_agents_yaml_key_is_documented_in_the_example(key: str):
+    assert _documented(EXAMPLE_AGENTS_YAML, key, separator=":"), key

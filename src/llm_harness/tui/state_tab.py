@@ -7,18 +7,22 @@ never rebuilt, so one the user opened or closed stays that way; findings and
 plan are one Static each, whose text is replaced.
 """
 
+from collections.abc import Sequence
+
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Collapsible, Static
 
-from llm_harness.config import ModelConfig
+from llm_harness.config import AgentConfig, ModelConfig
 from llm_harness.inspect_state import (
+    agents_text,
     build_preview,
     counters_text,
     environment_text,
     finding_text,
     goal_text,
     plan_step_text,
+    tools_text,
 )
 from llm_harness.orchestrator import Orchestrator
 
@@ -32,6 +36,10 @@ def _text(widget_id: str, *, classes: str | None = None) -> Static:
 class StatePanel(VerticalScroll):
     """Goal, findings, plan, environment, counters and the next-request preview."""
 
+    def __init__(self, agents: Sequence[AgentConfig], **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self._agents = agents
+
     def compose(self) -> ComposeResult:
         yield Static(_NO_SESSION, markup=False, id="state-empty", classes="secondary")
         yield _text("state-counters")
@@ -43,6 +51,14 @@ class StatePanel(VerticalScroll):
         yield from self._section(
             "Environment", "environment", _text("state-environment"), is_open=True
         )
+        # Configuration, not session state: shown before the first message too.
+        yield from self._section(
+            "Agents",
+            "agents",
+            Static(agents_text(self._agents), markup=False, id="state-agents"),
+            is_open=True,
+        )
+        yield from self._section("Tools", "tools", _text("state-tools"), is_open=True)
         yield Static("Next request", markup=False, classes="heading")
         # The user message carries the state JSON and the observation; the long
         # system prompt and the state JSON start collapsed.
@@ -81,6 +97,7 @@ class StatePanel(VerticalScroll):
         if orchestrator is None:
             return
         state = orchestrator.state
+        self._set("state-tools", tools_text(orchestrator.available_tools()))
         self._set("state-counters", counters_text(state))
         self._set("state-goal", goal_text(state))
         self._set(

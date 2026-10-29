@@ -6,15 +6,16 @@ model-derived string goes through `sanitize_text` and is shown in a `ui.label`,
 which sends a text node; no HTML or markdown element is used here.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from nicegui import events, ui
 
-from llm_harness.config import ModelConfig
+from llm_harness.config import AgentConfig, ModelConfig
 from llm_harness.display import sanitize_text
 from llm_harness.inspect_state import (
     OPEN_BY_DEFAULT,
+    agents_text,
     build_preview,
     counters_text,
     environment_text,
@@ -26,6 +27,7 @@ from llm_harness.inspect_state import (
     span_children,
     span_details_text,
     span_title,
+    tools_text,
 )
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.state import OrchestratorState
@@ -192,7 +194,9 @@ class StatePanel:
         self,
         get_orchestrator: Callable[[], Orchestrator | None],
         on_imported: Callable[[], None],
+        agents: Sequence[AgentConfig],
     ) -> None:
+        self._agents = agents
         with ui.tab_panel(STATE_TAB).classes(PANEL_CLASSES).mark("panel-state"):
             self.transfer = StateTransfer(get_orchestrator, on_imported)
             with (
@@ -200,6 +204,8 @@ class StatePanel:
                 ui.column().classes("w-full"),
             ):
                 self._build_state_section()
+                self._build_agents_section()
+                self._build_tools_section()
                 self._build_preview_section()
 
     def _build_state_section(self) -> None:
@@ -214,6 +220,19 @@ class StatePanel:
         with _section("Environment", "section-environment", is_open=True):
             self._environment = (
                 ui.label("").classes(f"w-full {_PRE_WRAP}").mark("state-environment")
+            )
+
+    def _build_agents_section(self) -> None:
+        # Configuration, not session state: shown before the first message too.
+        with _section("Agents", "section-agents", is_open=True):
+            ui.label(agents_text(self._agents)).classes(f"w-full {_PRE_WRAP}").mark(
+                "state-agents"
+            )
+
+    def _build_tools_section(self) -> None:
+        with _section("Tools", "section-tools", is_open=True):
+            self._tools = (
+                ui.label("(none)").classes(f"w-full {_PRE_WRAP}").mark("state-tools")
             )
 
     def _build_preview_section(self) -> None:
@@ -247,6 +266,7 @@ class StatePanel:
         if orchestrator is None:
             return
         self._show_state(orchestrator.state, orchestrator.pending_question)
+        self._tools.set_text(tools_text(orchestrator.available_tools()))
         self._show_preview(orchestrator, model, typed)
 
     def _show_state(self, state: OrchestratorState, question: str | None) -> None:

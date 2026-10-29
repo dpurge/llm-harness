@@ -8,7 +8,13 @@ import contextlib
 
 from nicegui import app, ui
 
-from llm_harness.config import ConfigError, HarnessConfig, ModelConfig, chat_models
+from llm_harness.config import (
+    ConfigError,
+    HarnessConfig,
+    ModelConfig,
+    chat_models,
+    find_orchestrator_agent,
+)
 from llm_harness.display import format_switch, format_usage_report, sanitize_text
 from llm_harness.gui import inspector
 from llm_harness.gui.security import LoopbackOnlyMiddleware
@@ -18,6 +24,8 @@ from llm_harness.providers.base import ChatProvider
 from llm_harness.redact import redact
 from llm_harness.router import RouterFactory
 from llm_harness.storage import Storage
+from llm_harness.subagents import SubagentFactoryMaker
+from llm_harness.tools import ToolRegistry
 from llm_harness.types import (
     Done,
     ErrorEvent,
@@ -117,8 +125,12 @@ class ChatPage:
         router_factory: RouterFactory,
         is_manual: bool,
         storage: Storage | None = None,
+        tools: ToolRegistry | None = None,
+        subagent_factory_maker: SubagentFactoryMaker | None = None,
     ) -> None:
         self._storage = storage
+        self._tools = tools
+        self._subagent_factory_maker = subagent_factory_maker
         self._config = config
         self._model = model
         self._router_factory = router_factory
@@ -147,7 +159,9 @@ class ChatPage:
                 ):
                     self._build_chat()
                 self._state_panel = inspector.StatePanel(
-                    lambda: self._orchestrator, self._refresh_inspector
+                    lambda: self._orchestrator,
+                    self._refresh_inspector,
+                    self._config.agents,
                 )
                 self._trace_panel = inspector.TracePanel()
         # on_delete, not on_disconnect: NiceGUI 3 also calls on_disconnect for a
@@ -216,7 +230,18 @@ class ChatPage:
         self._model = model
         self._is_manual = is_manual
         self._orchestrator = Orchestrator(
-            router, model, user_id=self._config.user_id, storage=self._storage
+            router,
+            model,
+            user_id=self._config.user_id,
+            storage=self._storage,
+            agent=find_orchestrator_agent(self._config),
+            tools=self._tools,
+            subagents=self._config.agents,
+            subagent_factory=(
+                self._subagent_factory_maker(router)
+                if self._subagent_factory_maker is not None
+                else None
+            ),
         )
         if old_router is not None:
             await old_router.aclose()
@@ -402,12 +427,23 @@ def register_page(
     router_factory: RouterFactory,
     is_manual: bool,
     storage: Storage | None = None,
+    tools: ToolRegistry | None = None,
+    subagent_factory_maker: SubagentFactoryMaker | None = None,
 ) -> None:
     """Register the chat page; its builder runs once per browser client."""
 
     @ui.page("/")
     async def chat_page() -> None:
-        await ChatPage(config, model, router_factory, is_manual, storage).build()
+        page = ChatPage(
+            config,
+            model,
+            router_factory,
+            is_manual,
+            storage,
+            tools,
+            subagent_factory_maker,
+        )
+        await page.build()
 
 
 def run_gui(
@@ -420,8 +456,12 @@ def run_gui(
     port: int = 8080,
     show: bool = True,
     storage: Storage | None = None,
+    tools: ToolRegistry | None = None,
+    subagent_factory_maker: SubagentFactoryMaker | None = None,
 ) -> int:
-    register_page(config, model, router_factory, is_manual, storage)
+    register_page(
+        config, model, router_factory, is_manual, storage, tools, subagent_factory_maker
+    )
     # Before ui.run: Starlette refuses new middleware once the app has started.
     # NiceGUI mounts socket.io on this same app, so the middleware covers it too.
     app.add_middleware(LoopbackOnlyMiddleware, port=port)

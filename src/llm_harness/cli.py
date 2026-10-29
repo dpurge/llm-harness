@@ -9,8 +9,11 @@ from pathlib import Path
 from typing import Protocol, TextIO
 
 from llm_harness import store as store_module
+from llm_harness.builtin_tools import build_tool_registry
 from llm_harness.config import (
+    AGENTS_FILE,
     CONFIG_FILE,
+    EXAMPLE_AGENTS_YAML,
     EXAMPLE_CONFIG_TOML,
     EXAMPLE_MODELS_YAML,
     MODELS_FILE,
@@ -20,6 +23,7 @@ from llm_harness.config import (
     ModelConfig,
     default_config_dir,
     default_data_dir,
+    find_orchestrator_agent,
     load_config,
     permission_warnings,
     resolve_think,  # noqa: F401 - still importable from here
@@ -34,6 +38,8 @@ from llm_harness.router import RouterFactory, make_router_factory
 from llm_harness.storage import Storage, open_storage
 from llm_harness.storage.status import storage_status
 from llm_harness.store import Store
+from llm_harness.subagents import SubagentFactoryMaker, make_subagent_factory_maker
+from llm_harness.tools import ToolRegistry
 from llm_harness.types import (
     Done,
     ErrorEvent,
@@ -48,7 +54,11 @@ from llm_harness.types import (
 
 _DIM = "\x1b[2m"
 _RESET = "\x1b[0m"
-_EXAMPLE_TEXT = {CONFIG_FILE: EXAMPLE_CONFIG_TOML, MODELS_FILE: EXAMPLE_MODELS_YAML}
+_EXAMPLE_TEXT = {
+    CONFIG_FILE: EXAMPLE_CONFIG_TOML,
+    MODELS_FILE: EXAMPLE_MODELS_YAML,
+    AGENTS_FILE: EXAMPLE_AGENTS_YAML,
+}
 _EXIT_COMMANDS = frozenset({"/exit", "/quit"})
 
 # (config, initial model, router factory, was --model given) -> exit code
@@ -63,6 +73,8 @@ class TuiRunner(Protocol):
         is_manual: bool,
         *,
         storage: Storage | None = None,
+        tools: ToolRegistry | None = None,
+        subagent_factory_maker: SubagentFactoryMaker | None = None,
     ) -> int: ...
 
 
@@ -280,11 +292,21 @@ def _run_tui_lazily(
     is_manual: bool,
     *,
     storage: Storage | None = None,
+    tools: ToolRegistry | None = None,
+    subagent_factory_maker: SubagentFactoryMaker | None = None,
 ) -> int:
     # Imported here so --plain and --help never load textual.
     from llm_harness.tui.app import run_tui
 
-    return run_tui(config, model, router_factory, is_manual, storage=storage)
+    return run_tui(
+        config,
+        model,
+        router_factory,
+        is_manual,
+        storage=storage,
+        tools=tools,
+        subagent_factory_maker=subagent_factory_maker,
+    )
 
 
 def _run_gui_lazily(
@@ -294,11 +316,21 @@ def _run_gui_lazily(
     is_manual: bool,
     *,
     storage: Storage | None = None,
+    tools: ToolRegistry | None = None,
+    subagent_factory_maker: SubagentFactoryMaker | None = None,
 ) -> int:
     # Imported here so --plain, --help and the TUI never load nicegui.
     from llm_harness.gui.app import run_gui
 
-    return run_gui(config, model, router_factory, is_manual, storage=storage)
+    return run_gui(
+        config,
+        model,
+        router_factory,
+        is_manual,
+        storage=storage,
+        tools=tools,
+        subagent_factory_maker=subagent_factory_maker,
+    )
 
 
 def _load_config(
@@ -398,6 +430,11 @@ def main(
     if isinstance(loaded, int):
         return loaded
     config, model = loaded
+    try:
+        tools = build_tool_registry(config.agents)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=stderr)
+        return 1
 
     # One storage, one ledger and one router factory per process; nothing touches
     # the disk until first use.
@@ -407,19 +444,39 @@ def main(
         data_dir if data_dir is not None else default_data_dir(),
         relational_path=db_path,
     )
+    store = Store(db_path)
     router_factory = make_router_factory(
         config,
         provider_factory,
         args.think,
-        Store(db_path),
+        store,
         required_tags=frozenset({"orchestrator"}),
+    )
+    subagent_factory_maker = make_subagent_factory_maker(
+        config, provider_factory, args.think, store
     )
     is_manual = bool(args.model)
 
     if args.gui:
-        return run_gui(config, model, router_factory, is_manual, storage=storage)
+        return run_gui(
+            config,
+            model,
+            router_factory,
+            is_manual,
+            storage=storage,
+            tools=tools,
+            subagent_factory_maker=subagent_factory_maker,
+        )
     if not args.plain:
-        return run_tui(config, model, router_factory, is_manual, storage=storage)
+        return run_tui(
+            config,
+            model,
+            router_factory,
+            is_manual,
+            storage=storage,
+            tools=tools,
+            subagent_factory_maker=subagent_factory_maker,
+        )
 
     try:
         router = router_factory(model, is_manual)
@@ -429,7 +486,14 @@ def main(
 
     try:
         orchestrator = Orchestrator(
-            router, model, user_id=config.user_id, storage=storage
+            router,
+            model,
+            user_id=config.user_id,
+            storage=storage,
+            agent=find_orchestrator_agent(config),
+            tools=tools,
+            subagents=config.agents,
+            subagent_factory=subagent_factory_maker(router),
         )
         return asyncio.run(
             _chat_loop_then_close(router, stdin, stdout, stderr, orchestrator, storage)

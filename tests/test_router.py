@@ -12,7 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from llm_harness.config import ConfigError, HarnessConfig, ModelConfig, ProviderConfig
-from llm_harness.router import ModelRouter, make_router_factory
+from llm_harness.router import ModelRouter, SessionCost, make_router_factory
 from llm_harness.store import CallRecord, Store
 from llm_harness.types import (
     ChatRequest,
@@ -808,6 +808,113 @@ async def test_failed_attempt_that_reported_usage_counts_in_the_session_total(
         ("a", "error", 1.0),
         ("b", "ok", 1.0),
     ]
+
+
+def usage_report(events: list[StreamEvent]) -> UsageReport:
+    return next(e for e in events if isinstance(e, UsageReport))
+
+
+async def test_routers_sharing_a_session_cost_never_show_a_decreasing_total(
+    tmp_path: Path,
+):
+    # Parent (a), child (b), parent again: the child's total includes the parent's.
+    a = PerCallProvider(reply(1_000_000, 0), reply(1_000_000, 0))
+    b = PerCallProvider(reply(2_000_000, 0))
+    world = World(
+        tmp_path, {"a": a, "b": b}, priced("a", 9, "chat"), priced("b", 5, "chat")
+    )
+    costs = SessionCost()
+    parent, child = world.router("a", costs=costs), world.router("b", costs=costs)
+
+    totals = [
+        usage_report(await run(parent)).session_cost_usd,
+        usage_report(await run(child)).session_cost_usd,
+        usage_report(await run(parent)).session_cost_usd,
+    ]
+    assert totals == [1.0, 3.0, 4.0]
+    assert totals == sorted(totals)
+    assert costs.total == 4.0
+
+
+async def test_routers_without_session_cost_each_start_at_zero(tmp_path: Path):
+    a = PerCallProvider(reply(1_000_000, 0))
+    world = World(tmp_path, {"a": a}, priced("a", 1, "chat"))
+    first, second = world.router("a"), world.router("a")
+    assert usage_report(await run(first)).session_cost_usd == 1.0
+    assert usage_report(await run(second)).session_cost_usd == 1.0
+
+
+async def test_failed_attempt_cost_is_added_to_the_shared_session_cost(
+    tmp_path: Path,
+):
+    failed_with_usage = [
+        UsageEvent(usage=Usage(input_tokens=1_000_000, output_tokens=0)),
+        *failing("connection"),
+    ]
+    a, b = PerCallProvider(failed_with_usage), PerCallProvider(reply(1_000_000, 0))
+    world = World(
+        tmp_path, {"a": a, "b": b}, priced("a", 9, "chat"), priced("b", 5, "chat")
+    )
+    costs = SessionCost()
+    await run(world.router("a", costs=costs))
+    assert costs.total == 2.0  # the failed attempt (1.0) and the retry (1.0)
+    other = PerCallProvider(reply(1_000_000, 0))
+    world.providers["a"] = other
+    report = usage_report(await run(world.router("a", costs=costs)))
+    assert report.session_cost_usd == 3.0
+
+
+async def test_unknown_cost_marks_the_shared_session_cost_incomplete(tmp_path: Path):
+    a = PerCallProvider(OK)  # no usage event: the cost is unknown
+    b = PerCallProvider(reply(1_000_000, 0))
+    world = World(
+        tmp_path, {"a": a, "b": b}, priced("a", 9, "chat"), priced("b", 5, "chat")
+    )
+    costs = SessionCost()
+    await run(world.router("a", costs=costs))
+    assert costs.incomplete is True
+    report = usage_report(await run(world.router("b", costs=costs)))
+    assert report.session_cost_incomplete is True
+    assert report.session_cost_usd == 1.0
+
+
+async def test_router_factory_shares_the_given_session_cost(tmp_path: Path):
+    a = PerCallProvider(reply(1_000_000, 0))
+    world = World(tmp_path, {"a": a}, priced("a", 1, "chat"))
+    model = pick(world.config, "a")
+    costs = SessionCost()
+    make = make_router_factory(
+        world.config,
+        world.factory,
+        None,
+        world.store,
+        clock=world.clock,
+        timer=world.timer,
+        costs=costs,
+    )
+    first, second = make(model, False), make(model, False)
+    assert usage_report(await run(first)).session_cost_usd == 1.0  # type: ignore[arg-type]
+    assert usage_report(await run(second)).session_cost_usd == 2.0  # type: ignore[arg-type]
+    assert costs.total == 2.0
+
+
+async def test_router_factory_without_session_cost_keeps_routers_private(
+    tmp_path: Path,
+):
+    a = PerCallProvider(reply(1_000_000, 0))
+    world = World(tmp_path, {"a": a}, priced("a", 1, "chat"))
+    model = pick(world.config, "a")
+    make = make_router_factory(
+        world.config,
+        world.factory,
+        None,
+        world.store,
+        clock=world.clock,
+        timer=world.timer,
+    )
+    first, second = make(model, False), make(model, False)
+    assert usage_report(await run(first)).session_cost_usd == 1.0  # type: ignore[arg-type]
+    assert usage_report(await run(second)).session_cost_usd == 1.0  # type: ignore[arg-type]
 
 
 async def test_failed_attempt_without_usage_stores_null_cost(tmp_path: Path):

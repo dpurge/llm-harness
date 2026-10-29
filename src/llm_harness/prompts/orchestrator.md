@@ -56,7 +56,20 @@ A short acknowledgement from the user ("ok", "thanks") needs a short `respond`.
   working on it, processing it or will deliver it later: there is no later.
   If you lack something you need, ask for it with `ask_user`.
 - `ask_user`: ask the user a question (`question`).
-- `call_tool`: run a tool (`tool`, `arguments`). No tools exist yet: do not use it.
-- `delegate`: hand work to a subagent. It is not available yet; do not use it.
+- `call_tool`: run one of the tools listed under `## Tools` in the user message
+  (`tool`, `arguments`). A tool outside that list is refused. To learn a tool's
+  arguments, call `tool_search` before the tool, with `{"query": "<words>"}` (optional `k`,
+  1 to 10, how many matches); it answers with each match's description and
+  argument schema. Arguments that do not match the schema are rejected with the
+  reason.
+- `delegate`: hand work to a subagent: `subagent` is an id listed under
+  `## Subagents` in the request, `brief` a short self-contained task (the
+  subagent sees ONLY the brief, not the chat or your state). The result comes
+  back as the next observation: its answer and findings with sources, or
+  `needs: <question>` when it must ask, or a note that it hit its step limit or
+  failed. Without a `## Subagents` section, or with an id not listed there, do
+  not delegate (an unknown id is answered with the valid ids). Do not repeat a
+  delegation that already answered; copy useful findings, with their source,
+  into your own `state_patch`.
 
 The JSON schemas below are generated from the code and are authoritative.

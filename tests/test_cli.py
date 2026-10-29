@@ -18,7 +18,9 @@ import pytest
 import llm_harness.store as store_module
 from llm_harness.cli import _chat_loop, _read_line, _run_turn, main, resolve_think
 from llm_harness.config import (
+    AGENTS_FILE,
     CONFIG_FILE,
+    EXAMPLE_AGENTS_YAML,
     EXAMPLE_CONFIG_TOML,
     EXAMPLE_MODELS_YAML,
     MODELS_FILE,
@@ -33,6 +35,8 @@ from llm_harness.providers.base import ChatProvider
 from llm_harness.router import RouterFactory
 from llm_harness.storage import Storage
 from llm_harness.store import CallRecord, Store
+from llm_harness.subagents import SubagentFactoryMaker
+from llm_harness.tools import ToolRegistry
 from llm_harness.types import (
     ChatRequest,
     Done,
@@ -142,6 +146,16 @@ def run_cli(
     return Run(code, out.getvalue(), err.getvalue())
 
 
+AGENTS_YAML = """\
+agents:
+  - id: orchestrator
+    name: Orchestrator
+    description: Reads the prompt and assembles the reply.
+    tags: [orchestrator]
+    model_tags: []
+"""
+
+
 @pytest.fixture
 def config_dir(tmp_path: Path) -> Path:
     directory = tmp_path / "cfg"
@@ -150,6 +164,7 @@ def config_dir(tmp_path: Path) -> Path:
     (directory / CONFIG_FILE).write_text(CONFIG_TOML)
     (directory / CONFIG_FILE).chmod(0o600)
     (directory / MODELS_FILE).write_text(MODELS_YAML)
+    (directory / AGENTS_FILE).write_text(AGENTS_YAML)
     return directory
 
 
@@ -205,6 +220,8 @@ class FakeTuiRunner:
         self.code = code
         self.calls: list[tuple[HarnessConfig, ModelConfig, RouterFactory, bool]] = []
         self.storages: list[Storage | None] = []
+        self.tools: list[ToolRegistry | None] = []
+        self.subagent_factory_makers: list[SubagentFactoryMaker | None] = []
 
     def __call__(
         self,
@@ -214,9 +231,13 @@ class FakeTuiRunner:
         is_manual: bool,
         *,
         storage: Storage | None = None,
+        tools: ToolRegistry | None = None,
+        subagent_factory_maker: SubagentFactoryMaker | None = None,
     ) -> int:
         self.calls.append((config, model, router_factory, is_manual))
         self.storages.append(storage)
+        self.tools.append(tools)
+        self.subagent_factory_makers.append(subagent_factory_maker)
         return self.code
 
 
@@ -402,6 +423,7 @@ def test_tui_first_run_declined_prints_examples_and_writes_nothing(
     assert result.code == 1
     assert EXAMPLE_CONFIG_TOML in result.err
     assert EXAMPLE_MODELS_YAML in result.err
+    assert EXAMPLE_AGENTS_YAML in result.err
     assert not target.exists()
     assert runner.calls == []
 
@@ -419,6 +441,7 @@ def test_tui_first_run_yes_writes_examples_like_plain(tmp_path: Path) -> None:
     )
     assert result.code == 0
     assert (target / MODELS_FILE).is_file()
+    assert (target / AGENTS_FILE).is_file()
     assert runner.calls == []
 
 
@@ -497,6 +520,31 @@ def test_the_default_gui_runner_delegates_to_run_gui(
     assert is_manual is False
     assert first_request_think(router_factory, model, provider) is False
     assert isinstance(keywords[0]["storage"], Storage)
+    assert keywords[0]["tools"].names() == ["tool_search"]
+    assert callable(keywords[0]["subagent_factory_maker"])
+
+
+def test_the_default_tui_runner_delegates_to_run_tui_with_the_registry(
+    config_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import llm_harness.tui.app as tui_app
+
+    keywords: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        tui_app, "run_tui", lambda *args, **kwargs: keywords.append(kwargs) or 6
+    )
+    _, factory = scripted(*reply_events())
+    result = run_cli(
+        ["--no-think"],
+        config_dir,
+        factory=factory,
+        stdin_tty=True,
+        stdout_tty=True,
+    )
+    assert result.code == 6
+    assert isinstance(keywords[0]["storage"], Storage)
+    assert keywords[0]["tools"].names() == ["tool_search"]
+    assert callable(keywords[0]["subagent_factory_maker"])
 
 
 def run_gui_cli(
@@ -602,6 +650,7 @@ def test_gui_first_run_non_interactive_prints_examples_and_writes_nothing(
     assert result.code == 1
     assert EXAMPLE_CONFIG_TOML in result.err
     assert EXAMPLE_MODELS_YAML in result.err
+    assert EXAMPLE_AGENTS_YAML in result.err
     assert not target.exists()
     assert runner.calls == []
 
@@ -612,6 +661,7 @@ def test_gui_first_run_yes_writes_examples_like_plain(tmp_path: Path) -> None:
     result = run_gui_cli(target, [], runner, stdin="y\n", stdin_tty=True)
     assert result.code == 0
     assert (target / MODELS_FILE).is_file()
+    assert (target / AGENTS_FILE).is_file()
     assert runner.calls == []
 
 
@@ -748,6 +798,7 @@ def test_first_run_non_interactive_prints_example_and_writes_nothing(
     assert str(empty / CONFIG_FILE) in result.err
     assert EXAMPLE_CONFIG_TOML in result.err
     assert EXAMPLE_MODELS_YAML in result.err
+    assert EXAMPLE_AGENTS_YAML in result.err
     assert "[y/N]" not in result.err
     assert list(empty.iterdir()) == []
 
@@ -770,6 +821,7 @@ def test_first_run_interactive_yes_writes_loadable_examples(tmp_path: Path) -> N
     assert "Review" in result.err
     assert stat.S_IMODE((target / CONFIG_FILE).stat().st_mode) == 0o600
     assert (target / MODELS_FILE).is_file()
+    assert (target / AGENTS_FILE).is_file()
     config = load_config(target)
     assert [m.model for m in config.models] == ["gemma4:12b"]
 
@@ -1182,6 +1234,7 @@ class FallbackSetup:
         (self.config_dir / CONFIG_FILE).write_text(FALLBACK_CONFIG_TOML)
         (self.config_dir / CONFIG_FILE).chmod(0o600)
         (self.config_dir / MODELS_FILE).write_text(FALLBACK_MODELS_YAML)
+        (self.config_dir / AGENTS_FILE).write_text(AGENTS_YAML)
         self.data_dir = tmp_path / "data"
         self.dead = ScriptedProvider(DEAD_EVENTS)
         self.live = ScriptedProvider(LIVE_EVENTS)

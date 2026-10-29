@@ -9,7 +9,13 @@ from typing import Any
 import pytest
 
 import llm_harness.cli as cli_module
-from llm_harness.config import CONFIG_FILE, MODELS_FILE, HarnessConfig, ModelConfig
+from llm_harness.config import (
+    AGENTS_FILE,
+    CONFIG_FILE,
+    MODELS_FILE,
+    HarnessConfig,
+    ModelConfig,
+)
 from llm_harness.router import RouterFactory
 from llm_harness.storage import Storage, open_storage
 from llm_harness.types import (
@@ -39,6 +45,15 @@ models:
     priority: 1
 """
 
+AGENTS_YAML = """\
+agents:
+  - id: orchestrator
+    name: Orchestrator
+    description: Reads the prompt and assembles the reply.
+    tags: [orchestrator]
+    model_tags: []
+"""
+
 RESPOND = {"type": "respond", "text": "hello there"}
 ASK = {"type": "ask_user", "question": "Which file?"}
 SET_GOAL = {"goal": "greet"}
@@ -52,6 +67,7 @@ def write_config_dir(root: Path, models_yaml: str = MODELS_YAML) -> Path:
     (directory / CONFIG_FILE).write_text(CONFIG_TOML)
     (directory / CONFIG_FILE).chmod(0o600)
     (directory / MODELS_FILE).write_text(models_yaml)
+    (directory / AGENTS_FILE).write_text(AGENTS_YAML)
     return directory
 
 
@@ -368,3 +384,241 @@ def test_the_gui_and_tui_runners_get_the_storage_to_close(
     assert len(spy_storage) == 1
     # Closing is the front end's job, so the runner that never closes leaves it open.
     assert spy_storage[0].close_calls == 0
+
+
+def test_plain_gives_the_orchestrator_the_agent_from_agents_yaml(
+    config_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agents: list[Any] = []
+
+    class RecordingOrchestrator(cli_module.Orchestrator):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            agents.append(kwargs.get("agent"))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "Orchestrator", RecordingOrchestrator)
+    _, factory = steps(reply_events(RESPOND, SET_GOAL, USAGE))
+    assert run_plain(config_dir, factory, tmp_path).code == 0
+    (agent,) = agents
+    assert agent is not None and agent.id == "orchestrator"
+    assert agent.tags == ["orchestrator"]
+
+
+def test_the_runners_get_one_registry_with_tool_search(
+    config_dir: Path, tmp_path: Path
+) -> None:
+    runner = FakeTuiRunner()
+    run_cli(
+        ["--gui"],
+        config_dir,
+        gui_runner=runner,
+        data_dir=tmp_path / "data",
+    )
+    (registry,) = runner.tools
+    assert registry is not None and registry.names() == ["tool_search"]
+
+
+def test_plain_requests_list_tool_search(config_dir: Path, tmp_path: Path) -> None:
+    provider, factory = steps(reply_events(RESPOND, SET_GOAL, USAGE))
+    assert run_plain(config_dir, factory, tmp_path).code == 0
+    user = provider.requests[0].messages[1].content
+    assert "## Tools\n\ntool_search: " in user
+
+
+def test_an_unknown_tool_name_in_agents_yaml_stops_startup_naming_it(
+    config_dir: Path, tmp_path: Path
+) -> None:
+    (config_dir / AGENTS_FILE).write_text(
+        AGENTS_YAML.replace("model_tags: []", "model_tags: []\n    tools: [nope]")
+    )
+    provider, factory = steps()
+    result = run_plain(config_dir, factory, tmp_path)
+    assert result.code == 1
+    assert "agent 'orchestrator': tools names unknown tool 'nope'" in result.err
+    assert provider.requests == []
+
+
+DELEGATE = {
+    "type": "delegate",
+    "subagent": "researcher",
+    "brief": "find the capital of France",
+}
+PRICE = "    price: {input_per_mtok: 1, output_per_mtok: 0}\n"
+TWO_PROVIDER_CONFIG = (
+    '[providers.local]\ntype = "ollama"\nbase_url = "http://parent.test"\n'
+    '[providers.other]\ntype = "ollama"\nbase_url = "http://child.test"\n'
+)
+
+
+def million(text_events: list[StreamEvent]) -> list[StreamEvent]:
+    usage = UsageEvent(usage=Usage(input_tokens=1_000_000, output_tokens=0))
+    return [usage, *text_events]
+
+
+def delegation_world(tmp_path: Path) -> tuple[Path, ScriptedSteps, ScriptedSteps]:
+    from llm_harness.config import EXAMPLE_AGENTS_YAML
+
+    directory = write_config_dir(tmp_path)
+    (directory / CONFIG_FILE).write_text(TWO_PROVIDER_CONFIG)
+    (directory / MODELS_FILE).write_text(
+        "models:\n"
+        "  - id: orch\n    name: Orchestrator\n    provider: local\n"
+        "    model: orch-model-id\n    tags: [orchestrator]\n    priority: 1\n"
+        + PRICE
+        + "  - id: helper\n    name: Helper\n    provider: other\n"
+        "    model: helper-model-id\n    tags: [chat]\n    priority: 1\n" + PRICE
+    )
+    (directory / AGENTS_FILE).write_text(EXAMPLE_AGENTS_YAML)
+    child_reply = reply_events(
+        RESPOND | {"text": "Paris"},
+        {
+            "findings": {
+                "$append": [{"text": "Paris is the capital", "source": "atlas"}]
+            }
+        },
+    )
+    parent = ScriptedSteps(
+        [
+            million(reply_events(DELEGATE, SET_GOAL)),
+            million(reply_events(RESPOND, SET_GOAL)),
+        ]
+    )
+    child = ScriptedSteps([million(child_reply)])
+    return directory, parent, child
+
+
+def run_delegation(tmp_path: Path) -> tuple[Run, ScriptedSteps, ScriptedSteps, Path]:
+    directory, parent, child = delegation_world(tmp_path)
+    by_url = {"http://parent.test": parent, "http://child.test": child}
+    result = run_cli(
+        ["--plain"],
+        directory,
+        stdin="capital of France?\n",
+        factory=lambda provider: by_url[provider.base_url],
+        data_dir=tmp_path / "data",
+    )
+    return result, parent, child, tmp_path / "data" / "harness.db"
+
+
+def test_plain_delegates_to_a_subagent_and_prints_the_parents_answer(
+    tmp_path: Path,
+) -> None:
+    result, parent, child, _ = run_delegation(tmp_path)
+    assert result.code == 0, result.err
+    assert result.out == "hello there\n"
+    assert len(parent.requests) == 2
+    assert len(child.requests) == 1
+    assert child.requests[0].model == "helper-model-id"
+    first, second = (r.messages[-1].content for r in parent.requests)
+    assert "## Subagents\n\nresearcher: " in first
+    assert "Paris" in second
+    assert "Paris is the capital (source: atlas)" in second
+
+
+def test_plain_session_total_includes_the_childs_call(tmp_path: Path) -> None:
+    result, *_ = run_delegation(tmp_path)
+    # The plain loop prints the turn's last usage line. Parent calls alone cost $2;
+    # $3 means the child's router fed the same session total.
+    lines = [line for line in result.err.splitlines() if "session $" in line]
+    assert len(lines) == 1, result.err
+    assert lines[0].startswith("[orch tokens in=1000000")
+    assert lines[0].endswith("| session $3.00]")
+
+
+async def session_total(router: Any) -> float:
+    from llm_harness.types import ChatRequest, UsageReport
+
+    request = ChatRequest(model="ignored", messages=[], think=None)
+    events = [event async for event in router.stream_chat(request)]
+    return next(e for e in events if isinstance(e, UsageReport)).session_cost_usd
+
+
+@pytest.mark.parametrize("flags", [[], ["--gui"]], ids=["tui", "gui"])
+async def test_each_session_of_a_ui_starts_its_cost_at_zero(
+    tmp_path: Path, flags: list[str]
+) -> None:
+    directory, parent, child = delegation_world(tmp_path)
+    runner = FakeTuiRunner()
+    by_url = {"http://parent.test": parent, "http://child.test": child}
+    run_cli(
+        flags,
+        directory,
+        stdin_tty=True,
+        stdout_tty=True,
+        tui_runner=runner,
+        gui_runner=runner,
+        factory=lambda provider: by_url[provider.base_url],
+        data_dir=tmp_path / "data",
+    )
+    (maker,) = runner.subagent_factory_makers
+    assert maker is not None
+    ((config, model, router_factory, is_manual),) = runner.calls
+    researcher = next(a for a in config.agents if a.id == "researcher")
+    # Session one: the parent's call costs $1, the child's call joins the same total.
+    first = router_factory(model, is_manual)
+    first_child, _ = maker(first)(researcher)
+    assert await session_total(first) == 1.0
+    assert await session_total(first_child) == 2.0
+    # A new session (new chat, model change, another GUI client) starts again at $0.
+    second = router_factory(model, is_manual)
+    assert await session_total(second) == 1.0
+
+
+def test_plain_delegation_records_ledger_rows_for_both_models(tmp_path: Path) -> None:
+    _, _, _, ledger = run_delegation(tmp_path)
+    with closing(sqlite3.connect(ledger)) as conn:
+        rows = conn.execute(
+            "SELECT model_id, COUNT(*) FROM llm_calls GROUP BY model_id ORDER BY 1"
+        ).fetchall()
+    assert rows == [("helper", 1), ("orch", 2)]
+
+
+# The terminal UI and the web GUI get the same subagent factory as plain mode
+
+
+@pytest.mark.parametrize("flags", [[], ["--gui"]], ids=["tui", "gui"])
+def test_the_ui_runners_get_a_maker_of_subagent_factories_that_serve_the_researcher(
+    tmp_path: Path, flags: list[str]
+) -> None:
+    from llm_harness.config import load_config
+
+    directory, parent, child = delegation_world(tmp_path)
+    runner = FakeTuiRunner()
+    by_url = {"http://parent.test": parent, "http://child.test": child}
+    run_cli(
+        flags,
+        directory,
+        stdin_tty=True,
+        stdout_tty=True,
+        tui_runner=runner,
+        gui_runner=runner,
+        factory=lambda provider: by_url[provider.base_url],
+        data_dir=tmp_path / "data",
+    )
+    (maker,) = runner.subagent_factory_makers
+    assert maker is not None
+    ((_, model, router_factory, is_manual),) = runner.calls
+    # What a UI does per session: bind the maker to that session's router.
+    make = maker(router_factory(model, is_manual))
+    researcher = next(a for a in load_config(directory).agents if a.id == "researcher")
+    router, model = make(researcher)
+    assert hasattr(router, "stream_chat")
+    assert model.id == "helper"
+    assert set(researcher.model_tags) <= set(model.tags)
+
+
+def test_plain_gives_the_orchestrator_the_agents_and_a_subagent_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    class RecordingOrchestrator(cli_module.Orchestrator):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            seen.append(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "Orchestrator", RecordingOrchestrator)
+    run_delegation(tmp_path)
+    (kwargs,) = seen
+    assert [agent.id for agent in kwargs["subagents"]] == ["orchestrator", "researcher"]
+    assert callable(kwargs["subagent_factory"])

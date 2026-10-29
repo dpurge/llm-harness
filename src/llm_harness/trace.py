@@ -1,6 +1,7 @@
 """Call trace of one orchestrator turn: a tree of frozen spans.
 
-The tree is `turn -> step -> llm_call | tool_call`, stored flat and linked by
+The tree is `turn -> step -> llm_call | tool_call | subagent` (a subagent span
+holds the child's own steps), stored flat and linked by
 `parent_id`. Spans are display and debug data only: nothing here is read by
 `build_request` or stored in the orchestrator state. Text is kept whole (no
 cut); secrets are masked with `redact` when a span closes.
@@ -9,14 +10,14 @@ cut); secrets are masked with `redact` when a span closes.
 import asyncio
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from typing import Any, Literal
 
 from llm_harness.redact import redact
 from llm_harness.types import _Frozen
 
-SpanKind = Literal["turn", "step", "llm_call", "tool_call"]
+SpanKind = Literal["turn", "step", "llm_call", "tool_call", "subagent"]
 SpanStatus = Literal["ok", "error", "rejected", "cancelled"]
 
 # `redact` cuts at `limit` and compares with `len(text) > limit`, so None is not
@@ -48,6 +49,8 @@ class SpanHandle:
     def __init__(self, span_id: str, parent_id: str | None) -> None:
         self.id = span_id
         self.parent_id = parent_id
+        # Offset from the turn's start, set when the span opens.
+        self.start_ms = 0.0
         self.status: SpanStatus | None = None
         # Raw values; masked as a whole when the span closes, so a secret split
         # across streamed chunks is still found.
@@ -101,6 +104,37 @@ class TraceRecorder:
             self._origin = now
         return (now - self._origin) * 1000
 
+    def adopt(
+        self, spans: Iterable[Span], parent: SpanHandle, offset_ms: float
+    ) -> None:
+        """Append another recorder's closed spans under `parent` in this turn.
+
+        Ids get fresh values from this recorder's own counter, so they never
+        collide; a span without a parent in `spans` (the child's root) hangs
+        under `parent`. Start offsets move by `offset_ms` (the child's clock
+        starts at its own turn). Call it while `parent` is open and nothing else
+        has opened, so the opening order stays right. A disabled recorder, or one
+        before its first turn, keeps nothing.
+        """
+        if self._slots is None:
+            return
+        adopted = list(spans)
+        new_ids: dict[str, str] = {}
+        for span in adopted:
+            self._count += 1
+            new_ids[span.id] = f"s{self._count}"
+        for span in adopted:
+            own_parent = new_ids.get(span.parent_id) if span.parent_id else None
+            self._slots.append(
+                span.model_copy(
+                    update={
+                        "id": new_ids[span.id],
+                        "parent_id": own_parent or parent.id,
+                        "start_ms": round(span.start_ms + offset_ms, _MS_DECIMALS),
+                    }
+                )
+            )
+
     @contextmanager
     def span(
         self, kind: SpanKind, name: str, parent: SpanHandle | None = None
@@ -108,6 +142,7 @@ class TraceRecorder:
         self._count += 1
         handle = SpanHandle(f"s{self._count}", parent.id if parent else None)
         start = self._now_ms()
+        handle.start_ms = round(start, _MS_DECIMALS)
         slots = self._slots
         index = -1
         if slots is not None:

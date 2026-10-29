@@ -21,6 +21,8 @@ from textual.widgets import (
 from textual.widgets._collapsible import CollapsibleTitle
 
 from llm_harness import state_files
+from llm_harness.builtin_tools import build_tool_registry
+from llm_harness.config import AgentConfig
 from llm_harness.context import answer_observation, build_request
 from llm_harness.display import sanitize_text
 from llm_harness.inspect_state import counters_text
@@ -502,7 +504,7 @@ async def test_the_trace_tree_after_a_scripted_turn() -> None:
             "s2": "ok",
             "s3": "rejected",
             "s4": "ok",
-            "s5": "error",  # no tool registry: "unknown tool"
+            "s5": "error",  # no tool registry: "not available"
             "s6": "ok",
             "s7": "ok",
         }
@@ -530,7 +532,7 @@ async def test_span_details_and_every_long_field_are_shown_whole() -> None:
         assert field_text(app, "s4", "thinking") == "hmm ok"
         assert field_text(app, "s5", "arguments") == "{}"
         assert field_text(app, "s5", "result") == spans["s5"].attributes["result"]
-        assert "unknown tool" in field_text(app, "s5", "result")
+        assert "is not available" in field_text(app, "s5", "result")
         details = details_of(span_boxes(app)["s3"])
         assert "kind: llm_call" in details and "status: rejected" in details
         assert "model: provider-model-1" in details
@@ -1162,3 +1164,43 @@ async def test_the_placeholder_lists_the_state_commands() -> None:
         placeholder = prompt_of(app).placeholder
         for command in ("/export", "/import", "/quit"):
             assert command in placeholder
+
+
+async def test_the_state_tab_lists_the_agents_before_the_first_message() -> None:
+    agent = AgentConfig(
+        id="boss",
+        name="Boss",
+        description="Leads [bold]hard[/].",
+        tags=["orchestrator"],
+        model_tags=[],
+    )
+    config = CONFIG.model_copy(update={"agents": [agent]})
+    app = ChatApp(
+        config, MODEL_1, router_factory_for(config, Factory(REPLY), None), False
+    )
+    async with app.run_test():
+        text = shown(app, "state-agents")
+        assert text.startswith("Boss [boss] (orchestrator)")
+        assert "[bold]hard[/]" in text
+
+
+async def test_the_state_tab_shows_the_tools_of_the_orchestrator() -> None:
+    agent = AgentConfig(
+        id="boss",
+        name="Boss",
+        description="Leads.",
+        tags=["orchestrator"],
+        model_tags=[],
+    )
+    config = CONFIG.model_copy(update={"agents": [agent]})
+    app = ChatApp(
+        config,
+        MODEL_1,
+        router_factory_for(config, Factory(REPLY), None),
+        False,
+        tools=build_tool_registry(config.agents),
+    )
+    async with app.run_test():
+        text = shown(app, "state-tools")
+        assert text.startswith("tool_search\n  tags: orchestrator\n")
+        assert "listing sent in every request: ~" in text

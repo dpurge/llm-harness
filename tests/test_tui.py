@@ -11,9 +11,10 @@ from textual.pilot import Pilot
 from textual.widgets import Input, Markdown, Select, Static
 from textual.widgets.markdown import MarkdownBlock, MarkdownFence
 
-from llm_harness.config import ConfigError, HarnessConfig, ProviderConfig
+from llm_harness.config import AgentConfig, ConfigError, HarnessConfig, ProviderConfig
 from llm_harness.redact import REDACTED
 from llm_harness.store import Store
+from llm_harness.subagents import make_subagent_factory_maker
 from llm_harness.tui.app import ChatApp
 from llm_harness.types import (
     Done,
@@ -152,6 +153,60 @@ def make_app(
     return ChatApp(
         CONFIG, model, router_factory_for(CONFIG, factory, think_flag), is_manual
     )
+
+
+async def test_the_orchestrator_gets_the_agent_from_the_config() -> None:
+    agent = AgentConfig(
+        id="boss",
+        name="Boss",
+        description="Leads.",
+        tags=["orchestrator"],
+        model_tags=[],
+    )
+    config = CONFIG.model_copy(update={"agents": [agent]})
+    app = ChatApp(
+        config,
+        MODEL_1,
+        router_factory_for(config, Factory(REPLY), None),
+        False,
+    )
+    async with app.run_test():
+        assert app._orchestrator is not None
+        assert app._orchestrator._agent_id == "boss"
+
+
+async def test_the_orchestrator_gets_the_subagents_and_the_factory() -> None:
+    helper = AgentConfig(
+        id="helper",
+        name="Helper",
+        description="Helps.",
+        tags=[],
+        model_tags=[],
+        examples=["Help me."],
+    )
+    config = CONFIG.model_copy(update={"agents": [helper]})
+
+    def factory(agent: AgentConfig) -> Any:
+        raise AssertionError("not called")
+
+    parents: list[Any] = []
+
+    def maker(parent: Any) -> Any:
+        parents.append(parent)
+        return factory
+
+    app = ChatApp(
+        config,
+        MODEL_1,
+        router_factory_for(config, Factory(REPLY), None),
+        False,
+        subagent_factory_maker=maker,
+    )
+    async with app.run_test():
+        assert app._orchestrator is not None
+        assert app._orchestrator.subagents == (helper,)
+        assert app._orchestrator._subagent_factory is factory
+        assert parents == [app._router]
 
 
 def texts(app: ChatApp, css_class: str) -> list[str]:
@@ -783,6 +838,29 @@ async def test_a_fallback_shows_the_note_the_reply_and_the_usage_line() -> None:
         assert line.startswith("[live-model tokens in=3 out=7 $0.02 ")
         assert line.endswith("s | session $0.02]")
         assert texts(app, "error") == []
+
+
+async def test_a_new_chat_starts_its_session_cost_at_zero_again() -> None:
+    factory = FallbackFactory()
+    router_factory = router_factory_for(FALLBACK_CONFIG, factory)
+    maker = make_subagent_factory_maker(FALLBACK_CONFIG, factory, None, None)
+    app = ChatApp(
+        FALLBACK_CONFIG,
+        DEAD_MODEL,
+        router_factory,
+        False,
+        subagent_factory_maker=maker,
+    )
+    async with app.run_test() as pilot:
+        await send(pilot, app, "one")
+        (first,) = texts(app, "usage")
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        await send(pilot, app, "two")
+        (second,) = texts(app, "usage")
+    # One turn costs $0.017: a carried-over total would show $0.03 in the second.
+    assert first.endswith("s | session $0.02]")
+    assert second.endswith("s | session $0.02]")
 
 
 async def test_a_second_turn_skips_the_model_in_backoff_when_a_store_is_used(

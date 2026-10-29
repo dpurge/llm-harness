@@ -68,6 +68,18 @@ class _Attempt:
     terminal: Done | ErrorEvent | None = None
 
 
+@dataclass
+class SessionCost:
+    """The session's running cost, shared by every router of one session.
+
+    A subagent's router and its parent's feed one object, so the total shown to
+    the user never decreases.
+    """
+
+    total: float = 0.0
+    incomplete: bool = False
+
+
 class ModelRouter:
     """Sends each turn to the first model and falls back along the chain.
 
@@ -90,6 +102,7 @@ class ModelRouter:
         required_tags: frozenset[str] = frozenset({"chat"}),
         clock: Callable[[], datetime] = _utc_now,
         timer: Callable[[], float] = time.monotonic,
+        costs: SessionCost | None = None,
     ) -> None:
         self._config = config
         self._is_manual = is_manual
@@ -100,10 +113,14 @@ class ModelRouter:
         self._timer = timer
         self._chain = fallback_chain(config.models, first, required_tags)
         self._providers: dict[str, ChatProvider] = {}
-        self._session_cost = 0.0
-        self._cost_incomplete = False
+        self._costs = costs if costs is not None else SessionCost()
         # Eager, so a ConfigError of the first model reaches the caller as before.
         self._provider_for(first)
+
+    @property
+    def costs(self) -> SessionCost:
+        """The session total this router feeds; a subagent's router shares it."""
+        return self._costs
 
     async def stream_chat(self, req: ChatRequest) -> AsyncIterator[StreamEvent]:
         entries: dict[str, BackoffEntry] = {}
@@ -272,21 +289,21 @@ class ModelRouter:
     def _add_failed_cost(self, attempt: _Attempt) -> None:
         cost = compute_cost(attempt.usage, attempt.model.price)
         if cost is not None:
-            self._session_cost += cost
+            self._costs.total += cost
 
     def _usage_report(self, attempt: _Attempt) -> UsageReport:
         cost = compute_cost(attempt.usage, attempt.model.price)
         if cost is None:
-            self._cost_incomplete = True
+            self._costs.incomplete = True
         else:
-            self._session_cost += cost
+            self._costs.total += cost
         return UsageReport(
             model_id=attempt.model.id,
             usage=attempt.usage,
             cost_usd=cost,
             seconds=attempt.seconds,
-            session_cost_usd=self._session_cost,
-            session_cost_incomplete=self._cost_incomplete,
+            session_cost_usd=self._costs.total,
+            session_cost_incomplete=self._costs.incomplete,
         )
 
     @staticmethod
@@ -314,6 +331,7 @@ def make_router_factory(
     required_tags: frozenset[str] = frozenset({"chat"}),
     clock: Callable[[], datetime] = _utc_now,
     timer: Callable[[], float] = time.monotonic,
+    costs: SessionCost | None = None,
 ) -> RouterFactory:
     def make(model: ModelConfig, is_manual: bool) -> ChatProvider:
         return ModelRouter(
@@ -326,6 +344,7 @@ def make_router_factory(
             required_tags=required_tags,
             clock=clock,
             timer=timer,
+            costs=costs,
         )
 
     return make

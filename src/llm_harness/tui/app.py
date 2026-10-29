@@ -21,7 +21,13 @@ from textual.widgets import (
 )
 from textual.worker import Worker, WorkerCancelled
 
-from llm_harness.config import ConfigError, HarnessConfig, ModelConfig, chat_models
+from llm_harness.config import (
+    ConfigError,
+    HarnessConfig,
+    ModelConfig,
+    chat_models,
+    find_orchestrator_agent,
+)
 from llm_harness.display import format_switch, format_usage_report, sanitize_text
 from llm_harness.markdown_render import parser_factory
 from llm_harness.orchestrator import Orchestrator
@@ -41,6 +47,8 @@ from llm_harness.state_files import (
 )
 from llm_harness.state_io import StateImportError, export_yaml, import_yaml
 from llm_harness.storage import Storage
+from llm_harness.subagents import SubagentFactoryMaker
+from llm_harness.tools import ToolRegistry
 from llm_harness.tui.state_tab import StatePanel
 from llm_harness.tui.trace_tab import TracePanel
 from llm_harness.types import (
@@ -106,9 +114,13 @@ class ChatApp(App[int]):
         router_factory: RouterFactory,
         is_manual: bool,
         storage: Storage | None = None,
+        tools: ToolRegistry | None = None,
+        subagent_factory_maker: SubagentFactoryMaker | None = None,
     ) -> None:
         super().__init__()
         self._storage = storage
+        self._tools = tools
+        self._subagent_factory_maker = subagent_factory_maker
         self._config = config
         self._model = model
         self._router_factory = router_factory
@@ -140,7 +152,7 @@ class ChatApp(App[int]):
                 yield VerticalScroll(id="log")
                 yield Input(placeholder=_PLACEHOLDER, id="prompt")
             with TabPane("State", id=STATE_TAB):
-                yield StatePanel(id="state-panel")
+                yield StatePanel(self._config.agents, id="state-panel")
             with TabPane("Trace", id=TRACE_TAB):
                 yield TracePanel(id="trace-panel")
         yield Footer()
@@ -172,7 +184,18 @@ class ChatApp(App[int]):
         self._model = model
         self._is_manual = is_manual
         self._orchestrator = Orchestrator(
-            router, model, user_id=self._config.user_id, storage=self._storage
+            router,
+            model,
+            user_id=self._config.user_id,
+            storage=self._storage,
+            agent=find_orchestrator_agent(self._config),
+            tools=self._tools,
+            subagents=self._config.agents,
+            subagent_factory=(
+                self._subagent_factory_maker(router)
+                if self._subagent_factory_maker is not None
+                else None
+            ),
         )
         if old_router is not None:
             await old_router.aclose()
@@ -400,7 +423,11 @@ def run_tui(
     is_manual: bool,
     *,
     storage: Storage | None = None,
+    tools: ToolRegistry | None = None,
+    subagent_factory_maker: SubagentFactoryMaker | None = None,
 ) -> int:
-    app = ChatApp(config, model, router_factory, is_manual, storage)
+    app = ChatApp(
+        config, model, router_factory, is_manual, storage, tools, subagent_factory_maker
+    )
     app.run()
     return app.return_code or 0

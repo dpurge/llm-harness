@@ -5,12 +5,15 @@ the instructions, the state and the latest observation, never chat history.
 """
 
 import json
+import re
+from collections.abc import Sequence
 from functools import cache
 from importlib.resources import files
 
-from llm_harness.config import ModelConfig, resolve_think
+from llm_harness.config import ORCHESTRATOR_TAG, AgentConfig, ModelConfig, resolve_think
 from llm_harness.redact import redact
 from llm_harness.state import OrchestratorState, reply_schema
+from llm_harness.tools import Tool
 from llm_harness.types import ChatRequest, Message
 
 MAX_OBSERVATION_CHARS = 4000
@@ -27,13 +30,36 @@ def _dump(schema: dict) -> str:
     return json.dumps(schema, sort_keys=True, indent=2)
 
 
-@cache
-def _system_prompt() -> str:
+def _with_schemas(instructions: str) -> str:
     # Generated from the models so the prompt can never drift from the contract.
     return (
-        f"{_instructions().rstrip()}\n\n"
+        f"{instructions.rstrip()}\n\n"
         f"## Reply schema\n\n{_dump(_reply_schema())}\n\n"
         f"## State schema\n\n{_dump(OrchestratorState.model_json_schema())}\n"
+    )
+
+
+@cache
+def _system_prompt() -> str:
+    return _with_schemas(_instructions())
+
+
+def subagent_instructions(agent_id: str, agent_name: str, description: str) -> str:
+    """The subagent prompt with its identity filled in, ready for `build_request`.
+
+    Single-pass replacement, not `str.format`: the prompt holds JSON braces, and a
+    value that itself contains a placeholder must not be substituted again.
+    """
+    template = (files("llm_harness") / "prompts" / "subagent.md").read_text("utf-8")
+    values = {
+        "{agent_id}": agent_id,
+        "{agent_name}": agent_name,
+        "{description}": description,
+    }
+    return re.sub(
+        "|".join(re.escape(key) for key in values),
+        lambda match: values[match.group(0)],
+        template,
     )
 
 
@@ -69,21 +95,62 @@ def answer_observation(question: str, answer: str) -> str:
     return f'You asked the user: "{asked}"\nThe user answered: {answer}'
 
 
+def tool_lines(tools: Sequence[Tool]) -> str:
+    """One `name: description` line per tool; the schema comes from `tool_search`."""
+    return "\n".join(f"{tool.name}: {tool.description}" for tool in tools) or "(none)"
+
+
+def delegation_targets(agents: Sequence[AgentConfig]) -> list[AgentConfig]:
+    """The agents the orchestrator may delegate to: not itself, and with examples.
+
+    The one place the rule lives, so the listing and the unknown-id check agree.
+    """
+    return [a for a in agents if ORCHESTRATOR_TAG not in a.tags and a.examples]
+
+
+def subagent_lines(agents: Sequence[AgentConfig]) -> str:
+    """One `id: description (e.g. a; b)` line per delegation target."""
+    return (
+        "\n".join(
+            f"{a.id}: {a.description} (e.g. {'; '.join(a.examples)})"
+            for a in delegation_targets(agents)
+        )
+        or "(none)"
+    )
+
+
 def build_request(
     state: OrchestratorState,
     observation: str,
     model_cfg: ModelConfig,
     think: bool | None = None,
+    tools: Sequence[Tool] = (),
+    instructions: str | None = None,
+    subagents: Sequence[AgentConfig] = (),
 ) -> ChatRequest:
-    """Two messages: system (instructions + schemas), user (state + observation)."""
+    """Two messages: system (instructions + schemas), user (state, tools, observation).
+
+    A `## Subagents` section follows the tools only when `subagents` holds at
+    least one delegation target; otherwise the message is unchanged.
+
+    `instructions` replaces the orchestrator prompt (a subagent passes its own);
+    the schema sections are appended either way.
+    """
+    targets = delegation_targets(subagents)
+    subagent_section = (
+        f"## Subagents\n\n{subagent_lines(targets)}\n\n" if targets else ""
+    )
     user = (
         f"## State\n\n{state.model_dump_json()}\n\n"
+        f"## Tools\n\n{tool_lines(tools)}\n\n"
+        f"{subagent_section}"
         f"## Observation\n\n{_truncate(observation)}\n"
     )
+    system = _system_prompt() if instructions is None else _with_schemas(instructions)
     return ChatRequest(
         model=model_cfg.model,
         messages=[
-            Message(role="system", content=_system_prompt()),
+            Message(role="system", content=system),
             Message(role="user", content=user),
         ],
         think=resolve_think(think, model_cfg),

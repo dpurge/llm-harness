@@ -16,13 +16,14 @@ from nicegui.elements.mixins.content_element import ContentElement
 from nicegui.testing import User
 
 import llm_harness.gui.app as gui_app
-from llm_harness.config import ConfigError, HarnessConfig, ProviderConfig
+from llm_harness.config import AgentConfig, ConfigError, HarnessConfig, ProviderConfig
 from llm_harness.gui.app import register_page, run_gui
 from llm_harness.gui.security import LoopbackOnlyMiddleware
 from llm_harness.markdown_render import sanitize_html
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.redact import REDACTED
 from llm_harness.store import Store
+from llm_harness.subagents import make_subagent_factory_maker
 from llm_harness.types import (
     Done,
     ErrorEvent,
@@ -180,6 +181,22 @@ def orchestrators(monkeypatch: pytest.MonkeyPatch) -> list[Orchestrator]:
 
     monkeypatch.setattr(gui_app, "Orchestrator", RecordingOrchestrator)
     return created
+
+
+async def test_the_orchestrator_gets_the_agent_from_the_config(
+    user: User, orchestrators: list[Orchestrator]
+) -> None:
+    agent = {
+        "id": "boss",
+        "name": "Boss",
+        "description": "Leads.",
+        "tags": ["orchestrator"],
+        "model_tags": [],
+    }
+    config = CONFIG.model_copy(update={"agents": [AgentConfig(**agent)]})
+    register_page(config, MODEL_1, router_factory_for(config, Factory(REPLY)), False)
+    await user.open("/")
+    assert orchestrators[0]._agent_id == "boss"
 
 
 async def wait_for(condition: Callable[[], bool]) -> None:
@@ -901,6 +918,41 @@ async def test_control_characters_are_stripped_everywhere(user: User) -> None:
     assert texts(user, "thinking") == [clean]
 
 
+async def test_the_orchestrator_gets_the_subagents_and_the_factory(
+    user: User, orchestrators: list[Orchestrator]
+) -> None:
+    helper = AgentConfig(
+        id="helper",
+        name="Helper",
+        description="Helps.",
+        tags=[],
+        model_tags=[],
+        examples=["Help me."],
+    )
+    config = CONFIG.model_copy(update={"agents": [helper]})
+
+    def factory(agent: AgentConfig) -> Any:
+        raise AssertionError("not called")
+
+    parents: list[Any] = []
+
+    def maker(parent: Any) -> Any:
+        parents.append(parent)
+        return factory
+
+    register_page(
+        config,
+        MODEL_1,
+        router_factory_for(config, Factory(REPLY)),
+        False,
+        subagent_factory_maker=maker,
+    )
+    await user.open("/")
+    assert orchestrators[0].subagents == (helper,)
+    assert orchestrators[0]._subagent_factory is factory
+    assert len(parents) == 1
+
+
 async def test_control_characters_are_stripped_from_error_messages(user: User) -> None:
     dirty = "a\x1b[31mb\x07c"
     await open_chat(user, Factory([ErrorEvent(kind="bad_request", message=dirty)]))
@@ -918,13 +970,25 @@ class HostileStatusOrchestrator:
     CLEAN = f"{SCRIPT}{BOLD}**x**[b]y[/b][31mz"
 
     def __init__(
-        self, router: Any, model: Any, user_id: str | None = None, storage: Any = None
+        self,
+        router: Any,
+        model: Any,
+        user_id: str | None = None,
+        storage: Any = None,
+        agent: Any = None,
+        tools: Any = None,
+        subagents: Any = (),
+        subagent_factory: Any = None,
     ) -> None:
         self.has_completed_turn = False
+        self.subagents = tuple(subagents)
         # What the State and Trace tabs read after each status event.
         self.state = Orchestrator(router, model).state
         self.pending_question = None
         self.last_trace = None
+
+    def available_tools(self) -> list:
+        return []
 
     async def send(self, text: str):
         yield StatusEvent(step=2, action_type="respond", text=self.TEXT)
@@ -1103,6 +1167,53 @@ async def test_a_fallback_shows_the_note_the_reply_and_the_usage_line(
         (label,) = elements(user, marker)
         assert isinstance(label, ui.label)
         assert "llm-secondary" in label.classes
+
+
+async def test_a_new_chat_starts_its_session_cost_at_zero_again(user: User) -> None:
+    factory = FallbackFactory()
+    router_factory = router_factory_for(FALLBACK_CONFIG, factory)
+    maker = make_subagent_factory_maker(FALLBACK_CONFIG, factory, None, None)
+    register_page(
+        FALLBACK_CONFIG,
+        DEAD_MODEL,
+        router_factory,
+        False,
+        subagent_factory_maker=maker,
+    )
+    await user.open("/")
+    await send(user, "one")
+    (first,) = texts(user, "usage")
+    user.find(marker="new-chat").click()
+    await wait_for(lambda: len(router_factory.calls) == 2)
+    await wait_for(lambda: texts(user, "usage") == [])
+    await send(user, "two")
+    (second,) = texts(user, "usage")
+    # One turn costs $0.017: a carried-over total would show $0.03 in the second.
+    assert first.endswith("s | session $0.02]")
+    assert second.endswith("s | session $0.02]")
+
+
+async def test_two_clients_do_not_share_a_session_cost(
+    user: User, create_user: Callable[[], User]
+) -> None:
+    factory = FallbackFactory()
+    maker = make_subagent_factory_maker(FALLBACK_CONFIG, factory, None, None)
+    register_page(
+        FALLBACK_CONFIG,
+        DEAD_MODEL,
+        router_factory_for(FALLBACK_CONFIG, factory),
+        False,
+        subagent_factory_maker=maker,
+    )
+    second = create_user()
+    await user.open("/")
+    await second.open("/")
+    await send(user, "from first")
+    await send(second, "from second")
+    (first_line,) = texts(user, "usage")
+    (second_line,) = texts(second, "usage")
+    assert first_line.endswith("s | session $0.02]")
+    assert second_line.endswith("s | session $0.02]")  # a shared total would be $0.03
 
 
 async def test_an_unusable_database_notice_is_shown_once_as_a_note(

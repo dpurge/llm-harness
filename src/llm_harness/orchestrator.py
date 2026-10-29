@@ -8,20 +8,29 @@ earlier valid steps committed and nothing else.
 
 import getpass
 import socket
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import datetime
 
-from llm_harness.config import ModelConfig
-from llm_harness.context import answer_observation, build_request, retry_observation
+from pydantic import ValidationError
+
+from llm_harness.config import ORCHESTRATOR_TAG, AgentConfig, ModelConfig
+from llm_harness.context import (
+    answer_observation,
+    build_request,
+    delegation_targets,
+    retry_observation,
+)
 from llm_harness.providers.base import ChatProvider
 from llm_harness.redact import redact
 from llm_harness.state import (
     DEFAULT_MAX_CHARS,
     AskUserAction,
     CallToolAction,
+    DelegateAction,
     Environment,
+    GoalChange,
     OrchestratorState,
     PatchError,
     Reply,
@@ -32,7 +41,7 @@ from llm_harness.state import (
     parse_reply,
 )
 from llm_harness.storage import Storage
-from llm_harness.tools import ToolContext, ToolRegistry
+from llm_harness.tools import Tool, ToolContext, ToolRegistry
 from llm_harness.trace import Span, SpanHandle, TraceRecorder
 from llm_harness.types import (
     Done,
@@ -52,6 +61,7 @@ _EMPTY_GOAL = (
     "goal is empty: set `goal` in state_patch, "
     "or use ask_user if you cannot tell what the user wants."
 )
+_NO_DELEGATION = "delegate is not available to subagents"
 _STATUS_CHARS = 80
 
 # Shown to the user as they arrive; the model's TextDelta is JSON and is never shown.
@@ -64,6 +74,13 @@ def _default_clock() -> datetime:
 
 def _default_identity() -> tuple[str, str]:
     return getpass.getuser(), socket.gethostname()
+
+
+@dataclass
+class _Delegation:
+    """The observation a delegation produced, filled in while its events are forwarded."""
+
+    observation: str = ""
 
 
 @dataclass
@@ -104,6 +121,15 @@ def _status_text(reply: Reply) -> str:
     return text[:_STATUS_CHARS]
 
 
+def _argument_problems(error: ValidationError) -> str:
+    # Only location and message: pydantic's str() echoes the offending input.
+    return "; ".join(
+        f"{'.'.join(str(item) for item in problem['loc']) or '(arguments)'}: "
+        f"{problem['msg']}"
+        for problem in error.errors(include_input=False, include_url=False)
+    )
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -120,8 +146,21 @@ class Orchestrator:
         tools: ToolRegistry | None = None,
         recorder: TraceRecorder | None = None,
         storage: Storage | None = None,
+        agent: AgentConfig | None = None,
+        instructions: str | None = None,
+        can_delegate: bool = True,
+        goal: str = "",
+        subagents: Sequence[AgentConfig] = (),
+        subagent_factory: Callable[[AgentConfig], tuple[ChatProvider, ModelConfig]]
+        | None = None,
     ) -> None:
+        self._subagents = tuple(subagents)
+        self._subagent_factory = subagent_factory
         self._storage = storage
+        # Without an agent (tests) the orchestrator keeps its built-in identity.
+        self._agent = agent
+        self._agent_id = agent.id if agent else ORCHESTRATOR_TAG
+        self._agent_tags = frozenset(agent.tags if agent else {ORCHESTRATOR_TAG})
         self._tools = tools if tools is not None else ToolRegistry()
         self._recorder = recorder if recorder is not None else TraceRecorder()
         self._provider = provider
@@ -133,7 +172,9 @@ class Orchestrator:
         self._max_steps = max_steps
         self._max_retries = max_retries
         self._max_state_chars = max_state_chars
-        self._state = OrchestratorState(environment=self._environment())
+        self._instructions = instructions
+        self._can_delegate = can_delegate
+        self._state = self._initial_state(goal)
         self._busy = False
         self._has_completed_turn = False
         # The last ask_user question; part of snapshot() so a run can resume from it.
@@ -142,6 +183,11 @@ class Orchestrator:
     @property
     def state(self) -> OrchestratorState:
         return self._state
+
+    @property
+    def subagents(self) -> tuple[AgentConfig, ...]:
+        """The agents this orchestrator may delegate to (read-only, for the preview)."""
+        return self._subagents
 
     @property
     def has_completed_turn(self) -> bool:
@@ -159,6 +205,18 @@ class Orchestrator:
         Display data only: `build_request` never reads it.
         """
         return self._recorder.spans
+
+    def _initial_state(self, goal: str) -> OrchestratorState:
+        """A fresh state; a preset goal is recorded as the model's own would be.
+
+        The first `send` is turn 1, so the history entry carries turn 1.
+        """
+        history = [GoalChange(turn=1, old="", new=goal)] if goal.strip() else []
+        return OrchestratorState(
+            goal=goal if goal.strip() else "",
+            goal_history=history,
+            environment=self._environment(),
+        )
 
     def _environment(self) -> Environment:
         user_name, computer_name = self._identity()
@@ -205,7 +263,13 @@ class Orchestrator:
                         for _ in range(self._max_retries + 1):
                             attempt = _Attempt()
                             request = build_request(
-                                self._state, observation, self._model_cfg, self._think
+                                self._state,
+                                observation,
+                                self._model_cfg,
+                                self._think,
+                                self.available_tools(),
+                                instructions=self._instructions,
+                                subagents=self._subagents,
                             )
                             with self._recorder.span(
                                 "llm_call", request.model, step
@@ -282,6 +346,17 @@ class Orchestrator:
                             return
                         if isinstance(action, CallToolAction):
                             observation = await self._run_tool(action, step)
+                        elif isinstance(action, DelegateAction):
+                            if not self._can_delegate:
+                                observation = _NO_DELEGATION
+                            else:
+                                delegation = _Delegation()
+                                async with aclosing(
+                                    self._delegate(action, step, delegation)
+                                ) as child_events:
+                                    async for event in child_events:
+                                        yield event
+                                observation = delegation.observation
                         else:
                             observation = f"{action.type} is not available yet"
 
@@ -298,6 +373,62 @@ class Orchestrator:
         finally:
             self._busy = False
 
+    async def _delegate(
+        self, action: DelegateAction, step: SpanHandle, delegation: _Delegation
+    ) -> AsyncIterator[StreamEvent]:
+        """Run one child agent; forward its display events, set the observation.
+
+        Every child failure becomes an observation, never an exception here;
+        cancellation propagates.
+        """
+        # Imported here: `subagents` imports this module for the child Orchestrator.
+        from llm_harness.subagents import SubagentRun, result_observation
+
+        if self._subagent_factory is None:
+            delegation.observation = f"{action.type} is not available yet"
+            return
+        targets = {agent.id: agent for agent in delegation_targets(self._subagents)}
+        child = targets.get(action.subagent)
+        if child is None:
+            available = ", ".join(sorted(targets)) or "none"
+            delegation.observation = (
+                f"unknown subagent {action.subagent}; available subagents: {available}"
+            )
+            return
+        with self._recorder.span("subagent", child.id, step) as span:
+            span.attributes["subagent"] = child.id
+            try:
+                provider, child_model_cfg = self._subagent_factory(child)
+            except Exception as error:  # noqa: BLE001 - becomes an observation
+                span.status = "error"
+                delegation.observation = (
+                    f"subagent {child.id} could not start: {redact(str(error))}"
+                )
+                return
+            try:
+                run = SubagentRun(
+                    child,
+                    self._state.environment,
+                    action.brief,
+                    provider,
+                    child_model_cfg,
+                    self._tools,
+                    think=self._think,
+                    storage=self._storage,
+                )
+            except BaseException:
+                # SubagentRun closes the provider only once it runs.
+                await provider.aclose()
+                raise
+            async with aclosing(run.events()) as events:
+                async for event in events:
+                    yield event
+            result = run.result
+            span.attributes["outcome"] = result.outcome
+            span.attributes["state"] = result.state.model_dump(mode="json")
+            self._recorder.adopt(result.spans, span, span.start_ms)
+            delegation.observation = result_observation(child.id, result)
+
     async def _run_tool(self, action: CallToolAction, step: SpanHandle) -> str:
         """Run a tool; every failure becomes an observation, never an exception."""
         with self._recorder.span("tool_call", action.tool, step) as call:
@@ -307,21 +438,39 @@ class Orchestrator:
             call.attributes["result"] = result
             return result
 
+    def available_tools(self) -> list[Tool]:
+        """The tools this agent may use, sorted by name."""
+        # Without an agent (tests) every registered tool is allowed.
+        if self._agent is None:
+            return self._tools.all()
+        return self._tools.tools_for(self._agent)
+
+    def _allowed_tool_names(self) -> frozenset[str]:
+        return frozenset(tool.name for tool in self.available_tools())
+
     async def _call_tool(self, action: CallToolAction, call: SpanHandle) -> str:
-        tool = self._tools.get(action.tool)
+        allowed = self._allowed_tool_names()
+        tool = self._tools.get(action.tool) if action.tool in allowed else None
         if tool is None:
             call.status = "error"
-            available = ", ".join(self._tools.names()) or "none"
-            return f"unknown tool {action.tool}; available tools: {available}"
-        # Agent ids and tags will come from the planned agent registry.
+            available = ", ".join(sorted(allowed)) or "none"
+            return f"tool {action.tool} is not available; available tools: {available}"
+        try:
+            arguments = tool.input_model.model_validate(action.arguments)
+        except ValidationError as error:
+            call.status = "error"
+            return (
+                f"invalid arguments for tool {action.tool}: {_argument_problems(error)}"
+            )
         ctx = ToolContext(
             storage=self._storage,
             user_id=self._user_id,
-            agent_id="orchestrator",
-            tags=frozenset({"orchestrator"}),
+            agent_id=self._agent_id,
+            tags=self._agent_tags,
+            allowed_tools=allowed,
         )
         try:
-            result = await tool.run(action.arguments, ctx)
+            result = await tool.run(arguments, ctx)
         except Exception as error:  # noqa: BLE001 - becomes an observation; Cancelled passes
             call.status = "error"
             return (
