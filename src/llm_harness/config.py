@@ -298,6 +298,17 @@ class StorageConfig(_Frozen):
     files: FilesConfig = FilesConfig()
 
 
+class ToolsConfig(_Frozen):
+    # Registers the harmless write-risk `dev_echo` tool, to try the approval prompt.
+    dev_echo: StrictBool = False
+    # Registers the read-risk `web_search` and `web_fetch` tools (no approval prompt).
+    web_search: StrictBool = False
+    web_fetch: StrictBool = False
+    # Only for a corporate TLS proxy whose CA breaks Python 3.13's strict X.509
+    # profile; the certificate chain and host name are still verified.
+    web_relax_tls_strict: StrictBool = False
+
+
 def _check_tag_list(values: list[str]) -> list[str]:
     for value in values:
         if not value or value != value.lower() or any(c.isspace() for c in value):
@@ -361,6 +372,7 @@ class HarnessConfig(_Frozen):
     # The same on every computer, so the orchestrator can tell whose state it is.
     user_id: str | None = None
     storage: StorageConfig = StorageConfig()
+    tools: ToolsConfig = ToolsConfig()
     agents: list[AgentConfig] = []
 
     _user_id_rule = field_validator("user_id", mode="before")(_check_user_id)
@@ -435,6 +447,21 @@ def _load_storage(raw: object) -> StorageConfig:
         raise _format_validation_error(CONFIG_FILE, exc) from None
 
 
+def _load_tools(raw: object) -> ToolsConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"invalid {CONFIG_FILE}: tools must be a table, not "
+            f"{type(raw).__name__}; write it as [tools]"
+        )
+    try:
+        # Wrapped so error locations start with "tools".
+        return TypeAdapter(dict[str, ToolsConfig]).validate_python({"tools": raw})[
+            "tools"
+        ]
+    except ValidationError as exc:
+        raise _format_validation_error(CONFIG_FILE, exc) from None
+
+
 def load_config(config_dir: Path) -> HarnessConfig:
     config_path = config_dir / CONFIG_FILE
     models_path = config_dir / MODELS_FILE
@@ -446,7 +473,7 @@ def load_config(config_dir: Path) -> HarnessConfig:
         raise MissingConfigError(missing)
 
     toml_data = _read_toml(config_path)
-    unknown = sorted(set(toml_data) - {"providers", "user_id", "storage"})
+    unknown = sorted(set(toml_data) - {"providers", "user_id", "storage", "tools"})
     if unknown:
         raise ConfigError(
             f"invalid {CONFIG_FILE}: unknown top-level keys: {', '.join(unknown)}"
@@ -468,6 +495,7 @@ def load_config(config_dir: Path) -> HarnessConfig:
     except ValueError as exc:
         raise ConfigError(f"invalid {CONFIG_FILE}: {exc}") from None
     storage = _load_storage(toml_data.get("storage", {}))
+    tools = _load_tools(toml_data.get("tools", {}))
 
     models = _load_models(models_path)
     agents = _load_agents(agents_path, models)
@@ -477,6 +505,7 @@ def load_config(config_dir: Path) -> HarnessConfig:
             models=models,
             user_id=user_id,
             storage=storage,
+            tools=tools,
             agents=agents,
         )
     except ValidationError as exc:
@@ -719,6 +748,14 @@ base_url = "http://localhost:11434"
 # [storage.files]
 # backend = "local"
 # root = "/absolute/path"              # default: ~/.local/share/llm-harness/files
+
+# Optional tools. `dev_echo` is a harmless tool that needs your approval (risk
+# "write"); switch it on to try the approval prompt. Default: false.
+# [tools]
+# dev_echo = true
+# web_search = true                    # tool: search the web (DuckDuckGo), no approval prompt
+# web_fetch = true                     # tool: fetch a public web page as text, no approval prompt
+# web_relax_tls_strict = false         # true only behind a TLS-inspecting proxy; chain and host name stay checked
 """
 
 EXAMPLE_MODELS_YAML = """\

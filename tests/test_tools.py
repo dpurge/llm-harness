@@ -28,11 +28,13 @@ class FakeTool:
         description: str = "A tool.",
         tags: list[str] | None = None,
         input_model: type[BaseModel] = NoInput,
+        risk: str = "read",
     ) -> None:
         self.name = name
         self.description = description
         self.tags = tags if tags is not None else []
         self.input_model = input_model
+        self.risk = risk
 
     async def run(self, arguments: BaseModel, ctx: ToolContext) -> str:
         return self.name
@@ -100,6 +102,26 @@ def test_an_input_model_that_is_not_a_pydantic_class_is_refused() -> None:
     tool.input_model = dict  # type: ignore[assignment]
     with pytest.raises(TypeError, match="tool 'x': input_model"):
         ToolRegistry().register(tool)
+
+
+def test_a_tool_without_a_risk_is_refused_naming_the_tool() -> None:
+    tool = FakeTool("x")
+    del tool.risk
+    with pytest.raises(ValueError, match="tool 'x': risk must be one of"):
+        ToolRegistry().register(tool)
+
+
+@pytest.mark.parametrize("risk", ["admin", "", "READ", None])
+def test_an_unknown_risk_is_refused_naming_the_tool(risk: str | None) -> None:
+    with pytest.raises(ValueError, match="tool 'x': risk must be one of"):
+        ToolRegistry().register(FakeTool("x", risk=risk))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("risk", ["read", "write", "exec"])
+def test_each_known_risk_is_accepted(risk: str) -> None:
+    tool = FakeTool("x", risk=risk)
+    registry = registry_of(tool)
+    assert registry.get("x") is tool
 
 
 def names_for(registry: ToolRegistry, **agent_fields: object) -> list[str]:

@@ -8,6 +8,7 @@ import contextlib
 
 from nicegui import app, ui
 
+from llm_harness.approval import ApprovalRequest
 from llm_harness.config import (
     ConfigError,
     HarnessConfig,
@@ -236,6 +237,7 @@ class ChatPage:
             storage=self._storage,
             agent=find_orchestrator_agent(self._config),
             tools=self._tools,
+            approver=self._approve_call,
             subagents=self._config.agents,
             subagent_factory=(
                 self._subagent_factory_maker(router)
@@ -284,6 +286,60 @@ class ChatPage:
             label = ui.label(text).classes(f"{_PRE_WRAP} {classes}").mark(marker)
         self._scroll_to_end()
         return label
+
+    async def _approve_call(self, request: ApprovalRequest) -> bool:
+        """Ask the human on THIS page; only the two buttons can answer.
+
+        Everything shown is a plain label (never html or markdown): the arguments
+        come from the model. Stop or closing the page cancels the turn, which
+        cancels the wait here; the buttons are removed in `finally`.
+        """
+        decision: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        with self._log:
+            block = ui.column().classes("w-full gap-1 border").mark("approval")
+        with block:
+            ui.label("Approval needed").classes("text-bold").mark("approval-title")
+            for text, marker in (
+                (f"tool: {request.tool}", "approval-tool"),
+                (f"risk: {request.risk}", "approval-risk"),
+                (f"agent: {request.agent_id}", "approval-agent"),
+            ):
+                ui.label(text).classes(_PRE_WRAP).mark(marker)
+            ui.label(f"arguments: {request.arguments_text}").classes(
+                f"{_PRE_WRAP} w-full"
+            ).mark("approval-args")
+            buttons = ui.row().classes("w-full no-wrap gap-4").mark("approval-buttons")
+            with buttons:
+                for caption, verdict, marker, color in (
+                    ("Approve", True, "approve", "positive"),
+                    ("Deny", False, "deny", "negative"),
+                ):
+                    ui.button(
+                        caption,
+                        color=color,
+                        on_click=lambda verdict=verdict: self._answer(
+                            decision, verdict
+                        ),
+                    ).classes("grow").props("size=lg").mark(marker)
+        self._scroll_to_end()
+        try:
+            approved = await decision
+            if not self._is_closed:
+                with block:
+                    ui.label("approved" if approved else "denied").classes(
+                        f"{_PRE_WRAP} {_DIM}"
+                    ).mark("approval-note")
+            return approved
+        finally:
+            if not self._is_closed:
+                buttons.delete()
+                self._scroll_to_end()
+
+    @staticmethod
+    def _answer(decision: asyncio.Future[bool], verdict: bool) -> None:
+        """A button click; a second click or one after a cancel does nothing."""
+        if not decision.done():
+            decision.set_result(verdict)
 
     def _show_reply(self) -> ui.html:
         with self._log:

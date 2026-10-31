@@ -339,6 +339,7 @@ class StubTool:
         self.description = f"Stub tool {name}."
         self.tags: list[str] = []
         self.input_model = AnyArguments
+        self.risk = "read"
         self._result = result
         self._error = error
         self._hang = hang
@@ -376,7 +377,7 @@ async def test_call_tool_result_is_the_next_observation_then_respond() -> None:
     assert stub.calls == [{"q": "x"}]
     assert observation(provider.requests[1]) == "tool search result: found it"
     assert events[0] == StatusEvent(
-        step=1, action_type="call_tool", text="calling tool search"
+        step=1, action_type="call_tool", text='tool search {"q": "x"}'
     )
     assert events[-1] == Done()
     assert orchestrator.state.step == 2

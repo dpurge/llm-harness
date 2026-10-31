@@ -6,9 +6,9 @@ terminal UI and a web GUI, and shows the model's thinking text when the model
 provides it. Every message goes through an orchestrator that keeps a small typed
 state instead of the chat history (see Orchestrator). It falls back to another
 model when one fails and records what each call cost. The orchestrator can hand
-a task to a subagent declared in `agents.yaml` (see Subagents). The only tool is
-`tool_search`, which finds the tools an agent may use; real tools do not exist
-yet.
+a task to a subagent declared in `agents.yaml` (see Subagents). The tool
+`tool_search` finds the tools an agent may use; the only real tools are two
+optional web tools, `web_search` and `web_fetch` (see Tools).
 
 ## Quick start
 
@@ -247,8 +247,8 @@ Rules:
   stops, for example `invalid agents.yaml: agent 'writer': no chat model
   carries all of model_tags ['writer', 'cheap']`.
 - Agent ids are unique, and a tool name cannot be in both `tools` and `deny`.
-  A name in `tools` or `deny` must be a known tool (today only `tool_search`),
-  otherwise the program stops, for example `error: invalid agents.yaml: agent
+  A name in `tools` or `deny` must be a known tool (`tool_search`, plus the optional tools switched on in
+  `[tools]`), otherwise the program stops, for example `error: invalid agents.yaml: agent
   'orchestrator': tools names unknown tool 'nope'; known tools: tool_search`.
   An agent may use the tools whose tags meet its own `tags`, plus those in
   `tools`, minus those in `deny`.
@@ -374,6 +374,99 @@ expects 1)`, `schema: legacy file (user_version 1), it will be migrated on the
 next start`, `collection tools: 4 dimensions, cosine, free` or `collection
 tools: locked (in use by another llm-harness process)`.
 
+### Tools
+
+An optional `[tools]` table in `config.toml` switches on optional built-in
+tools. Write it after `user_id`, like `[storage...]`:
+
+```toml
+# [tools]
+# dev_echo = true              # default: false
+# web_search = true            # default: false
+# web_fetch = true             # default: false
+# web_relax_tls_strict = true  # default: false; only behind a TLS-inspecting proxy
+```
+
+- `dev_echo` registers a harmless tool of risk `write` that echoes its `text`
+  argument. It exists only to try the approval prompt: in `--plain` mode the
+  program asks on stderr `Allow this call? [y/N]` and runs the call only after
+  you answer `y` or `yes`; anything else (including end of input) denies it. The
+  prompt shows the tool, risk, agent and the exact arguments the tool will
+  receive (after validation, defaults included), nothing masked, with non-ASCII
+  and control characters escaped as `\uXXXX`. Arguments longer than 20000
+  characters are denied without asking. When stdin is piped (not a terminal),
+  `--plain` cannot approve: such calls are denied, so a piped line never answers
+  a prompt. On a terminal, input typed ahead is discarded before the prompt. An
+  agent can use it when its tags include `orchestrator` or its `tools` list
+  names it. The terminal UI and the web GUI ask too (Approve and Deny buttons in
+  the GUI).
+- An unknown key under `[tools]` is an error. The three web keys must be `true`
+  or `false` (a string such as `"yes"` is an error) and default to `false`.
+- Naming a tool in `agents.yaml` while it is switched off is an error with a
+  hint, for example `enable it with [tools] web_fetch = true`. Both web tools are
+  tagged `orchestrator` and `web`, so the orchestrator agent can use them once
+  they are on.
+
+The web tools are two optional tools of risk `read`, so they run without an
+approval prompt:
+
+- `web_search` (`query`, optional `max_results` from 1 to 10, default 5) returns
+  numbered results, each with a title, a URL and a snippet. It scrapes
+  DuckDuckGo's HTML page and needs no API key.
+- `web_fetch` (`url`, optional `max_chars` from 200 to 3500, default 3000)
+  returns the main text of one page. The text starts with a `Title: ...` line,
+  because the extractor (`trafilatura`) drops short headings. Allowed types:
+  `text/html`, `application/xhtml+xml`, `text/plain`, `text/markdown` and
+  `application/json`.
+
+Safety rules:
+
+- Auto-run: no prompt. Before every such call (any `read` tool except
+  `tool_search`) the CLI, the terminal UI and the GUI show one plain-text line,
+  `tool <name> <arguments>`, with the full arguments (hard cap 2200 characters,
+  with the total length shown). Read the URL there: a URL can carry data to
+  another host. A subagent's calls inside a delegation are shown the same way,
+  prefixed with the subagent's id.
+  The trace keeps the full URL.
+- SSRF guard on the first URL and on every redirect hop: `http` and `https`
+  only, ports 80 and 443 only, no user name or password in the URL, no
+  `localhost`, no numeric host forms such as `2130706433`, and every address the
+  name resolves to must be public. The connection goes to the address that was
+  checked, so DNS cannot change it afterwards.
+- Redirects are followed by hand: at most 5, each one re-checked, never from
+  `https` to `http`.
+- Caps: the URL is at most 2048 characters, the body at most 1 MB after
+  decoding, the whole call takes at most 20 seconds, and the answer to the model
+  fits in 4000 characters.
+- No proxy variables, no cookies, no credentials are ever sent; the
+  `User-Agent` is `llm-harness/<version>`.
+- The page text goes to the model inside an `<untrusted-web-content ...>` block,
+  followed by a fixed sentence that says it is data, not an instruction.
+  This lowers the risk of prompt injection; it does not remove it.
+
+Behind a TLS-inspecting corporate proxy: the program checks certificates with
+the CA bundle of `certifi`, or with `SSL_CERT_FILE` / `SSL_CERT_DIR` when they
+are set. If your proxy re-signs HTTPS traffic, put the proxy's root CA in a
+bundle file and start the program with `SSL_CERT_FILE=/absolute/path/bundle.pem`.
+Python 3.13 may still reject such a CA under its strict X.509 profile (for
+example "Missing Authority Key Identifier"); then add `web_relax_tls_strict =
+true`. That key clears only Python's strict flag; the certificate chain and the
+host name are still checked.
+
+Caveats of `web_search`: scraping DuckDuckGo is fragile (a layout change or a
+bot check makes it fail with a short error message) and may be against the
+site's terms of use.
+
+Live tests of both tools call the real web and are off by default:
+
+```sh
+SSL_CERT_FILE=/absolute/path/bundle.pem LLM_HARNESS_LIVE_RELAX_TLS_STRICT=1 \
+  uv run pytest -m live tests/test_live_web.py
+```
+
+Both variables are optional; `LLM_HARNESS_LIVE_RELAX_TLS_STRICT=1` is read only
+by the tests.
+
 ## Model fallback and usage tracking
 
 When a model fails, the harness moves to the next suitable one. The chain for a
@@ -470,8 +563,9 @@ description 1) and answers with each match's description, tags and argument
 schema. A `call_tool` for a tool that is not in the list is not run: the model
 is told `tool <name> is not available; available tools: ...`; arguments that do
 not fit the tool's schema are not run either: `invalid arguments for tool
-<name>: <field>: <message>` (the values are never repeated). The only tool today
-is `tool_search`, tagged `orchestrator`.
+<name>: <field>: <message>` (the values are never repeated). `tool_search` is
+always available, tagged `orchestrator`; the optional tools from `[tools]` (see
+Tools) are listed only when switched on.
 
 - Each step prints a status line: `[step 1: answering]` on stderr in `--plain`;
   the terminal UI and the GUI show `step 1: answering` as a note.
@@ -688,7 +782,7 @@ known whether it accepts the `thinking` settings as sent.
 ```sh
 uv run pytest              # offline, no network
 uv run ruff check
-uv run pytest -m live      # live tests, call real providers
+uv run pytest -m live      # live tests, call real providers and web services
 uv run pytest -m live tests/test_live_ollama.py -k embed -rs   # embedding live test only
 ```
 
@@ -710,7 +804,8 @@ reachable.
   State tab has no section for a subagent (see the Trace tab). A subagent may
   fall back to a model tagged `default` outside its `model_tags`. No real model
   run of delegation was done; the tests use scripted fake models.
-- Tools are only `tool_search`; there are no web, RAG or memory tools yet.
+- The only real tools are the two optional web tools; there are no command
+  execution, RAG or memory tools yet.
 - Usage and backoff are only saved if the SQLite file can be used; the new note
   and usage lines were not looked at in a real browser or terminal.
 - OpenAI is untested.

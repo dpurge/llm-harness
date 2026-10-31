@@ -57,6 +57,7 @@ class StubTool:
         self.description = f"Stub tool {name}."
         self.tags: list[str] = []
         self.input_model = AnyArguments
+        self.risk = "read"
         self.calls = 0
 
     async def run(self, arguments: BaseModel, ctx: ToolContext) -> str:
@@ -250,6 +251,19 @@ async def test_display_events_are_forwarded_and_done_and_text_are_dropped() -> N
     events = await drain(run)
     assert events == [thinking, notice, switch, report]
     assert not any(isinstance(e, (Done, TextDelta)) for e in events)
+
+
+async def test_a_childs_auto_run_tool_call_is_shown_as_a_notice() -> None:
+    call = {"type": "call_tool", "tool": "search", "arguments": {"q": "a\nb"}}
+    run, _ = make([reply_events(call), reply_events(RESPOND)])
+    notices = [e for e in await drain(run) if isinstance(e, Notice)]
+    # The child's id prefixes the line; the newline in the argument stays escaped.
+    assert [n.text for n in notices] == ['researcher: tool search {"q": "a\\nb"}']
+
+
+async def test_a_childs_non_call_steps_are_not_shown() -> None:
+    run, _ = make([reply_events(RESPOND)])
+    assert not [e for e in await drain(run) if isinstance(e, Notice)]
 
 
 async def test_cancellation_propagates_and_closes_the_stream() -> None:

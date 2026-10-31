@@ -221,6 +221,7 @@ async def test_tool_call_holds_name_arguments_and_result_and_errors_set_status()
     assert ok.attributes == {
         "tool": "search",
         "arguments": {"q": "x"},
+        "approval": "not_required",
         "result": "tool search result: found it",
     }
     assert unknown.status == "error"

@@ -32,6 +32,7 @@ from llm_harness.types import (
     ErrorEvent,
     ModelSwitch,
     Notice,
+    StatusEvent,
     StreamEvent,
     TextDelta,
     ThinkingDelta,
@@ -132,6 +133,12 @@ class SubagentRun:
                 async for event in stream:
                     if isinstance(event, _FORWARDED):
                         yield event
+                    elif isinstance(event, StatusEvent):
+                        # The human must see every auto-run tool call, including
+                        # the child's (its web calls carry URLs); other steps stay
+                        # the parent's business.
+                        if event.action_type == "call_tool":
+                            yield Notice(text=f"{self._child.id}: {event.text}")
                     elif isinstance(event, ErrorEvent):
                         capped = self._orchestrator.state.step >= SUBAGENT_MAX_STEPS
                         outcome = "step_limit" if capped else "error"

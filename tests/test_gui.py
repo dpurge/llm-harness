@@ -977,6 +977,7 @@ class HostileStatusOrchestrator:
         storage: Any = None,
         agent: Any = None,
         tools: Any = None,
+        approver: Any = None,
         subagents: Any = (),
         subagent_factory: Any = None,
     ) -> None:

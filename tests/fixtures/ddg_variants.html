@@ -1,0 +1,70 @@
+<!--
+  SYNTHETIC fixture, written by hand on 2026-10-30 in the markup of the real capture
+  in ddg_results.html; neutral query "python asyncio tutorial". It covers cases the
+  real capture did not contain: a result without snippet, an HTML entity in a title, a non-http uddg target, a direct href, an ad-like block, a title and snippet with markup.
+  Re-check against a fresh capture when DuckDuckGo changes its page (see ddg_results.html).
+-->
+<html><head><title>python asyncio tutorial at DuckDuckGo</title></head>
+<body class="body--html">
+<div class="serp__results">
+  <!-- Web results are present -->
+  <div id="links" class="results">
+    <div class="result results_links results_links_deep web-result ">
+      <div class="links_main links_deep result__body">
+        <h2 class="result__title">
+          <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fno-snippet&amp;rut=x">A result without a snippet</a>
+        </h2>
+      </div>
+    </div>
+    <div class="result results_links results_links_deep web-result ">
+      <div class="links_main links_deep result__body">
+        <h2 class="result__title">
+          <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fentity%3Fa%3D1%26b%3D2&amp;rut=x">Tom &amp; Jerry&#x27;s &lt;asyncio&gt; guide</a>
+        </h2>
+        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fentity%3Fa%3D1%26b%3D2&amp;rut=x">An <b>entity</b> &amp; markup
+   in the snippet.</a>
+      </div>
+    </div>
+    <div class="result results_links results_links_deep web-result ">
+      <div class="links_main links_deep result__body">
+        <h2 class="result__title">
+          <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=javascript%3Aalert%281%29&amp;rut=x">Not an http target</a>
+        </h2>
+        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=javascript%3Aalert%281%29&amp;rut=x">dropped: javascript scheme</a>
+      </div>
+    </div>
+    <div class="result results_links results_links_deep web-result ">
+      <div class="links_main links_deep result__body">
+        <h2 class="result__title">
+          <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=file%3A%2F%2F%2Fetc%2Fpasswd&amp;rut=x">Another non-http target</a>
+        </h2>
+        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=file%3A%2F%2F%2Fetc%2Fpasswd&amp;rut=x">dropped: file scheme</a>
+      </div>
+    </div>
+    <div class="result results_links results_links_deep web-result ">
+      <div class="links_main links_deep result__body">
+        <h2 class="result__title">
+          <a rel="nofollow" class="result__a" href="https://example.net/direct">A direct link</a>
+        </h2>
+        <a class="result__snippet" href="https://example.net/direct">No uddg wrapper here.</a>
+      </div>
+    </div>
+    <div class="result results_links results_links_deep result--ad">
+      <div class="links_main links_deep result__body">
+        <h2 class="result__title">
+          <a rel="nofollow" class="result__a" href="//duckduckgo.com/y.js?ad_provider=bing&amp;ad_domain=ads.example.com&amp;u3=https%3A%2F%2Fads.example.com%2F">Sponsored result</a>
+        </h2>
+        <a class="result__snippet" href="//duckduckgo.com/y.js?ad_provider=bing&amp;ad_domain=ads.example.com&amp;u3=https%3A%2F%2Fads.example.com%2F">An ad-like block (synthetic; the real capture had none).</a>
+      </div>
+    </div>
+    <div class="result results_links results_links_deep web-result ">
+      <div class="links_main links_deep result__body">
+        <h2 class="result__title">
+          <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Flast&amp;rut=x">The last result</a>
+        </h2>
+        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Flast&amp;rut=x">Still parsed after the ad.</a>
+      </div>
+    </div>
+  </div>
+</div>
+</body></html>

@@ -20,6 +20,7 @@ from llm_harness.config import (
     ProviderConfig,
     RelationalConfig,
     StorageConfig,
+    ToolsConfig,
     VectorConfig,
     chat_models,
     default_config_dir,
@@ -1438,3 +1439,81 @@ def test_agents_unsatisfiable_model_tags_name_the_agent(tmp_path: Path):
 @pytest.mark.parametrize("key", AgentConfig.model_fields, ids=str)
 def test_every_agents_yaml_key_is_documented_in_the_example(key: str):
     assert _documented(EXAMPLE_AGENTS_YAML, key, separator=":"), key
+
+
+# --- [tools] -----------------------------------------------------------------
+
+
+def test_tools_default_to_dev_echo_off(tmp_path: Path):
+    write_config(tmp_path, PROVIDER_TOML)
+    config = load_config(tmp_path)
+    assert config.tools == ToolsConfig()
+    assert config.tools.dev_echo is False
+
+
+def test_tools_dev_echo_true_parses_from_toml(tmp_path: Path):
+    write_config(tmp_path, PROVIDER_TOML + "[tools]\ndev_echo = true\n")
+    assert load_config(tmp_path).tools.dev_echo is True
+
+
+def test_unknown_tools_key_is_rejected(tmp_path: Path):
+    write_config(tmp_path, PROVIDER_TOML + "[tools]\ndev_ecko = true\n")
+    message = str(load_error(tmp_path))
+    assert "tools.dev_ecko: Extra inputs are not permitted" in message
+
+
+def test_non_boolean_dev_echo_is_rejected(tmp_path: Path):
+    write_config(tmp_path, PROVIDER_TOML + '[tools]\ndev_echo = "yes"\n')
+    assert "tools.dev_echo" in str(load_error(tmp_path))
+
+
+def test_tools_must_be_a_table(tmp_path: Path):
+    write_config(tmp_path, 'tools = "x"\n' + PROVIDER_TOML)
+    assert "tools must be a table" in str(load_error(tmp_path))
+
+
+def test_the_example_config_documents_dev_echo(tmp_path: Path):
+    assert "# [tools]\n# dev_echo = true" in EXAMPLE_CONFIG_TOML
+
+
+def test_web_tools_default_to_off(tmp_path: Path):
+    write_config(tmp_path, PROVIDER_TOML)
+    tools = load_config(tmp_path).tools
+    assert (tools.web_search, tools.web_fetch, tools.web_relax_tls_strict) == (
+        False,
+        False,
+        False,
+    )
+
+
+def test_web_tool_flags_parse_from_toml(tmp_path: Path):
+    write_config(
+        tmp_path,
+        PROVIDER_TOML
+        + "[tools]\nweb_search = true\nweb_fetch = true\nweb_relax_tls_strict = true\n",
+    )
+    tools = load_config(tmp_path).tools
+    assert (tools.web_search, tools.web_fetch, tools.web_relax_tls_strict) == (
+        True,
+        True,
+        True,
+    )
+
+
+@pytest.mark.parametrize("key", ["web_search", "web_fetch", "web_relax_tls_strict"])
+@pytest.mark.parametrize("value", ['"yes"', "1", '"true"'])
+def test_non_boolean_web_flags_are_rejected(tmp_path: Path, key: str, value: str):
+    write_config(tmp_path, PROVIDER_TOML + f"[tools]\n{key} = {value}\n")
+    assert f"tools.{key}" in str(load_error(tmp_path))
+
+
+def test_a_typo_in_a_web_tools_key_is_rejected(tmp_path: Path):
+    write_config(tmp_path, PROVIDER_TOML + "[tools]\nweb_fetchh = true\n")
+    message = str(load_error(tmp_path))
+    assert "tools.web_fetchh: Extra inputs are not permitted" in message
+
+
+def test_the_example_config_documents_the_web_tools(tmp_path: Path):
+    assert "# web_search = true" in EXAMPLE_CONFIG_TOML
+    assert "# web_fetch = true" in EXAMPLE_CONFIG_TOML
+    assert "# web_relax_tls_strict = false" in EXAMPLE_CONFIG_TOML

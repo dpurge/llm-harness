@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import io
 import sys
 import threading
 from collections.abc import AsyncIterator
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Protocol, TextIO
 
 from llm_harness import store as store_module
+from llm_harness.approval import ApprovalRequest, Approver
 from llm_harness.builtin_tools import build_tool_registry
 from llm_harness.config import (
     AGENTS_FILE,
@@ -179,6 +181,49 @@ async def _read_line(stdin: TextIO) -> str:
 
     threading.Thread(target=read, daemon=True, name="stdin-reader").start()
     return await future
+
+
+def _discard_typed_ahead(stdin: TextIO) -> None:
+    """Drop input typed before the prompt appeared, so it cannot answer it.
+
+    A no-op when stdin is not a terminal with a file descriptor, or on a
+    platform without `termios` (Windows).
+    """
+    try:
+        import termios
+    except ImportError:
+        return
+    try:
+        if stdin.isatty():
+            termios.tcflush(stdin.fileno(), termios.TCIFLUSH)
+    except (OSError, ValueError, io.UnsupportedOperation, termios.error):
+        pass
+
+
+def _ask_on_stderr(stdin: TextIO, stderr: TextIO) -> Approver:
+    """An approver that asks on stderr and reads the answer from stdin.
+
+    Only a line that is exactly `y` or `yes` (any case, spaces ignored) allows
+    the call; EOF, an empty line and anything else deny it. Ctrl-C cancels the
+    awaited read and propagates.
+    """
+
+    async def approve(request: ApprovalRequest) -> bool:
+        _discard_typed_ahead(stdin)
+        # Reply text is only streamed by a `respond` step, so stdout is never
+        # mid-line while a tool waits; the leading blank line sets the block apart.
+        stderr.write(
+            "\nApproval needed\n"
+            f"  tool:  {request.tool}\n"
+            f"  risk:  {request.risk}\n"
+            f"  agent: {request.agent_id}\n"
+            f"  arguments:\n{request.arguments_text}\n"
+            "Allow this call? [y/N] "
+        )
+        stderr.flush()
+        return (await _read_line(stdin)).strip().lower() in {"y", "yes"}
+
+    return approve
 
 
 async def _chat_loop(
@@ -431,7 +476,13 @@ def main(
         return loaded
     config, model = loaded
     try:
-        tools = build_tool_registry(config.agents)
+        tools = build_tool_registry(
+            config.agents,
+            dev_echo=config.tools.dev_echo,
+            web_search=config.tools.web_search,
+            web_fetch=config.tools.web_fetch,
+            web_relax_tls_strict=config.tools.web_relax_tls_strict,
+        )
     except ConfigError as exc:
         print(f"error: {exc}", file=stderr)
         return 1
@@ -494,6 +545,8 @@ def main(
             tools=tools,
             subagents=config.agents,
             subagent_factory=subagent_factory_maker(router),
+            # A piped line must never answer an approval: no approver, so deny.
+            approver=_ask_on_stderr(stdin, stderr) if stdin.isatty() else None,
         )
         return asyncio.run(
             _chat_loop_then_close(router, stdin, stdout, stderr, orchestrator, storage)

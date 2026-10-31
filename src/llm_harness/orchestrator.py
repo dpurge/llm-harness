@@ -13,8 +13,14 @@ from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import datetime
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
+from llm_harness.approval import (
+    MAX_ARGUMENT_CHARS,
+    ApprovalRequest,
+    Approver,
+    arguments_text,
+)
 from llm_harness.config import ORCHESTRATOR_TAG, AgentConfig, ModelConfig
 from llm_harness.context import (
     answer_observation,
@@ -63,6 +69,10 @@ _EMPTY_GOAL = (
 )
 _NO_DELEGATION = "delegate is not available to subagents"
 _STATUS_CHARS = 80
+# Hard cap for the arguments shown on an auto-run tool's status line. A URL is
+# capped at 2048 by its input model, so a web call is always shown whole.
+_CALL_LINE_ARGUMENT_CHARS = 2200
+_UNLISTED_AUTO_RUN = frozenset({"tool_search"})
 
 # Shown to the user as they arrive; the model's TextDelta is JSON and is never shown.
 _FORWARDED = (ThinkingDelta, Notice, ModelSwitch, UsageEvent, UsageReport)
@@ -108,8 +118,27 @@ def _note_in_span(call: SpanHandle, event: StreamEvent) -> None:
         call.attributes["seconds"] = event.seconds
 
 
-def _status_text(reply: Reply) -> str:
+def _call_line(tool: Tool | None, action: CallToolAction) -> str | None:
+    """`tool NAME {arguments}` for an auto-run tool, so the human sees every call.
+
+    Raw (not yet validated) arguments, escaped by `arguments_text`: control and
+    bidi characters show as `\\uXXXX` and a newline cannot start a new line.
+    Never masked. None for unknown, `tool_search` and approval-gated tools.
+    """
+    if tool is None or tool.risk != "read" or action.tool in _UNLISTED_AUTO_RUN:
+        return None
+    text = arguments_text(action.arguments)
+    if len(text) > _CALL_LINE_ARGUMENT_CHARS:
+        text = f"{text[:_CALL_LINE_ARGUMENT_CHARS]}… ({len(text)} characters)"
+    return f"tool {action.tool} {text}"
+
+
+def _status_text(reply: Reply, tools: ToolRegistry) -> str:
     action = reply.action
+    if isinstance(action, CallToolAction):
+        line = _call_line(tools.get(action.tool), action)
+        if line is not None:
+            return line
     if isinstance(action, RespondAction):
         text = "answering"
     elif isinstance(action, AskUserAction):
@@ -153,7 +182,9 @@ class Orchestrator:
         subagents: Sequence[AgentConfig] = (),
         subagent_factory: Callable[[AgentConfig], tuple[ChatProvider, ModelConfig]]
         | None = None,
+        approver: Approver | None = None,
     ) -> None:
+        self._approver = approver
         self._subagents = tuple(subagents)
         self._subagent_factory = subagent_factory
         self._storage = storage
@@ -327,7 +358,7 @@ class Orchestrator:
                         yield StatusEvent(
                             step=step_number,
                             action_type=reply.action.type,
-                            text=_status_text(reply),
+                            text=_status_text(reply, self._tools),
                         )
                         action = reply.action
                         if isinstance(action, RespondAction):
@@ -448,6 +479,55 @@ class Orchestrator:
     def _allowed_tool_names(self) -> frozenset[str]:
         return frozenset(tool.name for tool in self.available_tools())
 
+    async def _approve(
+        self,
+        action: CallToolAction,
+        tool: Tool,
+        arguments: BaseModel,
+        call: SpanHandle,
+    ) -> str | None:
+        """Ask the human before a write or exec tool runs; None means go ahead."""
+        if tool.risk == "read":
+            call.attributes["approval"] = "not_required"
+            return None
+        if self._approver is None:
+            call.attributes["approval"] = "unavailable"
+            call.status = "rejected"
+            return (
+                f"tool {action.tool} was not run: it needs the user's approval "
+                "and none is available here"
+            )
+        # The validated model is what runs, so it is what the human reviews.
+        text = arguments_text(arguments)
+        if len(text) > MAX_ARGUMENT_CHARS:
+            call.attributes["approval"] = "denied"
+            call.status = "rejected"
+            return (
+                f"tool {action.tool} was not run: its arguments are too large "
+                f"to review ({len(text)} characters)"
+            )
+        request = ApprovalRequest(
+            tool=action.tool,
+            risk=tool.risk,
+            agent_id=self._agent_id,
+            arguments_text=text,
+        )
+        try:
+            approved = await self._approver(request)
+        except Exception as error:  # noqa: BLE001 - a failed prompt is a deny; Cancelled passes
+            call.attributes["approval"] = "denied"
+            call.status = "rejected"
+            return (
+                f"tool {action.tool} was not run: the approval request failed: "
+                f"{type(error).__name__}: {redact(str(error))}"
+            )
+        if approved is not True:  # a truthy non-bool must not allow
+            call.attributes["approval"] = "denied"
+            call.status = "rejected"
+            return f"tool {action.tool} was not run: the user denied it"
+        call.attributes["approval"] = "approved"
+        return None
+
     async def _call_tool(self, action: CallToolAction, call: SpanHandle) -> str:
         allowed = self._allowed_tool_names()
         tool = self._tools.get(action.tool) if action.tool in allowed else None
@@ -462,6 +542,9 @@ class Orchestrator:
             return (
                 f"invalid arguments for tool {action.tool}: {_argument_problems(error)}"
             )
+        refusal = await self._approve(action, tool, arguments, call)
+        if refusal is not None:
+            return refusal
         ctx = ToolContext(
             storage=self._storage,
             user_id=self._user_id,

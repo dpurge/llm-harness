@@ -21,6 +21,7 @@ from textual.widgets import (
 )
 from textual.worker import Worker, WorkerCancelled
 
+from llm_harness.approval import ApprovalRequest
 from llm_harness.config import (
     ConfigError,
     HarnessConfig,
@@ -65,6 +66,8 @@ from llm_harness.types import (
 _QUIT_COMMANDS = frozenset({"/quit", "/exit"})
 _IMPORT_BUSY = "import failed: a turn is running, try again after it"
 _PLACEHOLDER = "Message, Enter to send, /export, /import <path>, /quit to exit"
+_APPROVAL_PLACEHOLDER = "Allow this call? y/N (Enter on an empty line keeps waiting)"
+_APPROVE_ANSWERS = frozenset({"y", "yes"})  # the same rule as the CLI approver
 CHAT_TAB = "tab-chat"
 STATE_TAB = "tab-state"
 TRACE_TAB = "tab-trace"
@@ -85,6 +88,7 @@ class ChatApp(App[int]):
     .usage { color: $text-muted; text-style: dim; }
     .note { color: $text-muted; }
     .error { color: $error; text-style: bold; }
+    .approval { width: 1fr; height: auto; border: round $warning; padding: 0 1; }
     .secondary { color: $text-muted; }
     .heading { text-style: bold; margin-top: 1; }
     /* Tabs, panes and panels fill the width and the height left under the tab
@@ -129,6 +133,8 @@ class ChatApp(App[int]):
         self._router: ChatProvider | None = None
         self._orchestrator: Orchestrator | None = None
         self._turn: Worker[None] | None = None
+        # Set only while a write or exec call waits for the human's answer.
+        self._pending_approval: asyncio.Future[bool] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -190,6 +196,7 @@ class ChatApp(App[int]):
             storage=self._storage,
             agent=find_orchestrator_agent(self._config),
             tools=self._tools,
+            approver=self._approve_call,
             subagents=self._config.agents,
             subagent_factory=(
                 self._subagent_factory_maker(router)
@@ -274,6 +281,12 @@ class ChatApp(App[int]):
                 await self.workers.wait_for_complete()
             await self.action_quit()
             return
+        pending = self._pending_approval
+        if pending is not None and not pending.done():
+            # Only this handler decides; anything but y/yes denies (fail closed).
+            pending.set_result(text.strip().lower() in _APPROVE_ANSWERS)
+            self.query_one("#prompt", Input).value = ""
+            return
         command = parse_command(text)
         if command is not None:
             await self._run_state_command(command)
@@ -340,6 +353,37 @@ class ChatApp(App[int]):
             return False, _IMPORT_BUSY
         self._refresh_inspector()
         return True, f"state loaded from {safe_line(str(path))}"
+
+    async def _approve_call(self, request: ApprovalRequest) -> bool:
+        """The Approver: show the full request in the log, wait for y/yes."""
+        await self._show(
+            "\n".join(
+                (
+                    "Approval needed",
+                    f"tool: {sanitize_text(request.tool)}",
+                    f"risk: {request.risk}",
+                    f"agent: {sanitize_text(request.agent_id)}",
+                    f"arguments: {request.arguments_text}",
+                )
+            ),
+            "approval",
+        )
+        prompt = self.query_one("#prompt", Input)
+        previous_placeholder = prompt.placeholder
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._pending_approval = future
+        prompt.value = ""
+        prompt.placeholder = _APPROVAL_PLACEHOLDER
+        prompt.disabled = False
+        prompt.focus()
+        try:
+            return await future
+        finally:
+            self._pending_approval = None
+            prompt.placeholder = previous_placeholder
+            # When the turn was cancelled or ended, _end_turn owns the prompt.
+            if self._turn_is_running() and not future.cancelled():
+                prompt.disabled = True
 
     def action_cancel_turn(self) -> None:
         if self._turn is not None and self._turn.is_running:

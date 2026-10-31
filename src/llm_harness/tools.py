@@ -9,7 +9,7 @@ import math
 import re
 from collections.abc import Collection
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from pydantic import BaseModel
 
@@ -35,11 +35,16 @@ class ToolContext:
     allowed_tools: frozenset[str] = frozenset()
 
 
+Risk = Literal["read", "write", "exec"]
+_RISKS: tuple[str, ...] = ("read", "write", "exec")
+
+
 class Tool(Protocol):
     name: str
     description: str
     tags: list[str]
     input_model: type[BaseModel]
+    risk: Risk
 
     async def run(self, arguments: Any, ctx: ToolContext) -> str: ...
 
@@ -89,6 +94,11 @@ def _check_tool(tool: Tool) -> None:
         isinstance(tool.input_model, type) and issubclass(tool.input_model, BaseModel)
     ):
         raise TypeError(f"tool {name!r}: input_model must be a pydantic model class.")
+    risk = getattr(tool, "risk", None)
+    if risk not in _RISKS:
+        raise ValueError(
+            f"tool {name!r}: risk must be one of {', '.join(_RISKS)}, got {risk!r}."
+        )
 
 
 class ToolRegistry:

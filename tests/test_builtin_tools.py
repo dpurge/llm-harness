@@ -5,7 +5,12 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from llm_harness.builtin_tools import ToolSearchInput, build_tool_registry
+from llm_harness.builtin_tools import (
+    DevEchoInput,
+    DevEchoTool,
+    ToolSearchInput,
+    build_tool_registry,
+)
 from llm_harness.config import AgentConfig, ConfigError
 from llm_harness.tools import ToolContext, estimate_tokens
 from tests.test_tools import FakeTool, QueryInput, agent
@@ -118,3 +123,138 @@ def test_known_tool_names_in_agents_are_accepted() -> None:
         [agent_with(tools=["tool_search"]), agent(id="b", deny=["tool_search"])]
     )
     assert registry.names() == ["tool_search"]
+
+
+def test_dev_echo_is_registered_only_when_enabled() -> None:
+    assert "dev_echo" not in build_tool_registry([]).names()
+    registry = build_tool_registry([], dev_echo=True)
+    assert registry.names() == ["dev_echo", "tool_search"]
+    orchestrator = agent(tags=["orchestrator"])
+    assert "dev_echo" in [t.name for t in registry.tools_for(orchestrator)]
+
+
+def test_an_agent_can_list_dev_echo_only_when_it_is_enabled() -> None:
+    lists_it = AgentConfig(
+        id="a",
+        name="A",
+        description="d",
+        tags=["orchestrator"],
+        model_tags=[],
+        tools=["dev_echo"],
+    )
+    with pytest.raises(ConfigError, match="unknown tool 'dev_echo'"):
+        build_tool_registry([lists_it])
+    assert build_tool_registry([lists_it], dev_echo=True).names()
+
+
+async def test_dev_echo_is_a_write_tool_that_echoes_its_text() -> None:
+    tool = DevEchoTool()
+    assert tool.risk == "write"
+    ctx = ToolContext(
+        storage=None,
+        user_id=None,
+        agent_id="a",
+        tags=frozenset(),
+        allowed_tools=frozenset(),
+    )
+    result = await tool.run(DevEchoInput(text="hello"), ctx)
+    assert result == "dev_echo: hello"
+
+
+# --- web tools --------------------------------------------------------------
+
+
+class RecordingFetcher:
+    """Stands in for WebFetcher: the registry only stores it."""
+
+
+class FakeSearchProvider:
+    name = "fake"
+
+    async def search(self, query: str, max_results: int) -> list:
+        return []
+
+
+def test_web_tools_are_registered_only_when_enabled() -> None:
+    assert build_tool_registry([]).names() == ["tool_search"]
+    assert build_tool_registry([], web_fetch=True).names() == [
+        "tool_search",
+        "web_fetch",
+    ]
+    assert build_tool_registry([], web_search=True).names() == [
+        "tool_search",
+        "web_search",
+    ]
+    both = build_tool_registry([], web_search=True, web_fetch=True)
+    assert both.names() == ["tool_search", "web_fetch", "web_search"]
+
+
+def test_the_web_tools_are_read_risk_tools_for_the_orchestrator() -> None:
+    registry = build_tool_registry([], web_search=True, web_fetch=True)
+    shown = [t.name for t in registry.tools_for(agent(tags=["orchestrator"]))]
+    assert "web_fetch" in shown and "web_search" in shown
+    assert registry.get("web_fetch").risk == "read"
+    assert registry.get("web_search").risk == "read"
+    assert registry.tools_for(agent(tags=["writer"])) == []
+
+
+@pytest.mark.parametrize("name", ["web_fetch", "web_search"])
+def test_an_agent_naming_a_disabled_web_tool_gets_the_enable_hint(name: str) -> None:
+    with pytest.raises(ConfigError) as info:
+        build_tool_registry([agent_with(tools=[name])])
+    message = str(info.value)
+    assert f"unknown tool {name!r}" in message
+    assert f"enable it with [tools] {name} = true" in message
+
+
+def test_a_typo_in_a_web_tool_name_gets_no_hint() -> None:
+    with pytest.raises(ConfigError) as info:
+        build_tool_registry([agent_with(tools=["web_fetchh"])], web_fetch=True)
+    assert "unknown tool 'web_fetchh'" in str(info.value)
+    assert "enable it with" not in str(info.value)
+
+
+def test_an_agent_can_list_a_web_tool_once_it_is_enabled() -> None:
+    lists_it = agent_with(tools=["web_fetch"], deny=["web_search"])
+    assert build_tool_registry([lists_it], web_fetch=True, web_search=True).names()
+    with pytest.raises(
+        ConfigError, match="enable it with \\[tools\\] web_fetch = true"
+    ):
+        build_tool_registry([lists_it], web_search=True)
+
+
+def test_an_injected_fetcher_and_provider_are_used() -> None:
+    fetcher, provider = RecordingFetcher(), FakeSearchProvider()
+    registry = build_tool_registry(
+        [], web_search=True, web_fetch=True, fetcher=fetcher, search_provider=provider
+    )
+    assert registry.get("web_fetch")._fetcher is fetcher
+    assert registry.get("web_search")._provider is provider
+
+
+def test_the_real_search_provider_shares_the_fetcher(monkeypatch) -> None:
+    fetcher = RecordingFetcher()
+    registry = build_tool_registry([], web_search=True, fetcher=fetcher)
+    provider = registry.get("web_search")._provider
+    assert provider.name == "duckduckgo" and provider._fetcher is fetcher
+
+
+def test_web_relax_tls_strict_reaches_the_real_fetcher(monkeypatch) -> None:
+    created: list[bool] = []
+
+    from llm_harness import web_fetcher
+
+    real = web_fetcher.WebFetcher
+
+    class Spy(real):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            created.append(bool(kwargs.get("relax_tls_strict")))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(web_fetcher, "WebFetcher", Spy)
+    build_tool_registry([], web_fetch=True)
+    build_tool_registry([], web_fetch=True, web_relax_tls_strict=True)
+    build_tool_registry([], web_relax_tls_strict=True)  # no web tool: no fetcher
+    assert created == [False, True]
+    registry = build_tool_registry([], web_fetch=True, web_relax_tls_strict=True)
+    assert registry.get("web_fetch")._fetcher._relax_tls_strict is True
