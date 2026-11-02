@@ -18,6 +18,7 @@ from pydantic import (
     StrictInt,
     TypeAdapter,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -307,6 +308,39 @@ class ToolsConfig(_Frozen):
     # Only for a corporate TLS proxy whose CA breaks Python 3.13's strict X.509
     # profile; the certificate chain and host name are still verified.
     web_relax_tls_strict: StrictBool = False
+    # Registers the exec-risk `run_command` tool; every call needs your approval.
+    run_command: StrictBool = False
+    # Registers the `memory_*` tools (short English notes kept per user_id); needs
+    # user_id. The writes run without an approval prompt and show a one-line notice.
+    memory: StrictBool = False
+    # Longest a command may run, in seconds (1 to 120).
+    command_timeout_seconds: Annotated[StrictInt, Field(ge=1, le=120)] = 30
+    # Program names or absolute paths that may run; empty allows any command not denied.
+    command_allow: list[str] = []
+    # Program names or absolute paths that never run; wins over command_allow.
+    command_deny: list[str] = []
+
+    @field_validator("command_allow", "command_deny")
+    @classmethod
+    def _command_entry_rules(cls, values: list[str], info: ValidationInfo) -> list[str]:
+        return _check_command_list(str(info.field_name), values)
+
+
+def _check_command_list(key: str, values: list[str]) -> list[str]:
+    for value in values:
+        if not value:
+            raise ValueError(f"{key} entry must not be empty")
+        if any(c.isspace() for c in value):
+            raise ValueError(f"{key} entry {value!r} must not contain whitespace")
+        if "/" in value and not value.startswith("/"):
+            raise ValueError(
+                f"{key} entry {value!r} contains '/' so it must be an absolute path "
+                "starting with '/'; use a bare program name to match any directory"
+            )
+    duplicates = sorted({v for v in values if values.count(v) > 1})
+    if duplicates:
+        raise ValueError(f"{key} has duplicate entries: {', '.join(duplicates)}")
+    return values
 
 
 def _check_tag_list(values: list[str]) -> list[str]:
@@ -756,6 +790,11 @@ base_url = "http://localhost:11434"
 # web_search = true                    # tool: search the web (DuckDuckGo), no approval prompt
 # web_fetch = true                     # tool: fetch a public web page as text, no approval prompt
 # web_relax_tls_strict = false         # true only behind a TLS-inspecting proxy; chain and host name stay checked
+# run_command = true                   # tool: run a program (argv, no shell); every call needs your approval
+# memory = true                       # tools: short English notes kept per user_id (needs user_id); saves run with no prompt, one notice line
+# command_timeout_seconds = 30         # longest a command may run, 1 to 120
+# command_allow = ["git", "/usr/bin/make"]   # match the program (argv[0]) only; empty allows any command not denied
+# command_deny = ["rm*"]               # deny wins over allow; a built-in deny list (shells, sudo, curl, ...) always applies
 """
 
 EXAMPLE_MODELS_YAML = """\

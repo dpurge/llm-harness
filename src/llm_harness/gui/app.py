@@ -20,6 +20,7 @@ from llm_harness.display import format_switch, format_usage_report, sanitize_tex
 from llm_harness.gui import inspector
 from llm_harness.gui.security import LoopbackOnlyMiddleware
 from llm_harness.markdown_render import pygments_css, render_html, sanitize_html
+from llm_harness.memory_command import handle_memory_text
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.providers.base import ChatProvider
 from llm_harness.redact import redact
@@ -374,6 +375,13 @@ class ChatPage:
             return
         if text.strip().lower() == _QUIT_COMMAND:
             await self._quit()
+            return
+        memory_answer = await handle_memory_text(
+            text.strip(), self._tools, self._storage, self._config.user_id
+        )
+        if memory_answer is not None:
+            self._show(memory_answer, "memory", "w-full")
+            self._prompt.value = ""
             return
         if self._turn_is_running():
             return

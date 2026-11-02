@@ -127,11 +127,15 @@ def build_request(
     tools: Sequence[Tool] = (),
     instructions: str | None = None,
     subagents: Sequence[AgentConfig] = (),
+    memory: str = "",
 ) -> ChatRequest:
     """Two messages: system (instructions + schemas), user (state, tools, observation).
 
     A `## Subagents` section follows the tools only when `subagents` holds at
     least one delegation target; otherwise the message is unchanged.
+
+    A `## Memory` section (the recall block) sits between the state and the tools
+    only when `memory` is not empty; otherwise the message is unchanged.
 
     `instructions` replaces the orchestrator prompt (a subagent passes its own);
     the schema sections are appended either way.
@@ -140,8 +144,10 @@ def build_request(
     subagent_section = (
         f"## Subagents\n\n{subagent_lines(targets)}\n\n" if targets else ""
     )
+    memory_section = f"## Memory\n\n{memory}\n\n" if memory else ""
     user = (
         f"## State\n\n{state.model_dump_json()}\n\n"
+        f"{memory_section}"
         f"## Tools\n\n{tool_lines(tools)}\n\n"
         f"{subagent_section}"
         f"## Observation\n\n{_truncate(observation)}\n"
@@ -155,4 +161,26 @@ def build_request(
         ],
         think=resolve_think(think, model_cfg),
         response_schema=_reply_schema(),
+    )
+
+
+def build_side_request(
+    model_cfg: ModelConfig,
+    system: str,
+    user: str,
+    response_schema: dict,
+    think: bool | None = None,
+) -> ChatRequest:
+    """Two messages for a side call that is not an orchestrator step (reflection).
+
+    Here so that this module stays the one place that constructs a `ChatRequest`.
+    """
+    return ChatRequest(
+        model=model_cfg.model,
+        messages=[
+            Message(role="system", content=system),
+            Message(role="user", content=user),
+        ],
+        think=resolve_think(think, model_cfg),
+        response_schema=response_schema,
     )

@@ -1517,3 +1517,122 @@ def test_the_example_config_documents_the_web_tools(tmp_path: Path):
     assert "# web_search = true" in EXAMPLE_CONFIG_TOML
     assert "# web_fetch = true" in EXAMPLE_CONFIG_TOML
     assert "# web_relax_tls_strict = false" in EXAMPLE_CONFIG_TOML
+
+
+# --- [tools] run_command keys ------------------------------------------------
+
+COMMAND_KEYS = [
+    "run_command",
+    "command_timeout_seconds",
+    "command_allow",
+    "command_deny",
+]
+
+
+def test_command_keys_have_safe_defaults():
+    tools = ToolsConfig()
+    assert tools.run_command is False
+    assert tools.command_timeout_seconds == 30
+    assert tools.command_allow == []
+    assert tools.command_deny == []
+
+
+@pytest.mark.parametrize("seconds", [1, 30, 120])
+def test_command_timeout_accepts_the_range(seconds: int):
+    assert ToolsConfig(command_timeout_seconds=seconds).command_timeout_seconds == (
+        seconds
+    )
+
+
+@pytest.mark.parametrize("seconds", [0, 121, -1, True, "30", 30.0])
+def test_command_timeout_rejects_out_of_range_and_non_integers(seconds: object):
+    with pytest.raises(ValueError, match="command_timeout_seconds"):
+        ToolsConfig.model_validate({"command_timeout_seconds": seconds})
+
+
+@pytest.mark.parametrize("value", ["yes", 1, "true"])
+def test_run_command_rejects_non_booleans(value: object):
+    with pytest.raises(ValueError, match="run_command"):
+        ToolsConfig.model_validate({"run_command": value})
+
+
+@pytest.mark.parametrize("key", ["command_allow", "command_deny"])
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        ([""], "{key} entry must not be empty"),
+        (["x y"], "{key} entry 'x y' must not contain whitespace"),
+        (["a\tb"], "{key} entry 'a\\tb' must not contain whitespace"),
+        (["git", "git"], "{key} has duplicate entries: git"),
+        (["bin/git"], "{key} entry 'bin/git' contains '/' so it must be an absolute"),
+        (["./git"], "{key} entry './git' contains '/' so it must be an absolute"),
+    ],
+)
+def test_command_lists_reject_bad_entries(key: str, entries: list[str], message: str):
+    with pytest.raises(ValueError) as info:
+        ToolsConfig.model_validate({key: entries})
+    assert message.format(key=key) in str(info.value)
+
+
+@pytest.mark.parametrize("key", ["command_allow", "command_deny"])
+def test_command_lists_accept_names_patterns_and_absolute_paths(key: str):
+    entries = ["git", "py*", "/usr/bin/git"]
+    assert getattr(ToolsConfig.model_validate({key: entries}), key) == entries
+
+
+def test_command_list_errors_name_the_key_and_entry(tmp_path: Path):
+    write_config(tmp_path, PROVIDER_TOML + '[tools]\ncommand_allow = ["x y"]\n')
+    message = str(load_error(tmp_path))
+    assert "tools.command_allow" in message
+    assert "command_allow entry 'x y' must not contain whitespace" in message
+
+
+def test_an_unknown_tools_key_is_still_rejected_next_to_command_keys(tmp_path: Path):
+    write_config(
+        tmp_path, PROVIDER_TOML + "[tools]\nrun_command = true\ncommand_allw = []\n"
+    )
+    assert "tools.command_allw: Extra inputs are not permitted" in str(
+        load_error(tmp_path)
+    )
+
+
+def test_command_keys_parse_from_toml(tmp_path: Path):
+    write_config(
+        tmp_path,
+        PROVIDER_TOML
+        + "[tools]\nrun_command = true\ncommand_timeout_seconds = 60\n"
+        + 'command_allow = ["git"]\ncommand_deny = ["rm*", "/bin/ls"]\n',
+    )
+    tools = load_config(tmp_path).tools
+    assert tools.run_command is True
+    assert tools.command_timeout_seconds == 60
+    assert tools.command_allow == ["git"]
+    assert tools.command_deny == ["rm*", "/bin/ls"]
+
+
+@pytest.mark.parametrize("value", ["0", "121", "true", '"30"'])
+def test_bad_command_timeout_in_file_names_the_key(tmp_path: Path, value: str):
+    write_config(
+        tmp_path, PROVIDER_TOML + f"[tools]\ncommand_timeout_seconds = {value}\n"
+    )
+    assert "tools.command_timeout_seconds" in str(load_error(tmp_path))
+
+
+@pytest.mark.parametrize("key", COMMAND_KEYS)
+def test_the_example_config_documents_the_command_keys(key: str):
+    assert _documented(EXAMPLE_CONFIG_TOML, key, separator="="), key
+
+
+def test_the_example_config_with_command_lines_switched_on_loads(tmp_path: Path):
+    lines = [
+        line.removeprefix("# ")
+        for line in EXAMPLE_CONFIG_TOML.splitlines()
+        if line.startswith("# ")
+        and line.removeprefix("# ").split(" ")[0] in COMMAND_KEYS
+    ]
+    assert len(lines) == len(COMMAND_KEYS)
+    write_config(tmp_path, PROVIDER_TOML + "[tools]\n" + "\n".join(lines) + "\n")
+    tools = load_config(tmp_path).tools
+    assert tools.run_command is True
+    assert tools.command_allow == ["git", "/usr/bin/make"]
+    assert tools.command_deny == ["rm*"]

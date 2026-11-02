@@ -6,6 +6,7 @@ a whole valid step, so a rejected reply, an error or a cancellation leaves what
 earlier valid steps committed and nothing else.
 """
 
+import asyncio
 import getpass
 import socket
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -28,6 +29,16 @@ from llm_harness.context import (
     delegation_targets,
     retry_observation,
 )
+from llm_harness.memory import MemoryValidationError
+from llm_harness.memory_recall import RECALL_K, format_recall_block
+from llm_harness.memory_reflection import (
+    ReflectionError,
+    ReflectionTurn,
+    apply_reflection,
+    build_reflection_request,
+    parse_reflection,
+)
+from llm_harness.memory_tools import recall_store
 from llm_harness.providers.base import ChatProvider
 from llm_harness.redact import redact
 from llm_harness.state import (
@@ -47,8 +58,8 @@ from llm_harness.state import (
     parse_reply,
 )
 from llm_harness.storage import Storage
-from llm_harness.tools import Tool, ToolContext, ToolRegistry
-from llm_harness.trace import Span, SpanHandle, TraceRecorder
+from llm_harness.tools import Tool, ToolContext, ToolRegistry, tool_prompts
+from llm_harness.trace import UNCUT, Span, SpanHandle, TraceRecorder
 from llm_harness.types import (
     Done,
     ErrorEvent,
@@ -73,6 +84,11 @@ _STATUS_CHARS = 80
 # capped at 2048 by its input model, so a web call is always shown whole.
 _CALL_LINE_ARGUMENT_CHARS = 2200
 _UNLISTED_AUTO_RUN = frozenset({"tool_search"})
+
+# One attempt, no retry: the answer is already delivered, so the reflection is
+# worth one bounded try. Not a config key.
+REFLECTION_TIMEOUT_SECONDS = 60
+MAX_NOTICE_CHARS = 300
 
 # Shown to the user as they arrive; the model's TextDelta is JSON and is never shown.
 _FORWARDED = (ThinkingDelta, Notice, ModelSwitch, UsageEvent, UsageReport)
@@ -100,6 +116,12 @@ class _Attempt:
     text: str = ""
     done: bool = False
     failed: bool = False
+    # Reflection only: the router's usage report, shown after the reply.
+    report: UsageReport | None = None
+
+
+class _ReflectionCallError(Exception):
+    """The reflection model call did not produce a reply; the message says why."""
 
 
 def _note_in_span(call: SpanHandle, event: StreamEvent) -> None:
@@ -118,14 +140,38 @@ def _note_in_span(call: SpanHandle, event: StreamEvent) -> None:
         call.attributes["seconds"] = event.seconds
 
 
+def _notice_line(text: str) -> str:
+    """One masked line of at most `MAX_NOTICE_CHARS` characters, ellipsis when cut.
+
+    `splitlines` covers every line and paragraph separator (U+2028, U+2029, ...).
+    """
+    line = redact(" ".join(text.splitlines()), limit=UNCUT)
+    if len(line) > MAX_NOTICE_CHARS:
+        return f"{line[: MAX_NOTICE_CHARS - 1]}…"
+    return line
+
+
+def _failure_reason(error: Exception) -> str:
+    if isinstance(
+        error, ReflectionError | MemoryValidationError | _ReflectionCallError
+    ):
+        return str(error)
+    return f"{type(error).__name__}: {error}"
+
+
 def _call_line(tool: Tool | None, action: CallToolAction) -> str | None:
     """`tool NAME {arguments}` for an auto-run tool, so the human sees every call.
+
+    Auto-run is a `read` tool or one that declares `prompts = False` (agent memory):
+    for the second the arguments are the stored text, so the line is its notice.
 
     Raw (not yet validated) arguments, escaped by `arguments_text`: control and
     bidi characters show as `\\uXXXX` and a newline cannot start a new line.
     Never masked. None for unknown, `tool_search` and approval-gated tools.
     """
-    if tool is None or tool.risk != "read" or action.tool in _UNLISTED_AUTO_RUN:
+    if tool is None or action.tool in _UNLISTED_AUTO_RUN:
+        return None
+    if tool.risk != "read" and tool_prompts(tool):
         return None
     text = arguments_text(action.arguments)
     if len(text) > _CALL_LINE_ARGUMENT_CHARS:
@@ -210,6 +256,7 @@ class Orchestrator:
         self._has_completed_turn = False
         # The last ask_user question; part of snapshot() so a run can resume from it.
         self.pending_question: str | None = None
+        self._last_recall = ""
 
     @property
     def state(self) -> OrchestratorState:
@@ -236,6 +283,11 @@ class Orchestrator:
         Display data only: `build_request` never reads it.
         """
         return self._recorder.spans
+
+    @property
+    def last_recall(self) -> str:
+        """The memory block of the latest turn ("" when none); display data only."""
+        return self._last_recall
 
     def _initial_state(self, goal: str) -> OrchestratorState:
         """A fresh state; a preset goal is recorded as the model's own would be.
@@ -273,6 +325,9 @@ class Orchestrator:
                 }
             )
             self._recorder.reset()
+            goal_before = self._state.goal
+            # What this turn's tool and delegate steps observed, for the reflection.
+            tool_results: list[str] = []
             # Every span closes in the `with` exit, so cancel, error, step cap and
             # an early close of this generator all keep the partial trace.
             with self._recorder.span("turn", f"turn {self._state.turn}") as turn:
@@ -284,6 +339,7 @@ class Orchestrator:
                     if self.pending_question
                     else text
                 )
+                recall = await self._recall(text, turn)
                 for step_number in range(1, self._max_steps + 1):
                     with self._recorder.span(
                         "step", f"step {step_number}", turn
@@ -301,6 +357,7 @@ class Orchestrator:
                                 self.available_tools(),
                                 instructions=self._instructions,
                                 subagents=self._subagents,
+                                memory=recall,
                             )
                             with self._recorder.span(
                                 "llm_call", request.model, step
@@ -365,6 +422,15 @@ class Orchestrator:
                             self.pending_question = None
                             turn.status = "ok"
                             yield TextDelta(text=action.text)
+                            # Before Done, because consumers stop reading at Done;
+                            # after the answer, so the user already has it.
+                            async with aclosing(
+                                self._reflect(
+                                    turn, text, action.text, goal_before, tool_results
+                                )
+                            ) as reflection:
+                                async for event in reflection:
+                                    yield event
                             self._has_completed_turn = True
                             yield Done()
                             return
@@ -377,6 +443,7 @@ class Orchestrator:
                             return
                         if isinstance(action, CallToolAction):
                             observation = await self._run_tool(action, step)
+                            tool_results.append(observation)
                         elif isinstance(action, DelegateAction):
                             if not self._can_delegate:
                                 observation = _NO_DELEGATION
@@ -388,6 +455,7 @@ class Orchestrator:
                                     async for event in child_events:
                                         yield event
                                 observation = delegation.observation
+                            tool_results.append(observation)
                         else:
                             observation = f"{action.type} is not available yet"
 
@@ -403,6 +471,157 @@ class Orchestrator:
                 )
         finally:
             self._busy = False
+
+    async def _recall(self, text: str, turn: SpanHandle) -> str:
+        """The memory block for this turn, searched once with the text that starts it.
+
+        "" when memory is off for this agent (not the orchestrator, no `memory_search`
+        tool, no storage or no user_id), when nothing matches, or when the search
+        fails: a failure is recorded in the `recall` span and never fails the turn.
+        Cancellation propagates (it is not an `Exception`).
+        """
+        self._last_recall = ""
+        target = self._memory_target()
+        if target is None:
+            return ""
+        storage, user_id = target
+        with self._recorder.span("recall", "memory recall", turn) as span:
+            try:
+                store = recall_store(self._tools, storage.relational)
+                hits = await store.search(user_id, text, RECALL_K) if store else []
+            except Exception as error:  # noqa: BLE001 - recall must not fail the turn
+                span.status = "error"
+                span.attributes["error"] = f"{type(error).__name__}: {error}"
+                return ""
+            self._last_recall = format_recall_block(hits)
+            span.attributes["hits"] = [hit.id for hit in hits]
+            span.attributes["characters"] = len(self._last_recall)
+            return self._last_recall
+
+    def _memory_target(self) -> tuple[Storage, str] | None:
+        """The storage and user id when memory is on for this agent, else None.
+
+        On means: the orchestrator (a subagent never recalls or reflects), storage
+        and a user id present, and `memory_search` among its allowed tools. The one
+        gate of the automatic recall and of the reflection.
+        """
+        if (
+            ORCHESTRATOR_TAG not in self._agent_tags
+            or self._storage is None
+            or self._user_id is None
+            or "memory_search" not in self._allowed_tool_names()
+        ):
+            return None
+        return self._storage, self._user_id
+
+    async def _reflect(
+        self,
+        turn: SpanHandle,
+        text: str,
+        answer: str,
+        goal_before: str,
+        tool_results: list[str],
+    ) -> AsyncIterator[StreamEvent]:
+        """After an answer: one model call decides what to remember, then applies it.
+
+        Runs only when memory is on and the turn used a tool or a delegation, or
+        changed the goal; otherwise nothing happens at all. Yields the router's
+        usage report and, when memory changed or the reflection failed, one
+        `Notice`; `none` is silent. Nothing here fails the turn: every `Exception`
+        becomes the failure notice. Cancellation propagates.
+        """
+        target = self._memory_target()
+        if target is None or not (tool_results or self._state.goal != goal_before):
+            return
+        storage, user_id = target
+        store = recall_store(self._tools, storage.relational)
+        if store is None:
+            return
+        attempt = _Attempt()
+        notice = ""
+        with self._recorder.span("reflection", "memory reflection", turn) as span:
+            try:
+                goal = self._state.goal
+                memories = await store.search(user_id, f"{text} {goal}", RECALL_K)
+                request = build_reflection_request(
+                    self._model_cfg,
+                    ReflectionTurn(goal, text, answer, tool_results),
+                    memories,
+                    self._think,
+                )
+                with self._recorder.span("llm_call", request.model, span) as call:
+                    call.attributes["model"] = request.model
+                    call.attributes["messages"] = [
+                        message.model_dump() for message in request.messages
+                    ]
+                    try:
+                        await self._collect_reflection(request, attempt, call)
+                    finally:
+                        call.attributes["reply"] = attempt.text
+                action = parse_reflection(attempt.text)
+                span.attributes["action"] = action.action
+                span.attributes["id"] = action.id
+                result = await apply_reflection(store, user_id, action)
+                span.attributes["notice"] = result
+                span.attributes["outcome"] = (
+                    "none" if action.action == "none" else "applied"
+                )
+                if action.action != "none":
+                    notice = (
+                        result if result.startswith("memory") else f"memory: {result}"
+                    )
+            except Exception as error:  # noqa: BLE001 - the turn already answered
+                reason = _failure_reason(error)
+                span.status = "error"
+                span.attributes["outcome"] = "failed"
+                span.attributes["error"] = reason
+                notice = f"memory reflection failed: {reason}"
+        if attempt.report is not None:
+            yield attempt.report
+        if notice:
+            yield Notice(text=_notice_line(notice))
+
+    async def _collect_reflection(
+        self, request, attempt: _Attempt, call: SpanHandle
+    ) -> None:
+        """Read the reflection reply into `attempt.text`; raise `_ReflectionCallError`.
+
+        Display events are not forwarded (the reply is JSON for the harness); only
+        the usage report is kept, so the session total on the usage line is right.
+        """
+        try:
+            async with asyncio.timeout(REFLECTION_TIMEOUT_SECONDS):
+                await self._read_reflection(request, attempt, call)
+        except TimeoutError as error:
+            message = f"no answer within {REFLECTION_TIMEOUT_SECONDS:g} seconds"
+            call.status = "error"
+            call.attributes["error"] = message
+            raise _ReflectionCallError(message) from error
+
+    async def _read_reflection(
+        self, request, attempt: _Attempt, call: SpanHandle
+    ) -> None:
+        chunks: list[str] = []
+        async with aclosing(self._provider.stream_chat(request)) as stream:
+            async for event in stream:
+                if isinstance(event, TextDelta):
+                    chunks.append(event.text)
+                elif isinstance(event, Done):
+                    attempt.text = "".join(chunks)
+                    attempt.done = True
+                    return
+                elif isinstance(event, ErrorEvent):
+                    message = f"provider error ({event.kind}): {event.message}"
+                    call.status = "error"
+                    call.attributes["error"] = message
+                    raise _ReflectionCallError(message)
+                elif isinstance(event, _FORWARDED):
+                    _note_in_span(call, event)
+                    if isinstance(event, UsageReport):
+                        attempt.report = event
+        call.status = "error"
+        call.attributes["error"] = _NO_TERMINAL
+        raise _ReflectionCallError(_NO_TERMINAL)
 
     async def _delegate(
         self, action: DelegateAction, step: SpanHandle, delegation: _Delegation
@@ -469,6 +688,10 @@ class Orchestrator:
             call.attributes["result"] = result
             return result
 
+    def tool_notes(self) -> list[str]:
+        """Why a configured tool group is off (for the State tab)."""
+        return list(self._tools.notes)
+
     def available_tools(self) -> list[Tool]:
         """The tools this agent may use, sorted by name."""
         # Without an agent (tests) every registered tool is allowed.
@@ -487,7 +710,7 @@ class Orchestrator:
         call: SpanHandle,
     ) -> str | None:
         """Ask the human before a write or exec tool runs; None means go ahead."""
-        if tool.risk == "read":
+        if tool.risk == "read" or not tool_prompts(tool):
             call.attributes["approval"] = "not_required"
             return None
         if self._approver is None:

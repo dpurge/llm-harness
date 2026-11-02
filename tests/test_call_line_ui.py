@@ -88,6 +88,53 @@ async def test_the_gui_shows_the_line_as_a_plain_full_width_label(user: User) ->
     assert "w-full" in elements(user, "log")[0].classes
 
 
+NOTE_EXPECTED = 'step 1: tool note {"text": "Prefers metric units."}'
+
+
+def note_steps() -> list[list[Any]]:
+    return [
+        reply_events(call("note", text="Prefers metric units."), SET_GOAL),
+        reply_events(RESPOND),
+    ]
+
+
+def no_prompt_write_tool() -> StubTool:
+    stub = StubTool("note")
+    stub.risk = "write"
+    stub.prompts = False
+    return stub
+
+
+async def test_the_tui_shows_the_notice_of_a_no_prompt_write_tool() -> None:
+    config = CONFIG.model_copy(update={"agents": [AGENT]})
+    app = ChatApp(
+        config,
+        MODEL_1,
+        router_factory_for(config, StepFactory(note_steps()), None),
+        False,
+        tools=registry(no_prompt_write_tool()),
+    )
+    async with app.run_test() as pilot:
+        await tui_send(pilot, app, "hi")
+        assert NOTE_EXPECTED in texts(app, "note")
+
+
+async def test_the_gui_shows_the_notice_of_a_no_prompt_write_tool(user: User) -> None:
+    config = GUI_CONFIG.model_copy(update={"agents": [AGENT]})
+    register_page(
+        config,
+        GUI_MODEL,
+        router_factory_for(config, GuiStepFactory(note_steps())),
+        False,
+        tools=registry(no_prompt_write_tool()),
+    )
+    await user.open("/")
+    await send(user, "hi")
+    await wait_for(lambda: bool(elements(user, "status")))
+    (line,) = [e for e in elements(user, "status") if e.text.startswith("step 1: tool")]
+    assert line.text == NOTE_EXPECTED
+
+
 def test_the_gui_status_code_adds_no_narrow_column_or_fixed_height() -> None:
     source = Path(gui_app.__file__).read_text()
     assert "max-w-" not in source and "mx-auto" not in source

@@ -1,5 +1,6 @@
 """The tools that ship with the program, and the registry built from them."""
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
@@ -15,6 +16,7 @@ from llm_harness.tools import (
 )
 
 if TYPE_CHECKING:
+    from llm_harness.command_executor import CommandExecutor
     from llm_harness.web_fetcher import WebFetcher
     from llm_harness.web_search import SearchProvider
 
@@ -72,11 +74,23 @@ class DevEchoTool:
 
 
 _WEB_TOOL_NAMES = ("web_search", "web_fetch")
+_MEMORY_TOOL_NAMES = frozenset(
+    {"memory_search", "memory_save", "memory_update", "memory_forget"}
+)
+_COMMAND_TOOL_NAME = "run_command"
+MEMORY_NEEDS_USER_ID = (
+    "memory is off: [tools] memory = true needs user_id, but user_id is not set; "
+    'add user_id = "your-name" at the top of config.toml'
+)
 
 
-def _unknown_tool_hint(name: str) -> str:
-    if name in _WEB_TOOL_NAMES:
+def _unknown_tool_hint(name: str, memory_on: bool, user_id: str | None) -> str:
+    if name in _WEB_TOOL_NAMES or name == _COMMAND_TOOL_NAME:
         return f"; enable it with [tools] {name} = true"
+    if name in _MEMORY_TOOL_NAMES:
+        if memory_on and user_id is None:
+            return "; memory is on but needs user_id, which is not set (add it at the top of config.toml)"
+        return "; enable it with [tools] memory = true and set user_id"
     return ""
 
 
@@ -89,11 +103,22 @@ def build_tool_registry(
     web_relax_tls_strict: bool = False,
     fetcher: "WebFetcher | None" = None,
     search_provider: "SearchProvider | None" = None,
+    run_command: bool = False,
+    command_allow: Sequence[str] = (),
+    command_deny: Sequence[str] = (),
+    command_timeout_seconds: int = 30,
+    command_executor: "CommandExecutor | None" = None,
+    memory: bool = False,
+    user_id: str | None = None,
 ) -> ToolRegistry:
     """The registry of built-in tools; every tool name in `agents` must exist.
 
     `fetcher` and `search_provider` replace the real web access (tests). The web
-    modules are imported only when a web tool is switched on.
+    modules are imported only when a web tool is switched on. `command_executor`
+    replaces the real local executor (tests); the command modules are imported only
+    when `run_command` is on. The memory tools are registered only when `memory` is on
+    and `user_id` is set (memory is per user); with `memory` on and no `user_id` the
+    registry says so in `notes` and a `memory_*` name in `agents` gets a hint.
     """
     registry = ToolRegistry()
     registry.register(ToolSearchTool(registry))
@@ -118,6 +143,23 @@ def build_tool_registry(
                 else DuckDuckGoHtmlProvider(shared_fetcher)
             )
             registry.register(WebSearchTool(provider))
+    if run_command:
+        from llm_harness.command_executor import PermissionsExecutor
+        from llm_harness.command_tool import RunCommandTool
+
+        executor = (
+            command_executor
+            if command_executor is not None
+            else PermissionsExecutor(command_allow, command_deny)
+        )
+        registry.register(RunCommandTool(executor, command_timeout_seconds))
+    if memory and user_id is not None:
+        from llm_harness.memory_tools import MemoryTools
+
+        for memory_tool in MemoryTools().tools():
+            registry.register(memory_tool)
+    elif memory:
+        registry.notes.append(MEMORY_NEEDS_USER_ID)
     known = registry.names()
     for agent in agents:
         for field, names in (("tools", agent.tools), ("deny", agent.deny)):
@@ -126,6 +168,6 @@ def build_tool_registry(
                     raise ConfigError(
                         f"invalid agents.yaml: agent {agent.id!r}: {field} names "
                         f"unknown tool {name!r}; known tools: {', '.join(known)}"
-                        f"{_unknown_tool_hint(name)}"
+                        f"{_unknown_tool_hint(name, memory, user_id)}"
                     )
     return registry

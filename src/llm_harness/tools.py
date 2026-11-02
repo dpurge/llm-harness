@@ -45,8 +45,17 @@ class Tool(Protocol):
     tags: list[str]
     input_model: type[BaseModel]
     risk: Risk
+    # Optional (so not declared here): `prompts: bool`, default True. A non-read tool
+    # with `prompts = False` runs without the approval prompt and shows a one-line
+    # notice with its arguments instead; only for writes the user's own `[tools]`
+    # switch already allows (agent memory). `tool_prompts` reads it.
 
     async def run(self, arguments: Any, ctx: ToolContext) -> str: ...
+
+
+def tool_prompts(tool: Tool) -> bool:
+    """False only for a tool that declares `prompts = False`; every other tool asks."""
+    return getattr(tool, "prompts", True) is not False
 
 
 _NAME_RULE = re.compile(r"[a-z][a-z0-9_]*")
@@ -99,11 +108,16 @@ def _check_tool(tool: Tool) -> None:
         raise ValueError(
             f"tool {name!r}: risk must be one of {', '.join(_RISKS)}, got {risk!r}."
         )
+    prompts = getattr(tool, "prompts", True)
+    if not isinstance(prompts, bool):
+        raise TypeError(f"tool {name!r}: prompts must be a bool, got {prompts!r}.")
 
 
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        # Why a tool group is off although the config asks for it; the State tab shows it.
+        self.notes: list[str] = []
 
     def register(self, tool: Tool) -> None:
         _check_tool(tool)

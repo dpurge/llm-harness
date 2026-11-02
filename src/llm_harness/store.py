@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 from llm_harness.config import default_data_dir
+from llm_harness.memory import MEMORY_MIGRATIONS, MEMORY_NAMESPACE
 from llm_harness.routing import BackoffEntry, backoff_delay
 from llm_harness.storage.relational import (
     Migration,
@@ -57,6 +58,11 @@ _NAMESPACE = "ledger"
 def expected_schema_versions() -> dict[str, int]:
     """The schema version this build expects per namespace, for read-only diagnostics."""
     return {_NAMESPACE: len(_MIGRATIONS)}
+
+
+def optional_schema_versions() -> dict[str, int]:
+    """Namespaces this build knows but a database need not have (memory is opt-in)."""
+    return {MEMORY_NAMESPACE: len(MEMORY_MIGRATIONS)}
 
 
 @dataclass(frozen=True)

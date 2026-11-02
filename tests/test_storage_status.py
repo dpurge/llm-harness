@@ -20,9 +20,10 @@ from llm_harness.config import (
     StorageConfig,
     VectorConfig,
 )
+from llm_harness.memory import MEMORY_MIGRATIONS
 from llm_harness.storage.files import LocalFileStore
 from llm_harness.storage.qdrant_edge import QdrantEdgeVectorStore
-from llm_harness.storage.relational import read_schema_versions
+from llm_harness.storage.relational import SqliteRelationalStore, read_schema_versions
 from llm_harness.storage.status import storage_status
 from llm_harness.store import Store
 from tests.test_storage_vectors import _CHILD, CHILD_TIMEOUT_SECONDS, _read_line_within
@@ -154,6 +155,15 @@ async def test_an_unknown_namespace_is_listed(tmp_path: Path) -> None:
     assert (await status(tmp_path))[3] == (
         "  schema: later version 4 "
         "(this version of llm-harness does not know this namespace)"
+    )
+
+
+async def test_a_recorded_memory_namespace_is_known(tmp_path: Path) -> None:
+    db = tmp_path / "harness.db"
+    Store(db).backoff_entries()
+    await SqliteRelationalStore(db).migrate("memory", MEMORY_MIGRATIONS)
+    assert (await status(tmp_path))[3] == (
+        "  schema: memory version 1 (the code expects 1)"
     )
 
 

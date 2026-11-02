@@ -5,7 +5,8 @@ import asyncio
 import io
 import sys
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from functools import partial
 from pathlib import Path
 from typing import Protocol, TextIO
 
@@ -33,6 +34,7 @@ from llm_harness.config import (
     write_examples,
 )
 from llm_harness.display import format_switch, format_usage_report, sanitize_text
+from llm_harness.memory_command import handle_memory_text
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.providers import ProviderFactory, build_provider
 from llm_harness.providers.base import ChatProvider
@@ -233,6 +235,7 @@ async def _chat_loop(
     stderr: TextIO,
     *,
     session: _Sender,
+    memory_command: Callable[[str], Awaitable[str | None]] | None = None,
 ) -> int:
     try:
         while True:
@@ -247,6 +250,12 @@ async def _chat_loop(
                 return 0
             if not text:
                 continue
+            if memory_command is not None:
+                answer = await memory_command(text)
+                if answer is not None:
+                    stdout.write(f"{answer}\n")
+                    stdout.flush()
+                    continue
             if not await _run_turn(session, text, stdout, stderr):
                 return 1
     finally:
@@ -260,10 +269,18 @@ async def _chat_loop_then_close(
     stderr: TextIO,
     orchestrator: Orchestrator,
     storage: Storage,
+    memory_command: Callable[[str], Awaitable[str | None]] | None = None,
 ) -> int:
     """Run the chat; the storage is closed inside the loop, so Ctrl-C closes it too."""
     try:
-        return await _chat_loop(router, stdin, stdout, stderr, session=orchestrator)
+        return await _chat_loop(
+            router,
+            stdin,
+            stdout,
+            stderr,
+            session=orchestrator,
+            memory_command=memory_command,
+        )
     finally:
         await storage.close()
 
@@ -482,6 +499,12 @@ def main(
             web_search=config.tools.web_search,
             web_fetch=config.tools.web_fetch,
             web_relax_tls_strict=config.tools.web_relax_tls_strict,
+            run_command=config.tools.run_command,
+            memory=config.tools.memory,
+            user_id=config.user_id,
+            command_allow=config.tools.command_allow,
+            command_deny=config.tools.command_deny,
+            command_timeout_seconds=config.tools.command_timeout_seconds,
         )
     except ConfigError as exc:
         print(f"error: {exc}", file=stderr)
@@ -549,7 +572,20 @@ def main(
             approver=_ask_on_stderr(stdin, stderr) if stdin.isatty() else None,
         )
         return asyncio.run(
-            _chat_loop_then_close(router, stdin, stdout, stderr, orchestrator, storage)
+            _chat_loop_then_close(
+                router,
+                stdin,
+                stdout,
+                stderr,
+                orchestrator,
+                storage,
+                partial(
+                    handle_memory_text,
+                    tools=tools,
+                    storage=storage,
+                    user_id=config.user_id,
+                ),
+            )
         )
     except KeyboardInterrupt:
         print(file=stderr)

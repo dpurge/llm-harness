@@ -97,7 +97,10 @@ class StatePanel(VerticalScroll):
         if orchestrator is None:
             return
         state = orchestrator.state
-        self._set("state-tools", tools_text(orchestrator.available_tools()))
+        self._set(
+            "state-tools",
+            tools_text(orchestrator.available_tools(), orchestrator.tool_notes()),
+        )
         self._set("state-counters", counters_text(state))
         self._set("state-goal", goal_text(state))
         self._set(

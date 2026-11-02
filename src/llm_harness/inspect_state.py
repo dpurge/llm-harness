@@ -84,20 +84,23 @@ def tool_text(tool: Tool) -> str:
     )
 
 
-def tools_text(tools: Sequence[Tool]) -> str:
+def tools_text(tools: Sequence[Tool], notes: Sequence[str] = ()) -> str:
     """The tools the agent may use, and what listing them costs next to their schemas.
 
     Token counts are estimates (4 characters per token), not tokenizer counts.
+    `notes` say why a configured tool group is off; they come last.
     """
     if not tools:
-        return "(none)"
+        return "\n\n".join(["(none)", *map(sanitize_text, notes)])
     listing = estimate_tokens(tool_lines(tools))
     schemas = sum(estimate_tokens(schema_text(tool)) for tool in tools)
     totals = (
         f"listing sent in every request: ~{listing} tokens\n"
         f"full schemas of these tools would be: ~{schemas} tokens"
     )
-    return "\n\n".join([*(tool_text(tool) for tool in tools), totals])
+    return "\n\n".join(
+        [*(tool_text(tool) for tool in tools), totals, *map(sanitize_text, notes)]
+    )
 
 
 @dataclass(frozen=True)
@@ -122,6 +125,7 @@ def build_preview(
         model,
         tools=orchestrator.available_tools(),
         subagents=orchestrator.subagents,
+        memory=orchestrator.last_recall,
     )
     system, user = request.messages
     cut = (

@@ -114,3 +114,39 @@ def test_plain_cli_prints_the_line_on_stderr_and_leaves_stdout_alone(
     assert (
         '[step 1: tool web_fetch {"url": "https://example.com/\\nx"}]\n' in result.err
     )
+
+
+def no_prompt_write_tool() -> StubTool:
+    stub = StubTool("note")
+    stub.risk = "write"
+    stub.prompts = False
+    return stub
+
+
+async def test_a_write_tool_that_does_not_prompt_gets_the_line_with_its_arguments() -> (
+    None
+):
+    approver = FakeApprover(True)
+    orchestrator, _ = make(
+        script("note", text="Prefers metric units."),
+        tools=registry(no_prompt_write_tool()),
+        approver=approver,
+    )
+    events = await run(orchestrator, "hi")
+    assert tool_lines(events) == ['tool note {"text": "Prefers metric units."}']
+    assert approver.requests == []
+
+
+def test_plain_cli_prints_the_notice_of_a_no_prompt_write_tool_on_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_dir = write_config_dir(tmp_path)
+    monkeypatch.setattr(
+        cli_module,
+        "build_tool_registry",
+        lambda *args, **kwargs: registry(no_prompt_write_tool()),
+    )
+    _, factory = steps(*script("note", text="Prefers metric units."))
+    result = run_plain(config_dir, factory, tmp_path)
+    assert result.code == 0
+    assert '[step 1: tool note {"text": "Prefers metric units."}]\n' in result.err

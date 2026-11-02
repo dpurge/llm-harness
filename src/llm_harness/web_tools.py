@@ -13,6 +13,7 @@ from html.parser import HTMLParser
 
 from pydantic import BaseModel, Field
 
+from llm_harness.block_text import scrub_block_text
 from llm_harness.context import MAX_OBSERVATION_CHARS
 from llm_harness.display import sanitize_text
 from llm_harness.redact import redact
@@ -46,32 +47,11 @@ SEARCH_SNIPPET_CHARS = 200
 TITLE_SCAN_CHARS = 200_000
 
 _BLOCK_TAG = re.compile(re.escape(BLOCK_TAG), re.IGNORECASE)
-# Lines that start like a message the harness writes into the next observation.
-# The names of these phrases come from context.py and orchestrator.py.
-_HARNESS_LINE = re.compile(
-    r"^(?=[ \t]*(?:"
-    r"\[observation truncated"
-    r"|Your previous reply was rejected"
-    r"|You asked the user"
-    r"|The user answered"
-    r"|tool [a-z][a-z0-9_]* (?:result:|failed:|was not run)"
-    r"|## "
-    r"))",
-    re.IGNORECASE | re.MULTILINE,
-)
 
 
 def scrub(text: str) -> str:
-    """Make web text safe to place inside the block.
-
-    Drops terminal and bidi control characters, removes every spelling of the
-    block tag name (repeatedly, so removal cannot assemble a new one) and quotes
-    lines that start like harness messages with `> `.
-    """
-    text = sanitize_text(text)
-    while _BLOCK_TAG.search(text):
-        text = _BLOCK_TAG.sub("", text)
-    return _HARNESS_LINE.sub("> ", text)
+    """Make web text safe to place inside the block (see `scrub_block_text`)."""
+    return scrub_block_text(text, _BLOCK_TAG)
 
 
 def _one_line(text: str) -> str:

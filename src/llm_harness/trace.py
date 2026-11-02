@@ -1,7 +1,8 @@
 """Call trace of one orchestrator turn: a tree of frozen spans.
 
 The tree is `turn -> step -> llm_call | tool_call | subagent` (a subagent span
-holds the child's own steps), stored flat and linked by
+holds the child's own steps); a `recall` and a `reflection` span hang directly
+under the turn, and a reflection holds its own `llm_call`. Stored flat and linked by
 `parent_id`. Spans are display and debug data only: nothing here is read by
 `build_request` or stored in the orchestrator state. Text is kept whole (no
 cut); secrets are masked with `redact` when a span closes.
@@ -17,7 +18,9 @@ from typing import Any, Literal
 from llm_harness.redact import redact
 from llm_harness.types import _Frozen
 
-SpanKind = Literal["turn", "step", "llm_call", "tool_call", "subagent"]
+SpanKind = Literal[
+    "turn", "step", "llm_call", "tool_call", "subagent", "recall", "reflection"
+]
 SpanStatus = Literal["ok", "error", "rejected", "cancelled"]
 
 # `redact` cuts at `limit` and compares with `len(text) > limit`, so None is not

@@ -31,6 +31,7 @@ from llm_harness.config import (
 )
 from llm_harness.display import format_switch, format_usage_report, sanitize_text
 from llm_harness.markdown_render import parser_factory
+from llm_harness.memory_command import handle_memory_text
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.providers.base import ChatProvider
 from llm_harness.redact import redact
@@ -290,6 +291,13 @@ class ChatApp(App[int]):
         command = parse_command(text)
         if command is not None:
             await self._run_state_command(command)
+            return
+        memory_answer = await handle_memory_text(
+            text.strip(), self._tools, self._storage, self._config.user_id
+        )
+        if memory_answer is not None:
+            await self._show(memory_answer, "note")
+            self.query_one("#prompt", Input).value = ""
             return
         if self._turn_is_running():
             return

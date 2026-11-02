@@ -987,8 +987,12 @@ class HostileStatusOrchestrator:
         self.state = Orchestrator(router, model).state
         self.pending_question = None
         self.last_trace = None
+        self.last_recall = ""
 
     def available_tools(self) -> list:
+        return []
+
+    def tool_notes(self) -> list[str]:
         return []
 
     async def send(self, text: str):

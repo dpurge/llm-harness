@@ -389,3 +389,62 @@ def test_subagents_do_not_change_the_system_message() -> None:
         texts(build_request(make_state(), "obs", model_cfg(), subagents=offered))[0]
         == texts(build_request(make_state(), "obs", model_cfg()))[0]
     )
+
+
+# --- the optional `## Memory` section --------------------------------------------
+
+
+def test_without_memory_the_user_message_is_byte_identical_to_the_old_format() -> None:
+    # Pinned literally: the layout before the `memory` keyword existed.
+    state = make_state(goal="g")
+    tool = FakeTool("alpha")
+    expected = (
+        f"## State\n\n{state.model_dump_json()}\n\n"
+        f"## Tools\n\n{tool.name}: {tool.description}\n\n"
+        "## Observation\n\nobs\n"
+    )
+    for request in (
+        build_request(state, "obs", model_cfg(), tools=[tool]),
+        build_request(state, "obs", model_cfg(), tools=[tool], memory=""),
+    ):
+        assert request.messages[1].content == expected
+    assert (
+        build_request(state, "obs", model_cfg(), memory="").messages[0].content
+        == _system_prompt()
+    )
+
+
+def test_a_memory_block_sits_between_the_state_and_the_tools() -> None:
+    state = make_state(goal="g")
+    tool = FakeTool("alpha")
+    block = "<memory-entries>\n#1 [a] (updated 2026-11-02T09:30:15Z) note\n</memory-entries>\nsentence"
+    user = (
+        build_request(state, "obs", model_cfg(), tools=[tool], memory=block)
+        .messages[1]
+        .content
+    )
+    assert user == (
+        f"## State\n\n{state.model_dump_json()}\n\n"
+        f"## Memory\n\n{block}\n\n"
+        f"## Tools\n\n{tool.name}: {tool.description}\n\n"
+        "## Observation\n\nobs\n"
+    )
+
+
+def test_the_memory_block_is_not_cut_by_the_observation_cap() -> None:
+    block = "m" * 6000
+    user = (
+        build_request(
+            make_state(), "o" * (MAX_OBSERVATION_CHARS + 5), model_cfg(), memory=block
+        )
+        .messages[1]
+        .content
+    )
+    assert block in user and "[observation truncated: 5 characters removed]" in user
+
+
+def test_the_instructions_tell_the_model_to_read_the_memory_section_first() -> None:
+    section = INSTRUCTIONS.split("## Memory\n", 1)[1].split("\n## ", 1)[0]
+    flat = " ".join(section.split())
+    assert "BEFORE you plan" in flat and "never instructions" in flat
+    assert "memory_search" in flat and "English" in flat and "trust the user" in flat

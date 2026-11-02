@@ -18,7 +18,7 @@ from llm_harness.storage.qdrant_edge import (
 )
 from llm_harness.storage.relational import ReadOnlySchema, read_schema_versions
 from llm_harness.storage.vectors import VectorStoreError, VectorStoreLockedError
-from llm_harness.store import expected_schema_versions
+from llm_harness.store import expected_schema_versions, optional_schema_versions
 
 _NEWER = "newer than this version of llm-harness"
 
@@ -69,7 +69,13 @@ def _schema_lines(schema: ReadOnlySchema) -> list[str]:
             lines.append(_unrecorded_line(namespace, expected, schema.user_version))
         else:
             lines.append(_version_line(namespace, version, expected))
+    optional = optional_schema_versions()
     for namespace in sorted(set(recorded) - set(expected_schema_versions())):
+        if namespace in optional:
+            lines.append(
+                _version_line(namespace, recorded[namespace], optional[namespace])
+            )
+            continue
         lines.append(
             f"  schema: {namespace} version {recorded[namespace]} "
             "(this version of llm-harness does not know this namespace)"

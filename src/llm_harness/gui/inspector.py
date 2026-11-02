@@ -266,7 +266,9 @@ class StatePanel:
         if orchestrator is None:
             return
         self._show_state(orchestrator.state, orchestrator.pending_question)
-        self._tools.set_text(tools_text(orchestrator.available_tools()))
+        self._tools.set_text(
+            tools_text(orchestrator.available_tools(), orchestrator.tool_notes())
+        )
         self._show_preview(orchestrator, model, typed)
 
     def _show_state(self, state: OrchestratorState, question: str | None) -> None:
