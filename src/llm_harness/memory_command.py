@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from llm_harness.display import sanitize_text
+from llm_harness.memory import MemoryStorageError
+from llm_harness.memory_index import IndexedMemoryStore
 from llm_harness.memory_tools import recall_store
 
 if TYPE_CHECKING:
@@ -21,11 +23,13 @@ if TYPE_CHECKING:
 
 COMMAND_WORD = "/memory"
 MEMORY_OFF = "memory is off: set [tools] memory = true and user_id in config.toml"
+VECTORS_OFF = "vector search is off: set [tools] memory_vectors = true"
 USAGE = (
-    "usage: /memory [list [PAGE]] | /memory show ID | /memory delete ID\n"
+    "usage: /memory [list [PAGE]] | /memory show ID | /memory delete ID | /memory reindex\n"
     "  list    one line per memory, newest first, 20 per page\n"
     "  show    the full text of one memory\n"
-    "  delete  forget one memory for good"
+    "  delete  forget one memory for good\n"
+    "  reindex rebuild the vector index of your memories"
 )
 _PREVIEW_CHARS = 80
 _DELETED_CHARS = 200
@@ -35,7 +39,7 @@ _POSITIVE_INTEGER = re.compile(r"[1-9][0-9]*")
 
 @dataclass(frozen=True)
 class MemoryCommand:
-    action: str  # "list", "show", "delete" or "usage"
+    action: str  # "list", "show", "delete", "reindex" or "usage"
     number: int = 1  # the page for list, the memory id for show and delete
 
 
@@ -61,6 +65,8 @@ def parse_memory_command(text: str) -> MemoryCommand | None:
     if verb in ("show", "delete") and len(rest) == 1:
         memory_id = _positive_integer(rest[0])
         return MemoryCommand(verb, memory_id) if memory_id is not None else _usage()
+    if verb == "reindex" and not rest:
+        return MemoryCommand("reindex")
     return _usage()
 
 
@@ -137,6 +143,18 @@ async def _delete(store: MemoryStore, user_id: str, memory_id: int) -> str:
     return f"deleted memory #{memory_id}: {_escape(_clip(memory.text, _DELETED_CHARS))}"
 
 
+async def _reindex(store: MemoryStore, user_id: str) -> str:
+    if not isinstance(store, IndexedMemoryStore):
+        return VECTORS_OFF
+    if store.index_off_reason is not None:
+        store.resume()  # a failed retry turns the index off again with its new reason
+    counts = await store.reindex(user_id)
+    if counts is None:
+        return f"vector search is off: {_escape(store.index_off_reason or 'unknown')}"
+    indexed, unindexed = counts
+    return f"reindexed {indexed} of {unindexed} memories"
+
+
 async def run_memory_command(
     store: MemoryStore,
     user_id: str,
@@ -151,6 +169,8 @@ async def run_memory_command(
         return await _show(store, user_id, command.number)
     if command.action == "delete":
         return await _delete(store, user_id, command.number)
+    if command.action == "reindex":
+        return await _reindex(store, user_id)
     return USAGE
 
 
@@ -167,10 +187,17 @@ async def handle_memory_text(
     if command.action == "usage":
         return USAGE
     store = (
-        recall_store(tools, storage.relational)
+        recall_store(tools, storage)
         if tools is not None and storage is not None and user_id
         else None
     )
     if store is None or not user_id:
         return MEMORY_OFF
-    return await run_memory_command(store, user_id, command)
+    try:
+        answer = await run_memory_command(store, user_id, command)
+    except MemoryStorageError as error:
+        return str(error)  # the type name only; no front end catches an exception here
+    notice = store.take_notice()
+    if notice and command.action == "reindex" and "vector search is off" in answer:
+        return answer  # the answer already gives the reason
+    return f"{answer}\n{notice}" if notice else answer

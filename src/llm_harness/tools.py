@@ -49,6 +49,8 @@ class Tool(Protocol):
     # with `prompts = False` runs without the approval prompt and shows a one-line
     # notice with its arguments instead; only for writes the user's own `[tools]`
     # switch already allows (agent memory). `tool_prompts` reads it.
+    # Optional: `notify_result: bool`, default False. A tool with `notify_result = True`
+    # also shows its successful result as a one-line notice. `tool_notifies` reads it.
 
     async def run(self, arguments: Any, ctx: ToolContext) -> str: ...
 
@@ -56,6 +58,11 @@ class Tool(Protocol):
 def tool_prompts(tool: Tool) -> bool:
     """False only for a tool that declares `prompts = False`; every other tool asks."""
     return getattr(tool, "prompts", True) is not False
+
+
+def tool_notifies(tool: Tool) -> bool:
+    """True only for a tool that declares `notify_result = True`."""
+    return getattr(tool, "notify_result", False) is True
 
 
 _NAME_RULE = re.compile(r"[a-z][a-z0-9_]*")
@@ -111,6 +118,11 @@ def _check_tool(tool: Tool) -> None:
     prompts = getattr(tool, "prompts", True)
     if not isinstance(prompts, bool):
         raise TypeError(f"tool {name!r}: prompts must be a bool, got {prompts!r}.")
+    notify_result = getattr(tool, "notify_result", False)
+    if not isinstance(notify_result, bool):
+        raise TypeError(
+            f"tool {name!r}: notify_result must be a bool, got {notify_result!r}."
+        )
 
 
 class ToolRegistry:

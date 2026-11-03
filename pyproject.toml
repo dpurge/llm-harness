@@ -23,6 +23,12 @@ dependencies = [
     "trafilatura>=2.3.1",
 ]
 
+[project.optional-dependencies]
+# Remote vector backend: install with `uv sync --extra remote`.
+remote = ["qdrant-client>=1.20.0"]
+# Postgres relational backend: install with `uv sync --extra postgres`.
+postgres = ["psycopg[binary]>=3.3.7"]
+
 [project.scripts]
 llm-harness = "llm_harness.cli:main"
 
@@ -34,6 +40,10 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.1",
+    # Offline remote-store tests build the real request models and error classes.
+    "qdrant-client>=1.20.0",
+    # Offline Postgres adapter tests import the driver's error classes.
+    "psycopg[binary]>=3.3.7",
     "ruff>=0.17.3",
 ]
 

@@ -58,7 +58,13 @@ from llm_harness.state import (
     parse_reply,
 )
 from llm_harness.storage import Storage
-from llm_harness.tools import Tool, ToolContext, ToolRegistry, tool_prompts
+from llm_harness.tools import (
+    Tool,
+    ToolContext,
+    ToolRegistry,
+    tool_notifies,
+    tool_prompts,
+)
 from llm_harness.trace import UNCUT, Span, SpanHandle, TraceRecorder
 from llm_harness.types import (
     Done,
@@ -340,6 +346,9 @@ class Orchestrator:
                     else text
                 )
                 recall = await self._recall(text, turn)
+                recall_notice = self._vector_notice()
+                if recall_notice:
+                    yield Notice(text=recall_notice)
                 for step_number in range(1, self._max_steps + 1):
                     with self._recorder.span(
                         "step", f"step {step_number}", turn
@@ -444,6 +453,20 @@ class Orchestrator:
                         if isinstance(action, CallToolAction):
                             observation = await self._run_tool(action, step)
                             tool_results.append(observation)
+                            result_prefix = f"tool {action.tool} result: "
+                            called = self._tools.get(action.tool)
+                            if (
+                                called is not None
+                                and tool_notifies(called)
+                                and observation.startswith(result_prefix)
+                            ):
+                                yield Notice(
+                                    text=_notice_line(observation[len(result_prefix) :])
+                                )
+                            if action.tool.startswith("memory_"):
+                                tool_notice = self._vector_notice()
+                                if tool_notice:
+                                    yield Notice(text=tool_notice)
                         elif isinstance(action, DelegateAction):
                             if not self._can_delegate:
                                 observation = _NO_DELEGATION
@@ -487,7 +510,7 @@ class Orchestrator:
         storage, user_id = target
         with self._recorder.span("recall", "memory recall", turn) as span:
             try:
-                store = recall_store(self._tools, storage.relational)
+                store = recall_store(self._tools, storage)
                 hits = await store.search(user_id, text, RECALL_K) if store else []
             except Exception as error:  # noqa: BLE001 - recall must not fail the turn
                 span.status = "error"
@@ -497,6 +520,15 @@ class Orchestrator:
             span.attributes["hits"] = [hit.id for hit in hits]
             span.attributes["characters"] = len(self._last_recall)
             return self._last_recall
+
+    def _vector_notice(self) -> str | None:
+        """The memory index's one-time "vector search is off" line, once, else None."""
+        target = self._memory_target()
+        if target is None:
+            return None
+        store = recall_store(self._tools, target[0])
+        notice = store.take_notice() if store is not None else None
+        return _notice_line(notice) if notice else None
 
     def _memory_target(self) -> tuple[Storage, str] | None:
         """The storage and user id when memory is on for this agent, else None.
@@ -534,7 +566,7 @@ class Orchestrator:
         if target is None or not (tool_results or self._state.goal != goal_before):
             return
         storage, user_id = target
-        store = recall_store(self._tools, storage.relational)
+        store = recall_store(self._tools, storage)
         if store is None:
             return
         attempt = _Attempt()
@@ -580,6 +612,9 @@ class Orchestrator:
             yield attempt.report
         if notice:
             yield Notice(text=_notice_line(notice))
+        index_notice = self._vector_notice()
+        if index_notice:
+            yield Notice(text=index_notice)
 
     async def _collect_reflection(
         self, request, attempt: _Attempt, call: SpanHandle

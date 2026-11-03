@@ -1,25 +1,31 @@
-"""SQLite store: the call ledger and the model backoff state.
+"""Usage store: the call ledger and the model backoff state.
 
 Synchronous on purpose; async callers use `asyncio.to_thread`. Only ids, token
 counts, costs, times and error kinds are stored, never prompts, replies, error
-messages or keys. Runs on `SqliteRelationalStore` as the `ledger` namespace.
+messages or keys. Runs on a relational store (`SqliteRelationalStore` for a file,
+or the configured one, e.g. `PostgresRelationalStore`) as the `ledger` namespace,
+with DDL chosen by the store's `dialect`.
 """
 
-import sqlite3
+import functools
 import threading
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from llm_harness.config import default_data_dir
 from llm_harness.memory import MEMORY_MIGRATIONS, MEMORY_NAMESPACE
 from llm_harness.routing import BackoffEntry, backoff_delay
+from llm_harness.storage.pgvector import MIGRATIONS as PGVECTOR_MIGRATIONS
+from llm_harness.storage.pgvector import NAMESPACE as PGVECTOR_NAMESPACE
 from llm_harness.storage.relational import (
     Migration,
+    RelationalStoreError,
     SchemaTooNewError,
     SqliteRelationalStore,
+    database_error_classes,
 )
 
 __all__ = ["SchemaTooNewError"]  # re-exported: it moved to storage.relational
@@ -52,7 +58,50 @@ _MIGRATIONS: tuple[Migration, ...] = (
         )""",
     ),
 )
+# The same tables and columns on PostgreSQL. `INTEGER PRIMARY KEY` does not
+# autoincrement there and `REAL` is 32-bit (0.000123456789 came back as
+# 0.00012345679), so ids are IDENTITY and floats DOUBLE PRECISION. Both tuples
+# must keep the same number of steps: the version numbers mean the same thing.
+_POSTGRES_MIGRATIONS: tuple[Migration, ...] = (
+    (
+        """CREATE TABLE llm_calls (
+            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            time TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            input_tokens INTEGER NULL,
+            output_tokens INTEGER NULL,
+            reasoning_tokens INTEGER NULL,
+            cost_usd DOUBLE PRECISION NULL,
+            seconds DOUBLE PRECISION NOT NULL,
+            outcome TEXT NOT NULL CHECK(outcome IN ('ok','error','cancelled')),
+            error_kind TEXT NULL,
+            fallback_from TEXT NULL
+        )""",
+        """CREATE TABLE model_backoff (
+            model_id TEXT PRIMARY KEY,
+            failures INTEGER NOT NULL,
+            until TEXT NOT NULL
+        )""",
+    ),
+)
+_MIGRATIONS_BY_DIALECT: dict[str, tuple[Migration, ...]] = {
+    "sqlite": _MIGRATIONS,
+    "postgres": _POSTGRES_MIGRATIONS,
+}
 _NAMESPACE = "ledger"
+
+
+@functools.cache
+def _database_errors() -> tuple[type[Exception], ...]:
+    """What a ledger call may raise and must survive; computed once (it imports psycopg)."""
+    return (
+        *database_error_classes(),
+        OSError,
+        SchemaTooNewError,
+        ValueError,
+        RelationalStoreError,
+    )
 
 
 def expected_schema_versions() -> dict[str, int]:
@@ -62,7 +111,10 @@ def expected_schema_versions() -> dict[str, int]:
 
 def optional_schema_versions() -> dict[str, int]:
     """Namespaces this build knows but a database need not have (memory is opt-in)."""
-    return {MEMORY_NAMESPACE: len(MEMORY_MIGRATIONS)}
+    return {
+        MEMORY_NAMESPACE: len(MEMORY_MIGRATIONS),
+        PGVECTOR_NAMESPACE: len(PGVECTOR_MIGRATIONS),
+    }
 
 
 @dataclass(frozen=True)
@@ -95,9 +147,27 @@ def _parse(text: str) -> datetime:
 
 
 class Store:
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._relational = SqliteRelationalStore(path)
+    def __init__(
+        self, path: Path | None = None, *, relational: Any | None = None
+    ) -> None:
+        """Exactly one of `path` (a SQLite file) or `relational` (a configured store).
+
+        `relational` needs `dialect`, `migrate_sync` and `connect_sync`.
+        """
+        if (path is None) == (relational is None):
+            raise ValueError("Store needs exactly one of `path` or `relational`")
+        if relational is None:
+            relational = SqliteRelationalStore(path)
+        dialect = relational.dialect
+        if dialect not in _MIGRATIONS_BY_DIALECT:
+            raise ValueError(
+                f"no usage ledger schema for dialect {dialect!r}; "
+                f"known: {', '.join(_MIGRATIONS_BY_DIALECT)}"
+            )
+        self._migrations = _MIGRATIONS_BY_DIALECT[dialect]
+        # What the disable notice names: the file, or the backend (never a url).
+        self._where = str(path) if path is not None else dialect
+        self._relational = relational
         self._lock = threading.Lock()  # guards the three fields below
         self._migrated = False
         self._disabled = False
@@ -115,7 +185,7 @@ class Store:
                 model_id: BackoffEntry(model_id, failures, _parse(until))
                 for model_id, failures, until in rows
             }
-        except (sqlite3.Error, OSError, SchemaTooNewError, ValueError) as exc:
+        except _database_errors() as exc:
             self._disable(exc)
             return {}
 
@@ -132,6 +202,9 @@ class Store:
             return
         try:
             with closing(self._connect()) as conn:
+                # On Postgres this is also the cross-process advisory lock: it makes
+                # the read-then-write in `_update_backoff` atomic, so two processes
+                # cannot both read `failures = n` and both write `n + 1`.
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     self._insert_call(conn, call)
@@ -142,7 +215,7 @@ class Store:
                     conn.execute("ROLLBACK")
                     raise
                 conn.execute("COMMIT")
-        except (sqlite3.Error, OSError, SchemaTooNewError, ValueError) as exc:
+        except _database_errors() as exc:
             self._disable(exc)
 
     def pop_notice(self) -> str | None:
@@ -155,30 +228,31 @@ class Store:
             return self._disabled
 
     def _disable(self, exc: Exception) -> None:
-        # Type only: a sqlite3 message can quote file content.
+        # Type only: a sqlite3 message can quote file content, and a Postgres one
+        # names host and user or quotes the failing row.
         with self._lock:
             if self._disabled:
                 return
             self._disabled = True
             self._notice = (
-                f"usage database unavailable ({type(exc).__name__}): {self._path}; "
+                f"usage database unavailable ({type(exc).__name__}): {self._where}; "
                 "usage and backoff are not saved"
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self) -> Any:
         with self._lock:
             migrated = self._migrated
         if not migrated:
             # Concurrent first callers may both migrate; the second is a no-op.
             self._relational.migrate_sync(
-                _NAMESPACE, _MIGRATIONS, adopt_user_version=True
+                _NAMESPACE, self._migrations, adopt_user_version=True
             )
             with self._lock:
                 self._migrated = True
         return self._relational.connect_sync()
 
     @staticmethod
-    def _insert_call(conn: sqlite3.Connection, call: CallRecord) -> None:
+    def _insert_call(conn: Any, call: CallRecord) -> None:
         conn.execute(
             "INSERT INTO llm_calls (time, model_id, provider_id, input_tokens, "
             "output_tokens, reasoning_tokens, cost_usd, seconds, outcome, "
@@ -200,7 +274,7 @@ class Store:
 
     @staticmethod
     def _update_backoff(
-        conn: sqlite3.Connection,
+        conn: Any,
         call: CallRecord,
         backoff: BackoffAction,
         attempt_started: datetime,

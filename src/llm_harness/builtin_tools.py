@@ -1,6 +1,6 @@
 """The tools that ship with the program, and the registry built from them."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
@@ -17,6 +17,7 @@ from llm_harness.tools import (
 
 if TYPE_CHECKING:
     from llm_harness.command_executor import CommandExecutor
+    from llm_harness.embeddings import Embedder
     from llm_harness.web_fetcher import WebFetcher
     from llm_harness.web_search import SearchProvider
 
@@ -78,6 +79,10 @@ _MEMORY_TOOL_NAMES = frozenset(
     {"memory_search", "memory_save", "memory_update", "memory_forget"}
 )
 _COMMAND_TOOL_NAME = "run_command"
+MEMORY_VECTORS_NEEDS_MEMORY = (
+    "memory vector search is off: [tools] memory_vectors = true needs "
+    "[tools] memory = true and a user_id"
+)
 MEMORY_NEEDS_USER_ID = (
     "memory is off: [tools] memory = true needs user_id, but user_id is not set; "
     'add user_id = "your-name" at the top of config.toml'
@@ -110,6 +115,8 @@ def build_tool_registry(
     command_executor: "CommandExecutor | None" = None,
     memory: bool = False,
     user_id: str | None = None,
+    memory_vectors: bool = False,
+    embedder_factory: "Callable[[], Embedder] | None" = None,
 ) -> ToolRegistry:
     """The registry of built-in tools; every tool name in `agents` must exist.
 
@@ -119,6 +126,9 @@ def build_tool_registry(
     when `run_command` is on. The memory tools are registered only when `memory` is on
     and `user_id` is set (memory is per user); with `memory` on and no `user_id` the
     registry says so in `notes` and a `memory_*` name in `agents` gets a hint.
+    `memory_vectors` and `embedder_factory` add vector search to the memory tools; the
+    factory is only called on first use. `memory_vectors` without `memory` (or without
+    `user_id`) is a note, not an error.
     """
     registry = ToolRegistry()
     registry.register(ToolSearchTool(registry))
@@ -156,10 +166,15 @@ def build_tool_registry(
     if memory and user_id is not None:
         from llm_harness.memory_tools import MemoryTools
 
-        for memory_tool in MemoryTools().tools():
+        memory_tools = MemoryTools(
+            vectors=memory_vectors, embedder_factory=embedder_factory
+        )
+        for memory_tool in memory_tools.tools():
             registry.register(memory_tool)
     elif memory:
         registry.notes.append(MEMORY_NEEDS_USER_ID)
+    if memory_vectors and not (memory and user_id is not None):
+        registry.notes.append(MEMORY_VECTORS_NEEDS_MEMORY)
     known = registry.names()
     for agent in agents:
         for field, names in (("tools", agent.tools), ("deny", agent.deny)):

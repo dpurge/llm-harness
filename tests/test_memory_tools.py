@@ -15,8 +15,8 @@ from llm_harness.inspect_state import tools_text
 from llm_harness.memory import MemoryStore, MemoryValidationError
 from llm_harness.memory_tools import MemoryTools
 from llm_harness.storage import Storage, open_storage
-from llm_harness.tools import ToolContext, ToolRegistry, tool_prompts
-from llm_harness.types import StatusEvent
+from llm_harness.tools import ToolContext, ToolRegistry, tool_notifies, tool_prompts
+from llm_harness.types import Done, Notice, StatusEvent, TextDelta
 from tests.fake_steps import reply_events
 from tests.test_builtin_tools import agent_with
 from tests.test_config import PROVIDER_TOML, load_config, load_error, write_config
@@ -102,7 +102,8 @@ async def test_save_search_update_forget_round_trip(
         tools, "memory_update", ctx, id=1, keywords=["metric", "units"]
     )
     assert updated == (
-        "updated memory #1 (created 2026-11-02T09:30:15Z, updated 2026-11-02T10:30:15Z)"
+        "updated memory #1: Prefers metric units. (keywords: metric, units; "
+        "created 2026-11-02T09:30:15Z, updated 2026-11-02T10:30:15Z)"
     )
     found = await invoke(tools, "memory_search", ctx, query="units")
     assert found == "#1 [metric, units] (2026-11-02T10:30:15Z) Prefers metric units."
@@ -179,15 +180,15 @@ def test_one_memory_store_is_shared_per_relational_store(
     storage: Storage, tmp_path: Path
 ) -> None:
     holder = MemoryTools()
-    first = holder.store_for(storage.relational)
+    first = holder.store_for(storage)
     assert isinstance(first, MemoryStore)
-    assert holder.store_for(storage.relational) is first
+    assert holder.store_for(storage) is first
     other = open_storage(
         StorageConfig(vector=VectorConfig(backend="none")),
         tmp_path / "other",
         relational_path=tmp_path / "other.db",
     )
-    assert holder.store_for(other.relational) is not first
+    assert holder.store_for(other) is not first
 
 
 def test_all_four_tools_share_one_holder_and_declare_the_gate() -> None:
@@ -349,6 +350,102 @@ def test_prompts_defaults_to_true_and_only_false_skips_the_prompt() -> None:
     stub.prompts = False
     ToolRegistry().register(stub)
     assert tool_prompts(stub) is False
+
+
+def no_reflection() -> list:
+    body = '{"action": "none", "id": null, "text": null, "keywords": null}'
+    return [TextDelta(text=body), Done()]
+
+
+def updating_script(**arguments: object) -> list:
+    return [
+        reply_events(call("memory_update", **arguments), SET_GOAL),
+        reply_events(RESPOND),
+        no_reflection(),
+    ]
+
+
+async def update_notices(
+    storage: Storage, clock: FakeClock, approver: FakeApprover, **arguments: object
+) -> list[str]:
+    orchestrator, _ = make(
+        updating_script(**arguments),
+        tools=memory_registry(clock),
+        approver=approver,
+        storage=storage,
+        user_id="alice",
+    )
+    return [e.text for e in await run(orchestrator, "hi") if isinstance(e, Notice)]
+
+
+async def test_a_memory_update_shows_the_stored_text_and_asks_nothing(
+    storage: Storage, clock: FakeClock
+) -> None:
+    await MemoryStore(storage.relational, clock).save("alice", "Old text.", ["a"])
+    approver = FakeApprover(True)
+    notices = await update_notices(
+        storage, clock, approver, id=1, text="Prefers metric units."
+    )
+    assert approver.requests == []
+    (notice,) = notices
+    assert notice.startswith("updated memory #1: Prefers metric units. (keywords: a;")
+
+
+async def test_a_keywords_only_update_shows_the_unchanged_stored_text(
+    storage: Storage, clock: FakeClock
+) -> None:
+    await MemoryStore(storage.relational, clock).save("alice", "Old text.", ["a"])
+    (notice,) = await update_notices(
+        storage, clock, FakeApprover(True), id=1, keywords=["b", "c"]
+    )
+    assert notice.startswith("updated memory #1: Old text. (keywords: b, c;")
+
+
+async def test_a_missing_memory_update_notice_claims_no_stored_text(
+    storage: Storage, clock: FakeClock
+) -> None:
+    # `no memory #99` is a normal tool result, so the generic notice shows it as is.
+    approver = FakeApprover(True)
+    notices = await update_notices(storage, clock, approver, id=99, text="x")
+    assert notices == ["no memory #99"]
+    assert approver.requests == []
+
+
+async def test_invalid_memory_update_arguments_yield_no_notice(
+    storage: Storage, clock: FakeClock
+) -> None:
+    approver = FakeApprover(True)
+    assert await update_notices(storage, clock, approver, id="nope") == []
+    assert approver.requests == []
+
+
+async def test_a_memory_save_yields_no_result_notice(
+    storage: Storage, clock: FakeClock
+) -> None:
+    orchestrator, _ = make(
+        [*saving_script(), no_reflection()],
+        tools=memory_registry(clock),
+        storage=storage,
+        user_id="alice",
+    )
+    events = await run(orchestrator, "hi")
+    assert [e for e in events if isinstance(e, Notice)] == []
+
+
+@pytest.mark.parametrize("value", ["no", 0, None, 1])
+def test_check_tool_rejects_a_non_bool_notify_result(value: object) -> None:
+    stub = StubTool("act")
+    stub.notify_result = value
+    with pytest.raises(TypeError, match="notify_result must be a bool"):
+        ToolRegistry().register(stub)
+
+
+def test_notify_result_defaults_to_false() -> None:
+    stub = StubTool("act")
+    assert tool_notifies(stub) is False
+    stub.notify_result = True
+    ToolRegistry().register(stub)
+    assert tool_notifies(stub) is True
 
 
 # --- the flag and the registry -------------------------------------------------

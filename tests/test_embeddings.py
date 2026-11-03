@@ -1,10 +1,14 @@
 """Embedder behaviour, tested against the fake embedding provider."""
 
+import asyncio
+import time
+
 import pytest
 
+from llm_harness import embeddings
 from llm_harness.config import ModelConfig
 from llm_harness.embeddings import Embedder, EmbeddingError
-from tests.fakes import FakeEmbedder
+from tests.fakes import FakeEmbedder, HangingEmbedder
 
 
 def model(dimensions: int | None = None) -> ModelConfig:
@@ -81,3 +85,40 @@ async def test_provider_error_propagates_with_its_kind_and_is_not_retried() -> N
     assert info.value.kind == "rate_limit"
     assert str(info.value) == "slow down"
     assert len(fake.calls) == 1
+
+
+async def test_a_provider_that_never_answers_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(embeddings, "EMBED_TIMEOUT_SECONDS", 0.05)
+    hanging = HangingEmbedder()
+    started = time.monotonic()
+    with pytest.raises(EmbeddingError) as info:
+        await Embedder(hanging, model()).embed(["x"])
+    assert time.monotonic() - started < 1
+    assert info.value.kind == "connection"
+    assert "bge-m3-local" in str(info.value)
+    assert "0.05 seconds" in str(info.value)
+    assert isinstance(info.value.__cause__, TimeoutError)
+    assert len(hanging.calls) == 1
+
+
+async def test_cancelling_the_caller_is_not_turned_into_an_embedding_error() -> None:
+    hanging = HangingEmbedder()
+    task = asyncio.create_task(Embedder(hanging, model()).embed(["x"]))
+    while not hanging.calls:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_a_fast_provider_is_unaffected_by_the_timeout() -> None:
+    embedder = Embedder(FakeEmbedder(size=6), model())
+    vectors = await embedder.embed(["a", "bbb"])
+    assert vectors == [[1.0 + i for i in range(6)], [3.0 + i for i in range(6)]]
+    assert embedder.dimension == 6
+
+
+def test_the_default_timeout_is_sixty_seconds() -> None:
+    assert embeddings.EMBED_TIMEOUT_SECONDS == 60

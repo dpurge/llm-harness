@@ -79,15 +79,25 @@ base_url = "http://localhost:11434"
 # Where data lives; every key is optional and the values below are what you
 # get when you write nothing. Paths must be absolute (or start with ~).
 # Write these tables after user_id.
-# Relational data (usage ledger): "sqlite" is the only backend available now.
+# Relational data (usage ledger): "sqlite" (a local file) or "postgres".
 # [storage.relational]
-# backend = "sqlite"
-# path = "/absolute/path/harness.db"   # default: ~/.local/share/llm-harness/harness.db
+# backend = "sqlite"                   # or "postgres"
+# path = "/absolute/path/harness.db"   # sqlite only; default: ~/.local/share/llm-harness/harness.db
+# url = "postgresql://user@db.example:5432/llm_harness"   # postgres only, required; no password in it
 
-# Vector search: "qdrant-edge" (local), or "none" to turn vector search off.
+# Vector search: "qdrant-edge" (local files), "qdrant" (a qdrant server),
+# "pgvector" (PostgreSQL with the pgvector extension) or "none" to turn vector
+# search off.
 # [storage.vector]
-# backend = "qdrant-edge"              # or "none" to turn vector search off
-# path = "/absolute/path"              # default: ~/.local/share/llm-harness/vectors
+# backend = "qdrant-edge"              # or "qdrant", "pgvector", or "none"
+# path = "/absolute/path"              # qdrant-edge only; default: ~/.local/share/llm-harness/vectors
+# url = "http://127.0.0.1:6333"        # qdrant and pgvector only, required; no password in it
+# The qdrant backend needs the optional package: uv sync --extra remote.
+# If the server requires an API key, put it in secrets.toml next to this file
+# (see the README, "Remote qdrant"), never in this file.
+# The pgvector backend needs the optional package: uv sync --extra postgres, and
+# a url like "postgresql://user@db.example:5432/database"; its password goes in
+# secrets.toml under [postgres] (see the README, "pgvector").
 
 # Files: "local" is the only backend available now.
 # [storage.files]
@@ -260,9 +270,10 @@ Rules:
 
 ### Embedding models
 
-An embedding model turns text into vectors. It is meant for tool search and RAG,
-which are planned; nothing calls it yet, so configuring one changes no chat
-behaviour today. It is an ordinary entry in `models.yaml` with the tag
+An embedding model turns text into vectors. Today only the agent memory uses it,
+and only when `[tools] memory_vectors = true` (see Vector search below); tool
+search and RAG are planned. Configuring one does not change chat behaviour. It is
+an ordinary entry in `models.yaml` with the tag
 `embedding`, on a provider from `config.toml`. This is the entry in the example
 file, commented out between the markers `# --- embedding example: begin ---` and
 `# --- embedding example: end ---`:
@@ -313,6 +324,9 @@ Rules:
   cannot be compared. The one with the highest `priority` is used; two at the
   same top priority are an error (`several embedding models share the top
   priority <n>: <ids>`).
+- An embedding call that gets no answer within 60 seconds fails as a connection
+  error (`embedding model <id> did not answer within 60 seconds`). There is no
+  config key for the 60 seconds. Chat is not affected.
 - `dimensions` is optional and must be a positive integer (`0` is rejected). It
   is sent to the provider only when set, so leave it out to keep the model's own
   size; the model must support the value you ask for. The argument names are
@@ -328,12 +342,14 @@ key is optional; this is what you get when it is absent (`<data dir>` is
 
 ```toml
 # [storage.relational]
-# backend = "sqlite"                    # the only backend available now
-# path = "/absolute/path/harness.db"    # default: <data dir>/harness.db
+# backend = "sqlite"                    # or "postgres"
+# path = "/absolute/path/harness.db"    # sqlite only; default: <data dir>/harness.db
+# url = "postgresql://user@db.example:5432/llm_harness"   # postgres only, required; no password in it
 
 # [storage.vector]
-# backend = "qdrant-edge"               # or "none" to turn vector search off
-# path = "/absolute/path"               # default: <data dir>/vectors
+# backend = "qdrant-edge"               # or "qdrant", "pgvector", or "none" to turn vector search off
+# path = "/absolute/path"               # qdrant-edge only; default: <data dir>/vectors
+# url = "http://127.0.0.1:6333"         # qdrant and pgvector only, required; no password in it
 
 # [storage.files]
 # backend = "local"                     # the only backend available now
@@ -342,19 +358,68 @@ key is optional; this is what you get when it is absent (`<data dir>` is
 
 - Paths must be absolute or start with `~`. Like `user_id`, a `[storage...]`
   header closes the tables above it, so write it after `user_id`.
-- `postgres` (relational) and `qdrant` (vector) are recognised but not
-  available yet: the program stops with an error that names the backend and
-  `storage-backends-remote`. An unknown backend is an error that lists the
-  valid values, and an unknown key is an error too.
+- An unknown backend is an error that lists the valid values (for the relational
+  store: `sqlite, postgres`), and an unknown key is an error too.
+- Relational keys: `backend` is `sqlite` (the default) or `postgres`. `path` is
+  for `sqlite` only. `url` is for `postgres` only and is required with it: a
+  `postgresql://` or `postgres://` address with exactly one host, one database
+  name as the path (`/llm_harness`), an optional port from 1 to 65535, and
+  optionally a user name (`user@host`). A password in the `url` (`user:pass@`)
+  is refused: credentials do not belong in `config.toml` (the password goes in
+  `secrets.toml`, see Postgres, step 5). The query string may hold only
+  `sslmode` (`disable`, `allow`, `prefer`, `require`, `verify-ca`,
+  `verify-full`) and `connect_timeout` (1 to 120 seconds); any other parameter
+  is refused, even `password` or `options`. `postgres` with a `path`, or
+  `sqlite` with a `url`, is an error. For `postgres` the checks run in this
+  order: `url` missing, `path` set, `url` format, package installed. No message
+  repeats the `url`, the host or the user name.
+- Vector keys: `backend` is `qdrant-edge` (the default), `qdrant`, `pgvector` or
+  `none`. `path` is for `qdrant-edge` only. `url` is for `qdrant` and `pgvector`
+  only and is required with both. For `qdrant` it is an absolute `http://` or
+  `https://` URL with a host and no `user:pass@` in it. For `pgvector` it follows
+  the same rules as the relational `postgres` `url` above (`postgresql://` or
+  `postgres://`, one host, one database name, an optional port, a user name but
+  no password, only `sslmode` and `connect_timeout` in the query string, no
+  fragment, no whitespace). `qdrant` or `pgvector` with a `path`, or
+  `qdrant-edge` or `none` with a `url`, is an error. For `qdrant` and `pgvector`
+  the checks run in this order: `url` missing, `path` set, `url` format, package
+  installed. The unknown-backend message lists `qdrant-edge, qdrant, pgvector,
+  none`.
 - Nothing is created at startup. Each directory and file appears on first use,
   with directory mode 0700 and file mode 0600.
 - The usage ledger honours `[storage.relational] path`. On the first start with
   this version, an existing ledger file only gets a new `schema_versions` table;
   its rows are not touched and no backup copy is made.
-- The vector store is held open by one llm-harness process at a time. A second
-  process reports that the vector store is in use by another llm-harness
-  process and continues without it.
-- `qdrant-edge-py` (a native wheel of about 11 MB) is now a base dependency.
+- With `qdrant-edge` the vector store is held open by one llm-harness process at
+  a time. A second process reports that the vector store is in use by another
+  llm-harness process and continues without it. This limit does not apply to
+  `qdrant`: the lock error is raised by the `qdrant-edge` backend only.
+- `qdrant-edge-py` (a native wheel of about 11 MB) is a base dependency.
+  `qdrant-client`, which the `qdrant` backend needs, is an optional extra named
+  `remote` (`uv sync --extra remote`); it is also in the `dev` dependency group,
+  so the tests can use it.
+- `psycopg` (the PostgreSQL driver), which the `postgres` relational backend
+  needs, is an optional extra named `postgres` (`uv sync --extra postgres`); it
+  is also in the `dev` dependency group, so a plain `uv sync` in a clone of this
+  repository already installs it. The `pgvector` vector backend needs the same
+  extra `postgres`: there is no new extra and no new dependency (the `pgvector`
+  Python package is not needed).
+
+Which relational backend?
+
+| `backend` | Where the usage ledger lives | Needs | Good for |
+| --- | --- | --- | --- |
+| `sqlite` (default) | One local file under `path` | Nothing extra | One computer, no server |
+| `postgres` | A PostgreSQL server you run, at `url` | The extra `postgres`, a running server and a password if the server wants one | Keeping the usage ledger (every model call and the per-model backoff) and `--storage-status` on a server, and agent memory (search is PostgreSQL full-text search; see Postgres, step 8) |
+
+Which vector backend?
+
+| `backend` | Where vectors live | Needs | Good for |
+| --- | --- | --- | --- |
+| `qdrant-edge` (default) | Local files under `path` | Nothing extra | One computer, one llm-harness process at a time, no server |
+| `qdrant` | A qdrant server you run, at `url` | The extra `remote` and a running server | A server shared by several processes or computers |
+| `pgvector` | A PostgreSQL database with the pgvector extension, at `url` | The extra `postgres`, a running server with pgvector installed, and an administrator who creates the extension once (see pgvector, step 2) | A server shared by several processes or computers when you already run PostgreSQL. Exact search, so it slows down as a collection grows. Works with SQLite as the relational store, so agent memory keeps working |
+| `none` | Nowhere | Nothing | Vector search off |
 
 `llm-harness --storage-status` prints the state of the three stores and exits.
 It needs no model and no terminal, and it creates nothing. Sample output
@@ -375,6 +440,806 @@ expects 1)`, `schema: legacy file (user_version 1), it will be migrated on the
 next start`, `collection tools: 4 dimensions, cosine, free` or `collection
 tools: locked (in use by another llm-harness process)`.
 
+With `[storage.relational] backend = "postgres"` the first lines read
+`relational: postgres  <host:port/database>` and a `schema:` line, and this
+command contacts the Postgres server read-only (see Postgres, step 6). With
+`[storage.vector] backend = "pgvector"` the vector lines read
+`vector: pgvector  <host:port/database>` followed by the state of the extension
+and of the collections, and this command contacts that server read-only too (see
+pgvector, step 6).
+
+#### Remote qdrant (step by step)
+
+`backend = "qdrant"` keeps the vectors on a qdrant server that you run yourself,
+instead of in local files. This is for the memory vector search only (see Vector
+search). You do not need it for anything else; skip this section if the default
+`qdrant-edge` is enough.
+
+1. What you need:
+   - A running qdrant server. Step 2 shows how to start one with Docker. Docker
+     runs a program in a container, an isolated process with its own files; if
+     you already have a qdrant server, skip step 2 and use its address.
+   - The optional package `qdrant-client` (step 3).
+   - For memory vector search: `[tools] memory = true`, `memory_vectors = true`,
+     a `user_id` and an embedding model (see Agent memory and Vector search).
+
+2. Start a server for a first try (qdrant 1.20.0 was used to check this feature;
+   the image is `qdrant/qdrant`). Run this in the folder where you want the data
+   kept:
+
+   ```sh
+   mkdir -p qdrant_storage
+   docker run -d --name llm-harness-qdrant \
+     -p 127.0.0.1:6333:6333 \
+     -v "$PWD/qdrant_storage:/qdrant/storage" \
+     qdrant/qdrant
+   curl -s http://127.0.0.1:6333/healthz
+   ```
+
+   The last command prints `healthz check passed` when the server is ready (it
+   may need a few seconds after `docker run`). `-p 127.0.0.1:6333:6333` makes the
+   server reachable from this computer only; without `127.0.0.1:` other
+   computers on your network could reach it. The folder `qdrant_storage` keeps
+   the data. To stop and remove the container (the data stays in the folder):
+
+   ```sh
+   docker stop llm-harness-qdrant && docker rm llm-harness-qdrant
+   ```
+
+   To make the server demand an API key, add `-e QDRANT__SERVICE__API_KEY=<your-key>`
+   to the `docker run` command. Checked with qdrant 1.20.0 (not a guarantee for
+   other versions or servers): a server started this way answers HTTP 401 to a
+   request without the key and to a wrong key, and HTTP 200 when the key is sent
+   in the `api-key` header, which the program does for you once the key is in
+   `secrets.toml` (step 5).
+
+3. Make sure the optional package `qdrant-client` is installed. In a clone of
+   this repository the plain `uv sync` from the Quick start already installs it,
+   because it is also in the `dev` dependency group. Run this command to make it
+   explicit; you need it when you install without the dev group or install the
+   program as a package:
+
+   ```sh
+   uv sync --extra remote
+   ```
+
+   Note that after `uv sync --no-dev` a plain `uv run llm-harness ...` installs
+   the dev group again (it contains `qdrant-client`) and then works. If the
+   package is missing (`uv run --no-dev llm-harness ...`, `uv run --no-sync`, or
+   the program installed as a package without the dev group), choosing `qdrant`
+   stops the program with a message that names this command (see the table
+   below).
+
+4. Edit `~/.config/llm-harness/config.toml` (the folder that holds `config.toml`,
+   `models.yaml` and `agents.yaml`; see Configuration). Write the table after
+   `user_id` (if you have one), like `[storage...]`:
+
+   ```toml
+   [storage.vector]
+   backend = "qdrant"
+   url = "http://127.0.0.1:6333"
+   ```
+
+   Do not write `path` here and do not put a user name, password or key in the
+   `url`.
+
+5. Only if the server was started with an API key: put the key in
+   `~/.config/llm-harness/secrets.toml`, never in `config.toml`. The folder and
+   the name are fixed; there is no way to move the file. The file holds this key
+   (and the Postgres password, if you also use that: see Postgres, step 5).
+   Without the file the program sends no key, which is right for a server that
+   needs none. The file is read only when `backend = "qdrant"` or `"pgvector"`, or
+   the relational `backend = "postgres"`.
+
+   ```sh
+   mkdir -p ~/.config/llm-harness
+   cat > ~/.config/llm-harness/secrets.toml <<'EOF'
+   [qdrant]
+   api_key = "your-key-here"
+   EOF
+   chmod 600 ~/.config/llm-harness/secrets.toml
+   ```
+
+   Replace `your-key-here` with the real key. The `chmod 600` is required: a
+   file that group or other users can read is refused. The key must be a
+   non-empty string without spaces at the start or end and without control
+   characters.
+
+6. Check the settings:
+
+   ```sh
+   uv run llm-harness --storage-status
+   ```
+
+   The vector line must read like this (the other lines are as in the sample
+   above):
+
+   ```text
+   vector: qdrant  http://127.0.0.1:6333  (remote server, not contacted by --storage-status)
+   ```
+
+   This command never contacts the server, so it cannot tell you the server is
+   up (use the `curl` command of step 2 for that), and it never prints the key.
+   It does read `secrets.toml` (loading the config reads it for backend
+   `qdrant`), so it reports a broken or too-open secrets file with the same
+   messages as the table below: a quick way to check the file without starting
+   the chat. Memory vector search contacts the server the first time it needs it.
+
+7. If something is wrong, the program stops at start with `error: ` followed by
+   one of these messages, or shows the runtime message:
+
+   | Message | Meaning | Fix |
+   | --- | --- | --- |
+   | `invalid config.toml: storage.vector: backend "qdrant" requires url, for example url = "https://qdrant.example:6333"` | `backend = "qdrant"` without `url` | Add `url` |
+   | `invalid config.toml: storage.vector: path is only used with a local backend, not "qdrant"` | `path` is set together with `qdrant` | Remove `path` |
+   | `invalid config.toml: storage.vector: url is only used with backend = "qdrant" or "pgvector"` | `url` is set with `qdrant-edge` or `none` | Remove `url` or set `backend = "qdrant"` (or `"pgvector"`, see pgvector) |
+   | `invalid config.toml: storage.vector: url must be an absolute http:// or https:// URL with a host, for example https://qdrant.example:6333` | The `url` is not a full web address | Write it as `http://host:port` or `https://host:port` |
+   | `invalid config.toml: storage.vector: url must not contain credentials (user:pass@); credentials do not belong in config.toml` | The `url` holds a user name or password | Remove it; put an API key in `secrets.toml` (step 5) |
+   | `invalid config.toml: storage.vector: backend "qdrant" needs the optional extra remote, which is not installed; run: uv sync --extra remote` | `qdrant-client` is missing. You only see this with `uv run --no-dev ...`, `uv run --no-sync ...` or a program installed as a package without the dev group (a plain `uv run` installs the dev group again) | Run `uv sync --extra remote` |
+   | `invalid secrets.toml: <path> is accessible by group or other users; run: chmod 600 <path>` | Others can read `secrets.toml` | Run the `chmod 600` command shown |
+   | `invalid secrets.toml: <path> is not a regular file` | `secrets.toml` is a folder or another special file | Replace it with a plain file |
+   | `invalid secrets.toml: unknown table [<name>] in <path>; valid tables: qdrant, postgres` | A table name is wrong, for example `[qdrnt]` | Write `[qdrant]` (or `[postgres]`) |
+   | `invalid secrets.toml: unknown key '<name>' in [qdrant] of <path>; valid keys: api_key` | A key name is wrong | Write `api_key` |
+   | `invalid secrets.toml: [qdrant] api_key in <path> is empty` | The key is empty | Write the real key |
+   | `invalid secrets.toml: [qdrant] api_key in <path> has leading or trailing whitespace` | A space around the key | Remove it |
+   | `invalid secrets.toml: [qdrant] api_key in <path> contains a newline or other control character` | A control character in the key | Retype the key on one line |
+   | `invalid secrets.toml: [qdrant] api_key in <path> must be a string, not <type>` | The key is not in quotes | Write `api_key = "..."` |
+   | `cannot parse <path>: <position>` | `secrets.toml` is not valid TOML | Fix the line and column named |
+   | `warning: the qdrant api key is sent unencrypted to <host> over plain http; use an https:// url in [storage.vector] to protect it` | A key is configured and the `url` starts with `http://`. A warning only: the program continues. It is printed once to stderr at start | Use an `https://` url if the server is not on this computer |
+   | `memory vector search is off: <reason>; keyword search only` | A vector call failed, for example the server is not running. Shown once; keyword search continues. The reason starts with the error type, for example `VectorStoreError: vector store failed on collection ...` | Start the server, then run `/memory reindex` in the chat (it retries) |
+   | `vector store failed on collection '<name>': <ExceptionType> (HTTP <code>)` | The server answered with an error, or did not answer; `(HTTP <code>)` is shown only when there was an answer. The message never holds the url, the key or the server's reply | Look at the server's own log |
+   | `vector store failed on collection '<name>': UnexpectedResponse (HTTP 401)` | The server wants an API key and got none or a wrong one. Through memory search it shows inside the one notice, as `memory vector search is off: VectorStoreError: vector store failed on collection ...` | Put the right key in `secrets.toml` as in step 5, with mode 600; check that it is the key the server was started with |
+   | `unknown collection '<name>': call ensure_collection first` | The server answered HTTP 404 to a data call: the collection does not exist on it, for example on a new or wiped server | See step 8 |
+
+   The key is never printed in a message; if it is shown anywhere it appears as
+   `[REDACTED:api_key]`. A connection that gets no answer fails after 10
+   seconds (a fixed value, not a config key).
+
+8. Switching backends and servers. The vectors are NOT moved when you change
+   `[storage.vector]`. The program remembers which notes already have a vector
+   in a SQLite table, `memory_vectors`, in the file given by `[storage.relational]
+   path` (default `~/.local/share/llm-harness/harness.db`). After you switch
+   from `qdrant-edge` to `qdrant` (or back), or point `url` at another server or
+   at a server that was wiped, those marks still say "indexed":
+
+   - `/memory reindex` answers `reindexed 0 of 0 memories` (its normal answer
+     when nothing is unindexed).
+   - Notes saved before the switch are NOT found by vector search in the new
+     store. Keyword search still finds them. New and updated notes are indexed
+     normally.
+
+   Workaround: clear the marks, then run `/memory reindex`. A proper
+   `/memory reindex --all` is planned (roadmap item `memory-reindex-all`); this
+   is a stop-gap until then:
+
+   1. Stop llm-harness, so that nothing else holds the database.
+   2. Optional: copy the file first.
+
+      ```sh
+      cp ~/.local/share/llm-harness/harness.db ~/harness.db.bak
+      ```
+
+   3. Clear the marks:
+
+      ```sh
+      sqlite3 ~/.local/share/llm-harness/harness.db "DELETE FROM memory_vectors;"
+      ```
+
+      If you set `[storage.relational] path`, use that file instead. The
+      `sqlite3` command-line tool must be installed; if your system has no
+      `sqlite3` command, you need to install it. The statement prints nothing
+      when it works.
+   4. Start llm-harness and type `/memory reindex` in the chat. It answers
+      `reindexed N of N memories`.
+
+   The statement removes only the marks, for all users and all embedding models
+   in that file, and never the notes; the notes are embedded again from SQLite.
+   The cost is one embedding per note (16 notes per call to the embedding
+   model), so a large set of notes takes a while and costs what your embedding
+   provider charges.
+
+9. Security notes for the remote backend:
+   - All users' vectors of one collection live on the server. The program
+     separates them with a `user_id` filter in its queries. That is NOT access
+     control on the server: anyone who can reach the server, or holds its API
+     key, can read every user's vectors. Protect the server with an API key, use
+     `https://`, and keep it behind a firewall or bound to `127.0.0.1` as in
+     step 2.
+   - Plain `http://` with a key is allowed, but the key then travels unencrypted
+     (the warning in the table). Use `https://` for any server that is not on
+     this computer. The client library itself also prints a warning, `Api key is
+     used with an insecure connection`, for plain http with a key.
+   - The text of a note is sent to the embedding model, as without qdrant. The
+     qdrant server gets the vector, the `user_id` and the note id, not the note
+     text.
+   - Keep `secrets.toml` at mode 600 and out of git and backups you share.
+
+10. Undo: set `backend` back to `qdrant-edge` (or `none`) and remove the `url`
+    line; nothing else changes. The vectors on the server stay there until you
+    delete them.
+
+#### Postgres (step by step)
+
+`[storage.relational] backend = "postgres"` keeps the usage ledger (the table of
+every model call and the per-model backoff) and the schema versions on a
+PostgreSQL server that you run yourself, instead of in the SQLite file.
+`--storage-status` reports it. Agent memory also works on Postgres (`[tools]
+memory = true`): the notes are stored on the server and searched with PostgreSQL
+full-text search, which differs from SQLite in a few ways (step 8). You do not
+need Postgres for anything else; skip this section if the default `sqlite` is
+enough.
+
+1. What you need:
+   - A running PostgreSQL server. Step 2 shows how to start one with Docker.
+     Docker runs a program in a container, an isolated process with its own
+     files; if you already have a PostgreSQL server, skip step 2 and use its
+     address, database name and user name.
+   - The optional package `psycopg`, the PostgreSQL driver (step 3).
+   - The password of the database user, if the server asks for one (step 5).
+
+2. Start a server for a first try (PostgreSQL 17.11 was used to check this
+   feature; the image is `postgres:17`). Run this in the folder where you want
+   the data kept:
+
+   ```sh
+   mkdir -p postgres_data
+   docker run -d --name llm-harness-postgres \
+     -e POSTGRES_PASSWORD=your-password-here \
+     -e POSTGRES_DB=llm_harness \
+     -p 127.0.0.1:5432:5432 \
+     -v "$PWD/postgres_data:/var/lib/postgresql/data" \
+     postgres:17
+   docker exec llm-harness-postgres pg_isready -U postgres -d llm_harness
+   ```
+
+   Replace `your-password-here` with a real password of your own choice, and
+   remember it: the same password goes into `secrets.toml` in step 5. The last
+   command asks the server whether it accepts connections. While the server is
+   still starting it can answer `/var/run/postgresql:5432 - no response` (exit
+   code 2); once it is ready it answers `/var/run/postgresql:5432 - accepting
+   connections` (exit code 0). If it does not answer at once, wait a few seconds
+   and run it again.
+   `-p 127.0.0.1:5432:5432` makes the server reachable from this computer only;
+   without `127.0.0.1:` other computers on your network could reach it.
+   `POSTGRES_DB=llm_harness` creates the database `llm_harness`. The user name is
+   `postgres` (the default of the image), so the address of this server is
+   `postgresql://postgres@127.0.0.1:5432/llm_harness` (step 4). The folder
+   `postgres_data` keeps the data. To stop and remove the container (the data
+   stays in the folder):
+
+   ```sh
+   docker stop llm-harness-postgres && docker rm llm-harness-postgres
+   ```
+
+3. Make sure the optional package `psycopg` is installed. In a clone of this
+   repository the plain `uv sync` from the Quick start already installs it,
+   because it is also in the `dev` dependency group. Run this command to make it
+   explicit; you need it when you install without the dev group or install the
+   program as a package:
+
+   ```sh
+   uv sync --extra postgres
+   ```
+
+   Checked with four scratch runs: after `uv sync --no-dev`, `uv run --no-dev`
+   finds no `psycopg`; after `uv sync --no-dev --extra postgres` it finds it;
+   after `uv sync --extra postgres`, a plain `uv run` finds it; and a plain
+   `uv sync` finds it (dev group). Note that after `uv sync --no-dev` a plain
+   `uv run llm-harness ...` silently installs the dev group again (it contains
+   `psycopg`) and then works. If the package is missing (`uv run --no-dev
+   llm-harness ...`, `uv run --no-sync`, or the program installed as a package
+   without the dev group), choosing `postgres` stops the program with a message
+   that names this command (see the table below).
+
+4. Edit `~/.config/llm-harness/config.toml` (the folder that holds `config.toml`,
+   `models.yaml` and `agents.yaml`; see Configuration). Write the table after
+   `user_id` (if you have one), like `[storage...]`:
+
+   ```toml
+   [storage.relational]
+   backend = "postgres"
+   url = "postgresql://postgres@127.0.0.1:5432/llm_harness"
+   ```
+
+   The parts of the `url`: the user name (`postgres`), the host (`127.0.0.1`),
+   the port (`5432`; leave it out for 5432) and the database (`llm_harness`).
+   Do not write `path` here and do not put a password in the `url`
+   (`user:pass@` is refused). Optionally add `?sslmode=require` or
+   `?connect_timeout=5` to the end of the `url`; no other parameter is allowed
+   (see Storage for the rules). Without `connect_timeout` a connection that gets
+   no answer fails after 10 seconds.
+
+5. Only if the server asks for a password (the Docker command of step 2 does):
+   put it in `~/.config/llm-harness/secrets.toml`, never in `config.toml`. The
+   folder and the name are fixed; there is no way to move the file. Without the
+   file, or without a `password` in it, the program sends no password, which is
+   right for a server that trusts the connection. The file is read only when
+   the relational backend is `postgres` or the vector backend is `qdrant` or
+   `pgvector` (the same `[postgres] password` then serves the pgvector database
+   too: see pgvector, step 5).
+
+   ```sh
+   mkdir -p ~/.config/llm-harness
+   cat > ~/.config/llm-harness/secrets.toml <<'EOF'
+   [postgres]
+   password = "your-password-here"
+   EOF
+   chmod 600 ~/.config/llm-harness/secrets.toml
+   ```
+
+   Replace `your-password-here` with the password you gave the server in step 2.
+   The `chmod 600` is required: a file that group or other users can read is
+   refused. The password must be a non-empty string without control characters
+   and without a space at the start or end (so a password with a space at either
+   end cannot be used). The program hands the password to the driver as a
+   separate setting, never inside the `url`. One file serves both backends and
+   holds both tables when you use both (remote qdrant with an API key and
+   Postgres). The `cat >` command above replaces the whole file, so write both
+   tables at once. The file then looks like this:
+
+   ```toml
+   [qdrant]
+   api_key = "your-key-here"
+
+   [postgres]
+   password = "your-password-here"
+   ```
+
+   Each secret is used only when its own backend is selected, but the whole file
+   is checked whenever it is read, so a mistake in one table is reported even if
+   only the other backend is in use.
+
+6. Check the settings:
+
+   ```sh
+   uv run llm-harness --storage-status
+   ```
+
+   On a fresh database the relational lines must read like this (the vector and
+   files lines follow, as in the sample above):
+
+   ```text
+   relational: postgres  127.0.0.1:5432/llm_harness
+     schema: nothing to read yet
+   ```
+
+   After the first model call has created the ledger, the second line reads
+   `  schema: ledger version 1 (the code expects 1)`. The first line shows the
+   host, the port (5432 when the `url` has none) and the database, never the user
+   name, the password or the query string. This command contacts the server
+   read-only (the connection is opened with `default_transaction_read_only=on`
+   and a connect timeout of at most 5 seconds), and it never creates or writes
+   anything, so it does not create the tables. If the server does not answer, it
+   prints one line `  cannot connect (<ExceptionType>)`, for example
+   `  cannot connect (OperationalError)`, still prints the vector and files lines
+   and exits with code 0. Another database error prints
+   `  schema: not readable (<ExceptionType>)`. The server's own message is never
+   shown. If the table `schema_versions` exists but the ledger is not recorded in
+   it yet, the second line reads
+   `  schema: ledger not set up yet (it is set up on first use)`. This command
+   also reads `secrets.toml`, so it reports a broken or too-open secrets file
+   with the same messages as the table below.
+
+   Nothing connects at start: the program connects to the server for the first
+   time at the first model call, and that call creates the tables `llm_calls`
+   and `model_backoff` and the shared `schema_versions`. To look at the ledger
+   after the first model call (use your password; the `psql` program runs inside
+   the container):
+
+   ```sh
+   docker exec -e PGPASSWORD=your-password-here llm-harness-postgres psql -U postgres -d llm_harness -c "select count(*) from llm_calls"
+   ```
+
+   After the first recorded model call it prints a small table with a `count`
+   header and the number of recorded calls (`1` for one row). Before the ledger
+   exists it prints `ERROR:  relation "llm_calls" does not exist` (exit code 1),
+   because the table is created at the first model call.
+
+7. If something is wrong, the program stops at start with `error: ` followed by
+   one of these messages, or shows the runtime message or status line:
+
+   | Message | Meaning | Fix |
+   | --- | --- | --- |
+   | `invalid config.toml: storage.relational: backend "postgres" requires url, for example url = "postgresql://user@db.example:5432/llm_harness"` | `backend = "postgres"` without `url` | Add `url` (step 4) |
+   | `invalid config.toml: storage.relational: path is only used with a local backend, not "postgres"` | `path` is set together with `postgres` | Remove `path` |
+   | `invalid config.toml: storage.relational: url is only used with backend = "postgres"` | `url` is set with `sqlite` | Remove `url` or set `backend = "postgres"` |
+   | `invalid config.toml: storage.relational: url must be a postgresql:// or postgres:// URL with a host and a database name, for example postgresql://user@db.example:5432/llm_harness` | The `url` is not a full PostgreSQL address | Write it as `postgresql://user@host:port/database` |
+   | `invalid config.toml: storage.relational: url must end with one database name, as in /llm_harness` | The database name is missing, or the path has more than one part | End the `url` with one `/database` |
+   | `invalid config.toml: storage.relational: url port must be 1 to 65535` | The port is not a number from 1 to 65535 | Fix the port |
+   | `invalid config.toml: storage.relational: url must name exactly one host; several hosts are not supported` | A comma-separated list of hosts | Name one host |
+   | `invalid config.toml: storage.relational: url must not contain a password (user:pass@); credentials do not belong in config.toml, put it in secrets.toml under [postgres] as password = "..."` | The `url` holds a password | Remove it; put the password in `secrets.toml` (step 5) |
+   | `invalid config.toml: storage.relational: url has query parameter '<name>' that is not allowed (credentials and other settings do not belong in config.toml); allowed: sslmode, connect_timeout` | A query parameter other than the two allowed ones (for a name that is not a plain word the text says `a query parameter`) | Remove it |
+   | `invalid config.toml: storage.relational: url sslmode must be one of: disable, allow, prefer, require, verify-ca, verify-full` | `sslmode` has another value | Use one of the listed values |
+   | `invalid config.toml: storage.relational: url connect_timeout must be a whole number of seconds, 1 to 120` | `connect_timeout` is not a whole number from 1 to 120 | Fix the number |
+   | `invalid config.toml: storage.relational: url must not contain a #fragment` | The `url` ends with `#...` | Remove it |
+   | `invalid config.toml: storage.relational: url must not contain whitespace or control characters` | A space or control character in the `url` | Remove it |
+   | `invalid config.toml: storage.relational: backend "postgres" needs the optional extra postgres, which is not installed; run: uv sync --extra postgres` | `psycopg` is missing. You only see this with `uv run --no-dev ...`, `uv run --no-sync ...` or a program installed as a package without the dev group (a plain `uv run` installs the dev group again) | Run `uv sync --extra postgres` |
+   | `invalid config.toml: storage.relational.backend: unknown backend '<name>'; use one of: sqlite, postgres` | The backend name is wrong | Write `sqlite` or `postgres` |
+   | `invalid secrets.toml: <path> is accessible by group or other users; run: chmod 600 <path>` | Others can read `secrets.toml` | Run the `chmod 600` command shown |
+   | `invalid secrets.toml: <path> is not a regular file` | `secrets.toml` is a folder or another special file | Replace it with a plain file |
+   | `invalid secrets.toml: unknown table [<name>] in <path>; valid tables: qdrant, postgres` | A table name is wrong, for example `[postgre]` | Write `[postgres]` (or `[qdrant]`) |
+   | `invalid secrets.toml: unknown key '<name>' in [postgres] of <path>; valid keys: password` | A key name is wrong | Write `password` |
+   | `invalid secrets.toml: [postgres] password in <path> is empty` | The password is empty | Write the real password |
+   | `invalid secrets.toml: [postgres] password in <path> has leading or trailing whitespace` | A space around the password | Remove it (the server password then cannot start or end with a space) |
+   | `invalid secrets.toml: [postgres] password in <path> contains a newline or other control character` | A control character in the password | Retype it on one line |
+   | `invalid secrets.toml: [postgres] password in <path> must be a string, not <type>` | The password is not in quotes | Write `password = "..."` |
+   | `cannot parse <path>: <position>` | `secrets.toml` is not valid TOML | Fix the line and column named |
+   | `usage database unavailable (<ExceptionType>): postgres; usage and backoff are not saved`, for example `usage database unavailable (OperationalError): postgres; usage and backoff are not saved` (seen with a stopped server) | The server could not be used when a model call was recorded (not running, wrong address or password, ...). Shown once (a second call shows nothing); the chat continues, and usage and backoff are not saved until you restart the program. The server's own message is never shown: it would name the host and the user | Look at the server's own log; check the `url` and the password |
+   | `  cannot connect (<ExceptionType>)` | `--storage-status` could not reach the server, or the server refused the connection. A wrong password gives `cannot connect (OperationalError)` | Check that the server runs, the `url` and the password in `secrets.toml` |
+   | `  schema: not readable (<ExceptionType>)` | The server answered with another database error | Look at the server's own log |
+
+   The password is never printed in a message; if it is shown anywhere it
+   appears as `[REDACTED:api_key]` (the same mask as for every secret).
+
+8. Switching backends. Nothing is copied when you change `[storage.relational]`:
+   - Existing ledger data stays in the SQLite file (`~/.local/share/llm-harness/harness.db`
+     or your `[storage.relational] path`). It is NOT copied to Postgres.
+   - After you switch to `postgres`, the usage totals and the model backoff start
+     empty on a new, empty database (a database that already holds a ledger keeps
+     it: `--storage-status` then shows `ledger version 1`).
+   - Switching to `postgres` leaves the SQLite file untouched (checked: same size,
+     timestamp, row count and checksum after `--storage-status` and `--plain` with
+     the Postgres config).
+   - Switching back to `sqlite` uses the old file again, with what it had.
+   - Agent memory notes are NOT copied either. After you switch to `postgres`,
+     memory starts empty on a new database, and the notes you saved with `sqlite`
+     stay in the SQLite file. The memory tables are created on the server by a
+     versioned migration (namespace `memory`, version 2) the first time memory is
+     used; nothing connects at startup.
+   - Memory search on Postgres uses PostgreSQL full-text search (the `english`
+     configuration). It finds the same notes as SQLite on the corpus used to
+     check this, but the order of the results may differ from SQLite's `bm25`
+     ranking. Accents are not folded: `cafe` does NOT match a note with `café`
+     (SQLite does match it). Only the English stemmer is used; other languages
+     match as plain words. Vector search for memory is a separate setting
+     (`[storage.vector]`).
+
+9. Security notes for the Postgres backend:
+   - The password is only in `secrets.toml` (mode 600). The `url` in
+     `config.toml` holds no password, and a password in it is refused.
+   - Error messages and the status output never show the server's own text, the
+     host or the user name: the status line shows only `host:port/database`.
+   - The ledger rows hold the model id, the provider id, token counts, the
+     cost, the time, the outcome, an error kind, the model it fell back from and
+     the seconds the call took (the columns of `llm_calls`: `id`, `time`,
+     `model_id`, `provider_id`, `input_tokens`, `output_tokens`,
+     `reasoning_tokens`, `cost_usd`, `seconds`, `outcome`, `error_kind`,
+     `fallback_from`), plus the table `model_backoff` (`model_id`, `failures`,
+     `until`). No prompts and no replies.
+   - Use TLS (`?sslmode=require` or stricter) for any server that is not on this
+     computer; without it the password and the data travel unencrypted. That a
+     TLS connection can be set up successfully was NOT tested (see Known limits).
+   - Keep `secrets.toml` at mode 600 and out of git and backups you share. Keep
+     the server behind a firewall or bound to `127.0.0.1` as in step 2.
+
+10. Undo: set `backend` back to `sqlite` and remove the `url` line; nothing else
+    changes. The ledger on the server stays there until you delete it; the SQLite
+    file keeps what it had.
+
+#### pgvector (step by step)
+
+`[storage.vector] backend = "pgvector"` keeps the vectors of the memory vector
+search (see Vector search) in a PostgreSQL database with the pgvector extension,
+instead of in local files (`qdrant-edge`) or on a qdrant server. It works with
+SQLite or Postgres as the relational store, so agent memory keeps working. You
+do not need it for anything else; skip this section if the default `qdrant-edge` is enough.
+
+1. What you need:
+   - A running PostgreSQL server with the pgvector package installed. Step 2
+     shows how to start one with Docker. Docker runs a program in a container,
+     an isolated process with its own files; if you already have a server, skip
+     the `docker run` in step 2 and use its address, database name and user
+     name. A plain `postgres:17` image does NOT have pgvector; the image
+     `pgvector/pgvector:pg17` has it.
+   - An administrator (a PostgreSQL superuser) who runs `CREATE EXTENSION
+     vector;` once, in the database you name in `[storage.vector] url`. The
+     program only CHECKS that the extension exists and never creates it. In the
+     Docker try-out of step 2 you are that administrator.
+   - The optional package `psycopg`, the PostgreSQL driver (step 3). It is the
+     same extra as for the `postgres` relational backend; the `pgvector` Python
+     package is not needed.
+   - The password of the database user, if the server asks for one (step 5).
+   - For memory vector search: `[tools] memory = true`, `memory_vectors = true`,
+     a `user_id` and an embedding model (see Agent memory and Vector search).
+
+2. Start a server for a first try and create the extension (PostgreSQL 17.11 with
+   pgvector 0.8.7 was used to check this feature; the image is
+   `pgvector/pgvector:pg17`). Run this in the folder where you want the data
+   kept. It uses port 5433 so that it does not clash with the server of the
+   Postgres section (port 5432):
+
+   ```sh
+   mkdir -p pgvector_data
+   docker run -d --name llm-harness-pgvector \
+     -e POSTGRES_PASSWORD=your-password-here \
+     -e POSTGRES_DB=llm_harness \
+     -p 127.0.0.1:5433:5432 \
+     -v "$PWD/pgvector_data:/var/lib/postgresql/data" \
+     pgvector/pgvector:pg17
+   docker exec llm-harness-pgvector pg_isready -U postgres -d llm_harness
+   docker exec llm-harness-pgvector psql -U postgres -d llm_harness -c "CREATE EXTENSION vector;"
+   ```
+
+   Replace `your-password-here` with a real password of your own choice, and
+   remember it: the same password goes into `secrets.toml` in step 5. The
+   `pg_isready` command asks the server whether it accepts connections. While the
+   server is still starting it can answer `/var/run/postgresql:5432 - no
+   response` (exit code 2), and for about a second just before it is ready it can
+   answer `/var/run/postgresql:5432 - rejecting connections` (exit code 1); once
+   it is ready it answers `/var/run/postgresql:5432 - accepting connections`
+   (exit code 0). If it does not answer at once, wait a few seconds and run it
+   again, and run the last command only after it says `accepting connections`.
+   The last command is the administrator step: it creates the extension in the
+   database `llm_harness` and prints `CREATE EXTENSION` (exit code 0). If you run
+   it a second time it exits with code 1 and prints `ERROR:  extension "vector"
+   already exists`; that is harmless.
+   `-p 127.0.0.1:5433:5432` makes the server reachable from this computer only;
+   without `127.0.0.1:` other computers on your network could reach it. The user
+   name is `postgres` (the default of the image), so the address of this server
+   is `postgresql://postgres@127.0.0.1:5433/llm_harness` (step 4). The folder
+   `pgvector_data` keeps the data. To stop and remove the container (the data
+   stays in the folder):
+
+   ```sh
+   docker stop llm-harness-pgvector && docker rm llm-harness-pgvector
+   ```
+
+   For a server that you do not run yourself: an ordinary (non-superuser) role
+   cannot create the extension (the server answers `Must be superuser`), but it
+   can use the extension once a superuser has created it. Ask your administrator
+   to run `CREATE EXTENSION vector;` in your database.
+
+3. Make sure the optional package `psycopg` is installed. In a clone of this
+   repository the plain `uv sync` from the Quick start already installs it,
+   because it is also in the `dev` dependency group. Run this command to make it
+   explicit; you need it when you install without the dev group or install the
+   program as a package:
+
+   ```sh
+   uv sync --extra postgres
+   ```
+
+   Note that after `uv sync --no-dev` a plain `uv run llm-harness ...` installs
+   the dev group again (it contains `psycopg`) and then works. If the package is
+   missing (`uv run --no-dev llm-harness ...`, `uv run --no-sync`, or the program
+   installed as a package without the dev group), choosing `pgvector` stops the
+   program with a message that names this command (see the table below).
+
+4. Edit `~/.config/llm-harness/config.toml` (the folder that holds `config.toml`,
+   `models.yaml` and `agents.yaml`; see Configuration). The `[storage.vector]`
+   table, like `[storage...]` and `[tools]`, is written after `user_id`. A
+   complete minimal example for agent memory with vector search, with SQLite
+   (the default) as the relational store:
+
+   ```toml
+   user_id = "your-name"
+
+   [providers.local]
+   type = "ollama"
+   base_url = "http://localhost:11434"
+
+   [storage.vector]
+   backend = "pgvector"
+   url = "postgresql://postgres@127.0.0.1:5433/llm_harness"
+
+   [tools]
+   memory = true
+   memory_vectors = true
+   ```
+
+   `user_id` stays at the top, above every `[table]` header. Keep your own
+   `[providers...]` tables; the one shown is the example one. Memory vector
+   search also needs an embedding model in `models.yaml` (see Embedding models
+   and Vector search). If you only want the storage check of step 6, the
+   `[storage.vector]` table alone is enough.
+
+   The parts of the `url`: the user name (`postgres`), the host (`127.0.0.1`),
+   the port (`5433`; leave it out for 5432) and the database (`llm_harness`).
+   Do not write `path` here and do not put a password in the `url`
+   (`user:pass@` is refused). Optionally add `?sslmode=require` or
+   `?connect_timeout=5` to the end of the `url`; no other parameter is allowed
+   (see Storage for the rules). Without `connect_timeout` a connection that gets
+   no answer fails after 10 seconds.
+
+5. Only if the server asks for a password (the Docker command of step 2 does):
+   put it in `~/.config/llm-harness/secrets.toml`, never in `config.toml`. It is
+   the same optional `[postgres] password` as for the `postgres` relational
+   backend, in the same file, so ONE password serves both Postgres uses. The
+   file is read when the relational backend is `postgres` or the vector backend
+   is `qdrant` or `pgvector`. The folder and the name are fixed; there is no way
+   to move the file.
+
+   ```sh
+   mkdir -p ~/.config/llm-harness
+   cat > ~/.config/llm-harness/secrets.toml <<'EOF'
+   [postgres]
+   password = "your-password-here"
+   EOF
+   chmod 600 ~/.config/llm-harness/secrets.toml
+   ```
+
+   Replace `your-password-here` with the password you gave the server in step 2.
+   The `cat >` command replaces the whole file: if you already keep a `[qdrant]`
+   key or another password in it, write all the tables at once (see Postgres,
+   step 5, for the file with both tables). Everything about the file is as
+   described there: mode 600 is required, only the known tables and keys are
+   allowed, the password must be a non-empty string without control characters
+   and without a space at the start or end, it is never printed, and a mistake
+   is reported with the `invalid secrets.toml: ...` messages of the Postgres
+   table (step 7). A vector database that needs a DIFFERENT password than the
+   relational Postgres database is not supported (see Known limits).
+
+6. Check the settings:
+
+   ```sh
+   uv run llm-harness --storage-status
+   ```
+
+   When the extension was created (step 2) and the program has not used the
+   store yet, the vector lines must read like this (the other lines are as in the
+   sample under Storage; `0.8.7` is the version of the extension on your
+   server):
+
+   ```text
+   vector: pgvector  127.0.0.1:5433/llm_harness
+     extension: vector 0.8.7
+     collections: not set up yet (it is set up on first use)
+   ```
+
+   If nobody ran `CREATE EXTENSION vector;` yet (but the server has pgvector
+   installed), the lines read:
+
+   ```text
+   vector: pgvector  127.0.0.1:5433/llm_harness
+     extension: not created in this database (an administrator runs: CREATE EXTENSION vector;)
+   ```
+
+   Run the administrator command of step 2, then check again. The other state is
+   `  extension: not installed on this server (install the pgvector package, then
+   run: CREATE EXTENSION vector;)` (a server without pgvector, such as a plain
+   `postgres:17` image).
+   Only when the extension is present, a third line follows: `  collections: not
+   set up yet (it is set up on first use)` (the tables do not exist), `  no
+   collections yet`, or one line per collection, sorted by name, like `  collection
+   memories_<16 hex characters>: <dim> dimensions, <distance>` (memory vector
+   search uses one collection per embedding model, named `memories_` plus 16
+   hexadecimal characters; the distance is `cosine`).
+
+   The first line shows the host, the port (5432 when the `url` has none) and the
+   database, never the user name, the password or the query string. This command
+   contacts the server read-only (the connection is opened with
+   `default_transaction_read_only=on` and a connect timeout of at most 5
+   seconds), and it creates and writes nothing. If the server does not answer, it
+   prints exactly one line `  cannot connect (<ExceptionType>)` after the vector
+   line, for example `  cannot connect (OperationalError)` (a wrong password
+   and a closed port both give that line), still prints the files lines and exits
+   with code 0. Another database error prints `  not readable (<ExceptionType>)`.
+   The server's own message is never shown. This command also reads
+   `secrets.toml`, so it reports a broken or too-open secrets file with the same
+   messages as the Postgres table.
+
+   Nothing connects at start. The program connects to the server for the first
+   time when the memory vector search first needs it (the first memory search or
+   save with `memory_vectors = true`). That first use checks the extension and
+   creates, in the vector database, a versioned schema in the namespace `vector`
+   (recorded in the table `schema_versions`) with two tables: `vector_collections`
+   (`name`, `dim`, `distance`) and `vector_points` (`collection`, `id`,
+   `embedding`, `payload`). There is ONE table of points for all collections,
+   which is why a collection name of 64 characters works.
+
+7. If something is wrong, the program stops at start with `error: ` followed by
+   one of the `invalid config.toml` messages, or shows the runtime message or
+   status line:
+
+   | Message | Meaning | Fix |
+   | --- | --- | --- |
+   | `invalid config.toml: storage.vector: backend "pgvector" requires url, for example url = "postgresql://user@db.example:5432/llm_harness"` | `backend = "pgvector"` without `url` | Add `url` (step 4) |
+   | `invalid config.toml: storage.vector: path is only used with a local backend, not "pgvector"` | `path` is set together with `pgvector` | Remove `path` |
+   | `invalid config.toml: storage.vector: url is only used with backend = "qdrant" or "pgvector"` | `url` is set with `qdrant-edge` or `none` | Remove `url` or set `backend = "pgvector"` (or `"qdrant"`) |
+   | `invalid config.toml: storage.vector: url must be a postgresql:// or postgres:// URL with a host and a database name, for example postgresql://user@db.example:5432/llm_harness` | The `url` is not a full PostgreSQL address | Write it as `postgresql://user@host:port/database` |
+   | `invalid config.toml: storage.vector: url must end with one database name, as in /llm_harness` | The database name is missing, or the path has more than one part | End the `url` with one `/database` |
+   | `invalid config.toml: storage.vector: url port must be 1 to 65535` | The port is not a number from 1 to 65535 | Fix the port |
+   | `invalid config.toml: storage.vector: url must name exactly one host; several hosts are not supported` | A comma-separated list of hosts | Name one host |
+   | `invalid config.toml: storage.vector: url must not contain a password (user:pass@); credentials do not belong in config.toml, put it in secrets.toml under [postgres] as password = "..."` | The `url` holds a password | Remove it; put the password in `secrets.toml` (step 5) |
+   | `invalid config.toml: storage.vector: url has query parameter '<name>' that is not allowed (credentials and other settings do not belong in config.toml); allowed: sslmode, connect_timeout` | A query parameter other than the two allowed ones | Remove it |
+   | `invalid config.toml: storage.vector: url sslmode must be one of: disable, allow, prefer, require, verify-ca, verify-full` | `sslmode` has another value | Use one of the listed values |
+   | `invalid config.toml: storage.vector: url connect_timeout must be a whole number of seconds, 1 to 120` | `connect_timeout` is not a whole number from 1 to 120 | Fix the number |
+   | `invalid config.toml: storage.vector: url must not contain a #fragment` | The `url` ends with `#...` | Remove it |
+   | `invalid config.toml: storage.vector: url must not contain whitespace or control characters` | A space or control character in the `url` | Remove it |
+   | `invalid config.toml: storage.vector: backend "pgvector" needs the optional extra postgres, which is not installed; run: uv sync --extra postgres` | `psycopg` is missing. You only see this with `uv run --no-dev ...`, `uv run --no-sync ...` or a program installed as a package without the dev group (a plain `uv run` installs the dev group again) | Run `uv sync --extra postgres` |
+   | `invalid config.toml: storage.vector.backend: unknown backend '<name>'; use one of: qdrant-edge, qdrant, pgvector, none` | The backend name is wrong | Write one of the listed names |
+   | `invalid secrets.toml: ...` and `cannot parse <path>: <position>` | A problem in `secrets.toml` | The same messages and fixes as in the Postgres table (step 7) |
+   | `  extension: not created in this database (an administrator runs: CREATE EXTENSION vector;)` | `--storage-status`: the server has pgvector, but the extension is not created in this database | An administrator runs `CREATE EXTENSION vector;` as a superuser in the database named in `url` (step 2) |
+   | `  extension: not installed on this server (install the pgvector package, then run: CREATE EXTENSION vector;)` | `--storage-status`: the server has no pgvector (for example a plain `postgres:17` image) | Install the pgvector package on the server, or use the `pgvector/pgvector:pg17` image; then run the `CREATE EXTENSION` command |
+   | `  cannot connect (<ExceptionType>)` | `--storage-status` could not reach the server, or the server refused the connection. A wrong password and a closed port both give `cannot connect (OperationalError)` | Check that the server runs (`docker exec llm-harness-pgvector pg_isready -U postgres -d llm_harness`), the `url` and the password in `secrets.toml` |
+   | `  not readable (<ExceptionType>)` | `--storage-status`: the server answered with another database error | Look at the server's own log |
+   | `the pgvector extension is not created in this database: an administrator must run, as a superuser in the database named in [storage.vector] url: CREATE EXTENSION vector;` | Runtime: the first use found the extension available but not created | An administrator runs `CREATE EXTENSION vector;` as a superuser in the database named in `url`, then run `/memory reindex` in the chat (it retries) |
+   | `the pgvector extension is not installed on this PostgreSQL server: install the pgvector package on the server, then an administrator runs: CREATE EXTENSION vector;` | Runtime: the server has no pgvector | Install the package on the server, run the `CREATE EXTENSION` command, then run `/memory reindex` |
+   | `memory vector search is off: <reason>; keyword search only` | A vector call failed, for example the server is not running or the extension is missing. Shown once; keyword search continues. The reason starts with the error type, for example `VectorStoreError: the pgvector extension is not created in this database: ...` | Fix the cause, then run `/memory reindex` in the chat (it retries) |
+   | `vector store failed on collection '<name>': <ExceptionType>` | The server did not answer, refused the connection or reported a database error. The message never holds the server's text, the host, the user, the password or a row | Look at the server's own log; check the `url` and the password |
+   | `unknown collection '<name>': call ensure_collection first` | A call named a collection that was never set up in this process | No setting fixes it; report it with the steps that led to it |
+   | `collection '<name>' holds <N>-dimensional vectors, got <M>; re-index the collection or use another name` | The collection exists with another vector size than the one asked for | Re-index the collection or use another collection name |
+   | `collection '<name>' uses the '<stored>' distance, got '<asked>'; re-index the collection or use another name` | The collection exists with another distance than the one asked for | Re-index the collection or use another collection name |
+   | `collection '<name>': a vector may not hold NaN or infinity` | A vector holds NaN or infinity; the program refuses it | Use a vector of finite numbers |
+   | `the vector schema in this database is newer than this version of llm-harness` | The vector tables were made by a newer version of the program | Use the newer version of llm-harness |
+
+   The password is never printed in a message; if it is shown anywhere it
+   appears as `[REDACTED:api_key]`.
+
+8. Switching backends and servers. The vectors are NOT moved when you change
+   `[storage.vector]`. The program remembers which notes already have a vector
+   in a SQLite table, `memory_vectors`, in the file given by `[storage.relational]
+   path` (default `~/.local/share/llm-harness/harness.db`). After you switch to
+   `pgvector` (from `qdrant-edge` or `qdrant`), or to a fresh database, those
+   marks still say "indexed":
+
+   - `/memory reindex` answers `reindexed 0 of 0 memories`.
+   - Notes saved before the switch are NOT found by vector search in the new
+     store. Keyword search still finds them. New and updated notes are indexed
+     normally.
+
+   Workaround: clear the marks, then run `/memory reindex`. It was proven on a
+   real pgvector server (2026-11-03). Stop llm-harness, then run:
+
+   ```sh
+   sqlite3 ~/.local/share/llm-harness/harness.db "DELETE FROM memory_vectors;"
+   ```
+
+   (your `[storage.relational] path` instead, if you set one; the statement
+   prints nothing when it works). Start llm-harness and type `/memory reindex`;
+   it answers `reindexed N of N memories`. The statement removes only the marks,
+   for all users and all embedding models in that file, and never the notes; the
+   notes are embedded again, which costs one embedding per note. The full
+   procedure, with the optional backup copy, is in Remote qdrant, step 8. A
+   proper `/memory reindex --all` is planned (roadmap item `memory-reindex-all`).
+
+9. What to expect and the limits (found on a real server: PostgreSQL 17.11 with
+   pgvector 0.8.7 and psycopg 3.3.7):
+   - Search is EXACT: there is no index, so the result is the same as with the
+     other backends, but it gets slower as a collection grows. There is no index:
+     search is exact. An index created by hand would NOT be used by the program's
+     current queries (checked with EXPLAIN on 3000 rows): the queries order by
+     the plain vector column, and an expression index on a cast only matches
+     queries that use the same cast. An optional approximate (HNSW) index is a
+     planned roadmap item (`pgvector-index`), which has to change the queries.
+   - Scores are the same as for qdrant: cosine 1.0 for identical vectors; euclid
+     and dot are negated distances, so a higher score is always nearer.
+     pgvector stores float32, so scores agree with the other backends to about
+     1e-6.
+   - A vector of only zeros has no defined cosine distance: it is returned last
+     with score -1.0.
+   - NaN or infinity in a vector is refused by the program. A value outside the
+     float32 range (about 3.4e38) is refused by the server; the message shows
+     only the exception type.
+   - The program stores a small JSON payload per vector (the memory index stores
+     only the `user_id`). The database type `jsonb` does not keep the order of
+     the payload keys, very large float values (1e22 and up) come back as
+     integers, and a payload string with a NUL character is refused
+     (`UntranslatableCharacter`). These payload points do not affect the memory
+     index.
+   - Concurrent writers are safe: the rows of a batch are written in id order.
+   - An embedding model change starts a new collection, as with the other
+     backends (see Vector search).
+
+10. Security notes for the pgvector backend:
+    - All users' vectors of a collection live in ONE table. The program separates
+      them with a `user_id` filter in its queries. That is NOT access control on
+      the server: anyone who can reach the database can read every user's
+      vectors. Protect the server with a password, use TLS, and keep it behind a
+      firewall or bound to `127.0.0.1` as in step 2.
+    - The server gets the vector and the payload (the memory index sends the
+      `user_id` and the note id), not the note text. The text of a note is sent
+      to the embedding model, as without pgvector.
+    - The password is only in `secrets.toml` (mode 600), never in `config.toml`,
+      and is never printed. Keep `secrets.toml` out of git and backups you share.
+    - Use TLS (`?sslmode=require` or stricter) for any server that is not on this
+      computer. That a TLS connection can be set up successfully was NOT tested
+      (see Known limits).
+
+11. Undo: set `backend` back to `qdrant-edge` (or `none`) and remove the `url`
+    line; nothing else changes. The vectors stay in the database until you drop
+    the tables `vector_points` and `vector_collections`.
+
 ### Tools
 
 An optional `[tools]` table in `config.toml` switches on optional built-in
@@ -391,6 +1256,7 @@ tools. Write it after `user_id`, like `[storage...]`:
 # command_allow = ["git"]      # default: []
 # command_deny = ["rm*"]       # default: []
 # memory = true                # default: false; needs user_id; see Agent memory below
+# memory_vectors = true        # default: false; needs memory; see Vector search below
 ```
 
 - `dev_echo` registers a harmless tool of risk `write` that echoes its `text`
@@ -407,7 +1273,7 @@ tools. Write it after `user_id`, like `[storage...]`:
   names it. The terminal UI and the web GUI ask too (Approve and Deny buttons in
   the GUI).
 - An unknown key under `[tools]` is an error. The boolean keys (`dev_echo`, the
-  three web keys, `run_command` and `memory`) must be `true` or `false` (a string such as
+  three web keys, `run_command`, `memory` and `memory_vectors`) must be `true` or `false` (a string such as
   `"yes"` is an error) and default to `false`.
 - Naming a tool in `agents.yaml` while it is switched off is an error with a
   hint, for example `enable it with [tools] web_fetch = true`. Both web tools are
@@ -558,9 +1424,11 @@ sandbox:
 
 Four optional tools let the model keep short notes about you between chats. They
 are off by default. The harness also looks up the best matching notes at the start
-of each turn (see Automatic recall below). This is only part of the feature: the
-model saves notes when it chooses to, and reflection and `/memory` are not built
-(see Not built yet below).
+of each turn (see Automatic recall below). After some turns a short reflection
+step may save, update or forget a note (see Reflection below), and the `/memory`
+command lists, shows and deletes notes by hand (see The /memory command below).
+An optional vector (meaning-based) search can be added to all three (see Vector
+search below).
 
 What a memory is:
 
@@ -587,10 +1455,22 @@ memory = true
 | --- | --- | --- |
 | `[tools] memory` | `false` | Registers the four `memory_*` tools. Must be `true` or `false`; a string such as `"yes"` is an error (`tools.memory: Input should be a valid boolean`). |
 | `user_id` | not set | Whose memories these are. Every read and write is filtered by it. Rules: see Configuration (not blank, at most 128 characters, printable, kept as written). |
-| `[storage.relational] path` | `~/.local/share/llm-harness/harness.db` | The SQLite file that holds the memories (see Storage). |
+| `[storage.relational] path` | `~/.local/share/llm-harness/harness.db` | The SQLite file that holds the memories when `[storage.relational] backend` is `sqlite` (see Storage). With `backend = "postgres"` the memories are kept on the server at `url` (and `path` is not allowed with it). |
 
 Automatic recall has no setting of its own: it is on when these same two settings
 are on, and its numbers are fixed in code (see Automatic recall below).
+
+Memory also works with `[storage.relational] backend = "postgres"` (see Postgres
+under Storage). On Postgres the search differs from SQLite:
+
+- It uses PostgreSQL full-text search (the `english` configuration) instead of
+  SQLite's. The same notes are found on the corpus used to check this, but the
+  ranking may differ from SQLite's `bm25`.
+- Accents are not folded: `cafe` does NOT match a note that contains `café`
+  (SQLite does match it).
+- Only the English stemmer is used; other languages match as plain words.
+- Switching `[storage.relational]` does not copy memories. Notes saved with
+  `sqlite` stay in the SQLite file, and `postgres` starts empty.
 
 The `user_id` gotcha: TOML puts a key written after a `[table]` header into that
 table. `user_id` below `[providers.local]` stops the program with `invalid
@@ -662,21 +1542,24 @@ at most 10 memories.
 Where the data lives: the relational SQLite file (default
 `~/.local/share/llm-harness/harness.db`, or `[storage.relational] path`), in the
 tables `memories` and `memories_fts` (the search index), under the schema
-namespace `memory`. The tables are created on first use. `llm-harness
+namespace `memory`. With vector search, two more tables, `memory_vectors` (which
+note is indexed in which collection) and `memory_vector_meta` (the embedding model
+and vector size of each collection), hold the bookkeeping. The tables are created on first use. `llm-harness
 --storage-status` lists the namespace once it exists, for example:
 
 ```text
 relational: sqlite  <data dir>/harness.db
   file: exists (36864 bytes)
   schema: ledger not set up yet (it is set up on first use)
-  schema: memory version 1 (the code expects 1)
+  schema: memory version 2 (the code expects 2)
 ```
 
 Memories are isolated per `user_id`: another `user_id` never sees, updates or
 deletes them.
 
-There is no screen to list or delete memories yet (`/memory` is planned). By
-hand, with the program stopped, and after a copy of the file:
+To list or delete memories use the `/memory` command (see The /memory command
+below). To delete by hand instead, with the program stopped, and after a copy of
+the file:
 
 ```sh
 sqlite3 ~/.local/share/llm-harness/harness.db \
@@ -686,10 +1569,95 @@ sqlite3 ~/.local/share/llm-harness/harness.db \
 Triggers keep the search index in step. Leave out the `WHERE` part to delete
 every user's memories. Use your `[storage.relational] path` if you set one.
 
-Not built yet (planned, not available): a reflection step after work that saves
-what was learned, the `/memory` command, and vector (meaning-based) search.
-Today the notes are found by keyword only: automatically at the start of each
-turn, and when the model calls `memory_search`.
+By default the notes are found by keyword only: automatically at the start of each
+turn, when the model calls `memory_search`, and as input to the reflection step.
+Vector search (next section) adds a search by meaning.
+
+#### Vector search
+
+Off by default. It adds a search by meaning next to the keyword search, so a
+message about a `diet` can find the note `Partner is allergic to peanuts`, which
+keyword search alone does not. Switch it on with `memory_vectors` under `[tools]`:
+
+```toml
+[tools]
+memory = true
+memory_vectors = true
+```
+
+It needs:
+
+- `memory = true` and a `user_id` (see above). With `memory_vectors = true` but
+  without them the program starts, the index is not used, and the State tab says
+  `memory vector search is off: [tools] memory_vectors = true needs [tools] memory
+  = true and a user_id`.
+- An embedding model in `models.yaml`, tagged `embedding` (see Embedding models),
+  for example the commented `bge-m3-local` entry and `ollama pull bge-m3`.
+- The vector store `[storage.vector]` with the backend `qdrant-edge` (the default),
+  `qdrant` (a server you run; see Remote qdrant under Storage) or `pgvector` (a
+  PostgreSQL database with the pgvector extension; see pgvector under Storage).
+  `pgvector` works with SQLite as the relational store, so memory keeps working.
+
+What changes:
+
+- Automatic recall, `memory_search` and the reflection step run both searches. The
+  keyword hits (up to 10) and the vector hits (up to 10, only your `user_id`) are
+  merged by rank: each list gives a note the score `1 / (60 + rank)` and the scores
+  add up. A note found by both lists comes first; on a tie the keyword order wins,
+  so exact words still rank high. The limits of recall, `memory_search` and the
+  6000-character block stay as above.
+- Each save and update embeds `<text> [<keywords>]` and stores the vector next to
+  the SQLite row; a forget deletes it. SQLite stays the truth: the vector index
+  can be rebuilt from it, and a write never fails because of the index.
+- The first search of a process also indexes up to 20 of your notes that have no
+  vector yet (the lazy repair), after the result is built, so it never changes
+  that result. A first search can therefore pay up to 20 embeddings.
+- `/memory reindex` indexes all your notes that have no vector yet (see The
+  /memory command).
+
+When anything goes wrong (no embedding model, a provider error, a model whose
+size changed, the vector store disabled or in use by another process), you see one
+notice, `memory vector search is off: <reason>; keyword search only` (the reason
+starts with the error type), and from then on the process uses keyword search
+until you run `/memory reindex`. Notes are still saved. An embedding call that
+gets no answer within 60 seconds counts as such an error (a connection error, no
+config key): you see the one notice and keyword search continues. Searches and writes never
+retry by themselves. `/memory reindex` also switches vector search back on: it
+retries the embedding model and the vector store, then indexes the notes that have
+no vector yet. If the problem is still there it answers `vector search is off:
+<reason>` with the new reason and the index stays off. A model or dimension
+mismatch (`embedding model or dimension changed for this collection`) keeps
+failing until the configured embedding model is the one used before.
+
+Limits:
+
+- With `qdrant-edge` the vector store is held open by one llm-harness process at
+  a time (see Storage). A second running process gets the keyword-only notice
+  above. With `qdrant` the server may be shared by several processes; the lock
+  error comes from the `qdrant-edge` backend only.
+- With `qdrant` or `pgvector`, a server that is not reachable at run time
+  switches vector search off with the same notice; `/memory reindex` retries. With
+  `pgvector` the same happens when the extension is not created in the database
+  (an administrator must run `CREATE EXTENSION vector;`, see pgvector, step 2).
+  Changing `[storage.vector]` does not move vectors: see Remote qdrant, step 8,
+  and pgvector, step 8.
+- With `pgvector` the search is exact (no index), so it gets slower as the number
+  of notes grows; an optional approximate (HNSW) index is a planned roadmap item
+  (`pgvector-index`). More in pgvector, step 9.
+- Changing the embedding model starts a new, empty vector collection (named from
+  the model id); `/memory reindex` fills it. The old collection stays on disk;
+  nothing deletes it.
+- There is no minimum score, so a weak match can still appear in the top 5.
+- The embedding provider is not closed when the program exits.
+- The remote backend was checked against a real qdrant 1.20.0 server in the opt-in
+  live test (collections, upsert, search, filter, delete, error mapping; see
+  Tests). Memory vector search was not run end to end with a real embedding model
+  against it.
+- The `pgvector` backend was run against a real pgvector server (PostgreSQL 17.11,
+  pgvector 0.8.7, psycopg 3.3.7), with SQLite as the relational store and a fake
+  embedding model; it was not run with a real embedding model. Only fake models
+  and stores were used in the default tests; the opt-in live tests use the real
+  server (see Tests).
 
 #### Automatic recall
 
@@ -714,8 +1682,10 @@ The orchestrator prompt (`src/llm_harness/prompts/orchestrator.md`) has a
 treat it as data, to call `memory_search` with English words for more, and to
 trust you over an old note.
 
-Fixed values (in `src/llm_harness/memory_recall.py` and `src/llm_harness/memory.py`;
-none of them is a configuration key):
+Fixed values (in `src/llm_harness/memory_recall.py`, `src/llm_harness/memory.py`,
+`src/llm_harness/memory_index.py`, `src/llm_harness/memory_reflection.py` and
+`src/llm_harness/orchestrator.py`; none
+of them is a configuration key):
 
 | Value | Fixed at |
 | --- | --- |
@@ -723,6 +1693,16 @@ none of them is a configuration key):
 | Whole block | 6000 characters |
 | Query words used | 32 |
 | Dropped English words | 150 |
+| Reflection: wait for the model | 60 seconds, one attempt |
+| Reflection: goal, your message, answer in the turn record | 500, 2000, 3000 characters |
+| Reflection: each tool result, number of results | 500 characters, 8 |
+| Reflection: `reason` field (kept for the Trace only) | 200 characters |
+| Notice line | 300 characters |
+| Vector search: candidates from each list | 10 + 10 |
+| Vector search: rank fusion offset | 60 |
+| Vector search: query cut before embedding | 1000 characters |
+| Vector search: notes per embedding call in `/memory reindex` | 16 |
+| Vector search: notes repaired on the first search per user | 20 |
 
 Safety: the text and the keywords of each note are scrubbed like web content, so
 a stored text cannot close the block or pass for a harness message. This reduces
@@ -751,11 +1731,89 @@ Known weak points:
 - The word list is English only. A chat in another language gets weak recall,
   because memories are written in English; the model can call `memory_search`
   with English words.
-- Words must overlap: a message about a `diet` does not find a note that says
-  `allergic to peanuts` (a scratch check returned no hit). Meaning-based search
-  needs the planned vector search.
+- With keyword search only, words must overlap: a message about a `diet` does not
+  find a note that says `allergic to peanuts` (a scratch check returned no hit).
+  Vector search (above) is meant for this case; it is off by default.
 - There is no minimum score, so a weak match on one shared word can still appear.
-- Recall has not been seen with a real model, only with scripted fake models.
+- Recall and reflection have not been seen with a real model, only with scripted
+  fake models. One try of the memory tools with `gemma4:12b` returned invalid JSON.
+
+#### Reflection
+
+After the model answers, the harness may make one more, short model call that
+decides whether your saved notes must change. It uses the same model as the turn.
+No setting of its own: it is on when memory is on (the two settings above, and the
+orchestrator agent has `memory_search`), and it is never done for subagents.
+
+- When: only after a `respond` action, not after a question to you or a failed
+  turn, and only when the turn used a tool or a delegation, or changed the goal.
+  Any other turn makes no call at all.
+- The model gets the turn (goal, your message, its answer and the tool results,
+  each cut to a fixed size) and the up to 5 closest existing notes, and must reply
+  with one action: `save` (new text and keywords), `update` (an id plus new text
+  and/or keywords), `forget` (an id) or `none`. The default is `none`.
+- It never asks you for approval: the change is applied at once, and you see a
+  notice line (below). The answer to you is already shown before it runs.
+- The same rules as the tools apply: a text or keyword that looks like a secret is
+  refused and nothing is stored.
+- A failed call, a reply that breaks the contract (not one JSON object, an unknown
+  action or key, a missing field) or a refused note never fails the turn. You get
+  the notice `memory reflection failed: <reason>` and the turn ends normally. The
+  call has one attempt and no retry, and stops after 60 seconds.
+- The Trace tab shows a `reflection` span with the chosen action, and the usage
+  line includes the call.
+
+Notice lines (one line, secrets masked, at most 300 characters, ending in `…` when
+cut). They show in `--plain`, the terminal UI and the GUI:
+
+| Event | Notice |
+| --- | --- |
+| Reflection saves | `memory saved #<id>: <stored text>` |
+| Reflection updates | `memory updated #<id>: <stored text>` |
+| Reflection forgets | `memory forgot #<id>` (only the id: the text is gone) |
+| Reflection finds the id missing | `memory: no memory #<id>` |
+| Reflection chooses `none` | no line |
+| Reflection fails | `memory reflection failed: <reason>` |
+| The model calls `memory_save` or `memory_forget` | the call line `tool <name> <arguments>`, before the call runs |
+| The model calls `memory_update` | the call line, and after it ran, the stored record: `updated memory #<id>: <text> (keywords: <keywords>; created ..., updated ...)`, or `no memory #<id>` |
+
+The text shown is the stored record, not the model's wording.
+
+#### The /memory command
+
+`/memory` lists, shows and deletes your saved memories by hand. It makes no model
+call and is not a turn: the line is never sent to the model, and the answer is not
+kept in the model's context. It works in `--plain` (also with piped input), the
+terminal UI and the GUI, and only for the memories of your `user_id`. It must be
+the first word of the message.
+
+| Command | Does |
+| --- | --- |
+| `/memory` or `/memory list` | Page 1 of the list. |
+| `/memory list PAGE` | One page; `PAGE` is a whole number from 1. |
+| `/memory show ID` | The full text of one memory, with keywords, created and updated times. |
+| `/memory delete ID` | Forgets one memory for good, no confirmation, and answers `deleted memory #<id>: <text>` (text cut at 200 characters). |
+| `/memory reindex` | Indexes your memories that have no vector yet (see Vector search) and answers `reindexed N of M memories`; also switches vector search back on after a failure. |
+
+- The list has one line per memory, newest first, 20 per page:
+  `#<id> [<keywords>] (updated <time>) <text>`, with the text cut at 80
+  characters, then `page <n> of <pages>` and, when there is more,
+  `next page: /memory list <n+1>`. With no memory it answers `(no memories)`; past
+  the last page, `no page <n>: there is <pages> page(s)`.
+- `/memory reindex`: `M` is the number of your memories without a vector in the
+  current collection, `N` how many were indexed now (all of them). With vector
+  search not switched on it answers `vector search is off: set [tools]
+  memory_vectors = true`. When the index has switched itself off, the command
+  switches it back on and retries; if the retry fails it answers `vector search
+  is off: <reason>` with the new reason. A second run answers `reindexed 0 of 0
+  memories`.
+- An unknown id answers `no memory #<id>`.
+- Any other form (a word that is not `list`, `show` or `delete`, an id that is not
+  a positive whole number, extra words) prints the usage text.
+- Control and look-alike characters show as `\uXXXX`.
+- When memory is off (the two settings above are not both set) it answers `memory
+  is off: set [tools] memory = true and user_id in config.toml`. The usage text
+  is shown regardless.
 
 ## Model fallback and usage tracking
 
@@ -817,11 +1875,12 @@ stdout holds only the reply.
 
 Every model call, failed ones too, is recorded in a SQLite file,
 `~/.local/share/llm-harness/harness.db` (directory mode 0700, file mode 0600;
-the path can be changed with `[storage.relational] path`, see Storage).
+the path can be changed with `[storage.relational] path`, see Storage), or on a
+PostgreSQL server when `[storage.relational] backend = "postgres"` (see Postgres).
 It stores the model id, provider id, token counts, cost, time, outcome and error
 kind, plus the backoff state. It never stores prompts, replies, error messages
-or keys. If the file cannot be used, the chat keeps working, one notice says
-that usage and backoff are not saved, and the file is left untouched.
+or keys. If the file (or the server) cannot be used, the chat keeps working, one
+notice says that usage and backoff are not saved, and the file is left untouched.
 
 ## Orchestrator
 
@@ -978,7 +2037,7 @@ Terminal UI only:
 | `--no-think` | turn thinking off |
 | `--plain` | line-based chat (mutually exclusive with `--gui`) |
 | `--gui` | web GUI (mutually exclusive with `--plain`) |
-| `--storage-status` | show the state of the three stores and exit; changes nothing (exclusive with `--plain` and `--gui`; see Storage) |
+| `--storage-status` | show the state of the three stores and exit; changes nothing; for a remote vector backend (`qdrant`) the server is not contacted, for the relational backend `postgres` and the vector backend `pgvector` the server is contacted read-only (exclusive with `--plain` and `--gui`; see Storage) |
 
 `--think` and `--no-think` are mutually exclusive. Precedence: flag, then the
 model's `thinking` key, then the model's own default.
@@ -1026,6 +2085,28 @@ known whether it accepts the `thinking` settings as sent.
 - The program warns on stderr when `config.toml` is readable or writable by
   group or other (`chmod 600`) or the config directory is writable by group or
   other (`chmod 700`).
+- With `[storage.vector] backend = "qdrant"`, an optional qdrant API key lives in
+  `~/.config/llm-harness/secrets.toml`, never in `config.toml`. The program
+  refuses the file when group or other users can read it (`chmod 600`), the key
+  is never printed (it shows as `[REDACTED:api_key]`), and the file is read only
+  with that backend. The vectors on a qdrant server are separated per user only
+  by a filter in the program's queries, not by the server: whoever can reach the
+  server or holds its key can read them all (see Remote qdrant, step 9).
+- With `[storage.relational] backend = "postgres"`, the database password lives
+  in the same `secrets.toml`, under `[postgres]`, never in `config.toml` (a
+  password in the `url` is refused). The same rules apply: mode 600, the
+  password is never printed (it shows as `[REDACTED:api_key]`), and the file is
+  read only when a backend that needs a secret is selected. The server's own
+  error text is never shown, because it would name the host and the user or
+  quote a row; the messages carry only the error type (see Postgres, step 9).
+- With `[storage.vector] backend = "pgvector"`, the database password is the same
+  `[postgres] password` in `secrets.toml` (read when the vector backend is
+  `pgvector` too), under the same rules. The vectors of all users of a collection
+  live in one table and are separated only by a filter in the program's queries,
+  not by the server: anyone who can reach the database can read them all. The
+  server gets the vector, the `user_id` and the note id, not the note text. The
+  messages carry only the error type, never the server's text (see pgvector,
+  step 10).
 - The GUI has no login. It binds `127.0.0.1` only and answers HTTP 403 to any
   request whose Host or Origin is not `127.0.0.1:<port>` or `localhost:<port>`.
 - `/export` in the terminal UI creates the file exclusively with mode 0600 and
@@ -1062,6 +2143,73 @@ known whether it accepts the `thinking` settings as sent.
   or `model_tags` that no chat model carries together. Fix `agents.yaml` or
   `models.yaml`. A config made before agents existed has no `agents.yaml`: answer
   `y` to the offer to write the example.
+- `invalid config.toml: storage.vector: backend "qdrant" needs the optional extra
+  remote, which is not installed; run: uv sync --extra remote` appears before the
+  app starts. Run `uv sync --extra remote` once (see Remote qdrant, step 3).
+- `invalid config.toml: storage.vector: backend "qdrant" requires url, ...`
+  appears before the app starts. Add `url = "http://127.0.0.1:6333"` (or your
+  server's address) under `[storage.vector]`.
+- `invalid config.toml: storage.vector: backend "pgvector" needs the optional extra
+  postgres, which is not installed; run: uv sync --extra postgres` appears before
+  the app starts. Run `uv sync --extra postgres` once (see pgvector, step 3).
+- `invalid config.toml: storage.vector: backend "pgvector" requires url, ...`
+  appears before the app starts. Add `url = "postgresql://postgres@127.0.0.1:5433/llm_harness"`
+  (or your server's address) under `[storage.vector]`.
+- `  extension: not created in this database (an administrator runs: CREATE
+  EXTENSION vector;)` in `--storage-status`, or the same words in the message `the
+  pgvector extension is not created in this database: ...`: the server has
+  pgvector, but nobody created the extension in the database named in
+  `[storage.vector] url`. An administrator (a superuser) runs `CREATE EXTENSION
+  vector;` there (pgvector, step 2: `docker exec llm-harness-pgvector psql -U
+  postgres -d llm_harness -c "CREATE EXTENSION vector;"`), then run `/memory
+  reindex`.
+- `  extension: not installed on this server (install the pgvector package, then
+  run: CREATE EXTENSION vector;)`, or the message `the pgvector extension is not
+  installed on this PostgreSQL server: ...`: the server has no pgvector (a plain
+  `postgres:17` image has none). Install the pgvector package on the server or
+  use the image `pgvector/pgvector:pg17`, then run `CREATE EXTENSION vector;`.
+- `  cannot connect (<ExceptionType>)` under `vector: pgvector` in
+  `--storage-status`: the server did not accept the connection (a wrong password
+  and a closed port both give `cannot connect (OperationalError)`). Check that the
+  server runs (for the Docker server of pgvector, step 2: `docker exec
+  llm-harness-pgvector pg_isready -U postgres -d llm_harness`), the `url` and the
+  password in `~/.config/llm-harness/secrets.toml` (mode 600).
+- `memory vector search is off: VectorStoreError: the pgvector extension is not
+  created in this database: ...` or `... vector store failed on collection
+  '<name>': OperationalError`, while `backend = "pgvector"`: the extension is
+  missing, or the server is not running or not reachable at `url` or the password
+  is wrong. Fix it as in the two entries above, then run `/memory reindex`.
+- `invalid config.toml: storage.relational: backend "postgres" needs the optional
+  extra postgres, which is not installed; run: uv sync --extra postgres` appears
+  before the app starts. Run `uv sync --extra postgres` once (see Postgres,
+  step 3).
+- `invalid config.toml: storage.relational: backend "postgres" requires url, ...`
+  appears before the app starts. Add `url = "postgresql://postgres@127.0.0.1:5432/llm_harness"`
+  (or your server's address) under `[storage.relational]`.
+- `  cannot connect (<ExceptionType>)` under `relational: postgres` in
+  `--storage-status`: the server did not accept the connection. It is the line
+  you get for a wrong password (`cannot connect (OperationalError)` was seen) and
+  for a closed port. Check that the server runs (for the Docker server of Postgres,
+  step 2: `docker exec llm-harness-postgres pg_isready -U postgres -d llm_harness`),
+  the `url` and the password in `~/.config/llm-harness/secrets.toml` (mode 600).
+  The server's own message is never shown; look at the server's own log.
+- `usage database unavailable (<ExceptionType>): postgres; usage and backoff are
+  not saved` appears once during a chat (for example `usage database unavailable
+  (OperationalError): postgres; ...` with a stopped server; later calls show
+  nothing more): the Postgres server could not be used when a model call was
+  recorded. The chat continues; nothing is saved until you
+  restart the program. Fix the server, the `url` or the password as for
+  `cannot connect`, then restart.
+- `memory vector search is off: VectorStoreError: vector store failed on
+  collection '<name>': UnexpectedResponse (HTTP 401)`: the qdrant server wants an
+  API key and got none or a wrong one. Put the right key in
+  `~/.config/llm-harness/secrets.toml` with mode 600 (Remote qdrant, step 5), then
+  run `/memory reindex`.
+- `memory vector search is off: <reason>; keyword search only` with a `vector
+  store failed on collection ...` reason, while `backend = "qdrant"`: the server
+  is probably not running or not reachable at `url`. Check it, for example with
+  `curl -s http://127.0.0.1:6333/healthz` (it prints `healthz check passed` when
+  the server is ready), then run `/memory reindex`.
 - `tool <name> is not available; available tools: ...` and `invalid arguments
   for tool <name>: ...` are observations the model receives, not errors shown to
   you; if the model keeps repeating them, a stronger model may help (advice, not tested).
@@ -1085,6 +2233,54 @@ Live tests read your real config. `LLM_HARNESS_LIVE_MODEL` (OpenAI-compatible
 test) and `LLM_HARNESS_LIVE_VERTEX_MODEL` (Vertex test) are test-only variables
 that choose the model; the application never reads them.
 
+The remote qdrant live test needs a qdrant server and skips, with a printed
+reason, when `LLM_HARNESS_LIVE_QDRANT_URL` is unset or no server answers within
+3 seconds. The module docstring of `tests/test_live_qdrant.py` has the container
+commands; with a server on `http://127.0.0.1:6333` (the Docker command under
+Remote qdrant, step 2):
+
+```sh
+LLM_HARNESS_LIVE_QDRANT_URL=http://127.0.0.1:6333 uv run pytest -m live tests/test_live_qdrant.py
+```
+
+It is deselected by default; the default suite uses fakes and needs no server.
+
+The Postgres live tests need a PostgreSQL server. They skip, with a printed
+reason, when `LLM_HARNESS_LIVE_POSTGRES_URL` is unset or no server answers
+within 3 seconds. The commands are in the module docstrings of
+`tests/test_live_postgres.py` and `tests/test_storage_relational.py`:
+
+```sh
+docker --context rancher-desktop run -d --rm --name llm-harness-live-postgres -e POSTGRES_PASSWORD=live-test-password -e POSTGRES_DB=llm_harness_live -p 127.0.0.1:15432:5432 postgres:17
+LLM_HARNESS_LIVE_POSTGRES_URL=postgresql://postgres@127.0.0.1:15432/llm_harness_live LLM_HARNESS_LIVE_POSTGRES_PASSWORD=live-test-password uv run pytest -m live tests/test_live_postgres.py tests/test_storage_relational.py
+docker --context rancher-desktop rm -f llm-harness-live-postgres
+```
+
+The pgvector live tests need a server with the pgvector extension and a second,
+plain `postgres:17` server (only for the "not installed" tests; they skip without
+it). They skip, with a printed reason, when `LLM_HARNESS_LIVE_PGVECTOR_URL` is
+unset or no server answers within 3 seconds. The commands are in the module
+docstring of `tests/test_live_pgvector.py`:
+
+```sh
+docker --context rancher-desktop run -d --rm --name llm-harness-live-pgvector -e POSTGRES_PASSWORD=live-test-password -e POSTGRES_DB=llm_harness_live -p 127.0.0.1:15433:5432 pgvector/pgvector:pg17
+docker --context rancher-desktop run -d --rm --name llm-harness-live-pgplain -e POSTGRES_PASSWORD=live-test-password -e POSTGRES_DB=llm_harness_live -p 127.0.0.1:15434:5432 postgres:17
+LLM_HARNESS_LIVE_PGVECTOR_URL=postgresql://postgres@127.0.0.1:15433/llm_harness_live LLM_HARNESS_LIVE_PGVECTOR_PLAIN_URL=postgresql://postgres@127.0.0.1:15434/llm_harness_live LLM_HARNESS_LIVE_POSTGRES_PASSWORD=live-test-password uv run pytest -m live tests/test_live_pgvector.py tests/test_storage_vectors.py -v -rs
+docker --context rancher-desktop rm -f llm-harness-live-pgvector
+docker --context rancher-desktop rm -f llm-harness-live-pgplain
+```
+
+Wait a few seconds after `run` until `docker --context rancher-desktop exec
+llm-harness-live-pgvector pg_isready -U postgres` answers. The tests DROP the
+tables `vector_points` and `vector_collections` and drop and recreate the
+`vector` extension, so they skip unless the database name in the url contains
+`live` or `test`. Never point them at a database that holds real vectors.
+
+Some of these tests DROP the ledger tables (`llm_calls`, `model_backoff`) and
+the `ledger` version row of the database, so they skip unless the database name
+in the url contains `live` or `test`. Never point them at a database that holds
+usage data. They are deselected by default; the default suite needs no server.
+
 The embedding live test embeds two short texts with the `embedding` model of
 your config. It skips, and `-rs` prints the reason, when no `embedding` entry
 exists, the entry is not on an `ollama` provider, or Ollama or the model is not
@@ -1100,12 +2296,68 @@ reachable.
   fall back to a model tagged `default` outside its `model_tags`. No real model
   run of delegation was done; the tests use scripted fake models.
 - The only real tools are the two optional web tools, `run_command` and the four
-  memory tools; there are no RAG tools yet. The memory tools have not been seen
-  working with a real model (see Agent memory). `run_command` is not sandboxed
+  memory tools; there are no RAG tools yet. The memory tools and the reflection
+  step have not been seen working with a real model (see Agent memory). `run_command` is not sandboxed
   (see Command execution) and there is no Docker backend yet.
-- Usage and backoff are only saved if the SQLite file can be used; the new note
-  and usage lines were not looked at in a real browser or terminal.
+- Usage and backoff are only saved if the ledger database (the SQLite file, or
+  the Postgres server) can be used; the new note and usage lines were not looked
+  at in a real browser or terminal.
 - OpenAI is untested.
+- Changing `[storage.vector]` (backend, or `url` to another or a wiped server)
+  does not move vectors: the markers in the SQLite table `memory_vectors` still
+  say "indexed", `/memory reindex` answers `reindexed 0 of 0 memories`, and notes
+  saved before the switch are not found by vector search in the new store
+  (keyword search still finds them). The workaround is in Remote qdrant, step 8;
+  a proper `/memory reindex --all` is planned as roadmap item
+  `memory-reindex-all`. The workaround is: stop llm-harness, run
+  `sqlite3 ~/.local/share/llm-harness/harness.db "DELETE FROM memory_vectors;"`
+  (your `[storage.relational] path` if you set one), start it again and run
+  `/memory reindex`.
+- The remote qdrant backend: a server that enforces an API key was tested against
+  qdrant 1.20.0 over plain http, started with the container variable (the right
+  key works; no key or a wrong key gives HTTP 401). Not tested: https/TLS against
+  a real server, a slow or hung server, other qdrant versions and hosted qdrant
+  services, and the runtime vector-search-off notice and the HTTP 404
+  unknown-collection message at CLI level (covered by tests with fakes, not run
+  against a live CLI). Plain `http://` with a key is allowed and only warns; the qdrant
+  client library prints its own warning, `Api key is used with an insecure
+  connection`, for that case (seen in the live run).
+- Postgres status lines: `  schema: not readable (<ExceptionType>)` and
+  `  schema: ledger not set up yet (it is set up on first use)` are covered by
+  tests with fakes, but were not provoked against a real server in the README
+  check. `pg_isready` can answer before the image has finished initialising, so
+  wait a few seconds and run it again (Postgres, step 2).
+- The Postgres relational backend was checked against PostgreSQL 17.11 (image
+  `postgres:17`) with psycopg 3.3.7 over a plain connection. Not tested: a TLS
+  connection that succeeds (only that `sslmode=require` against a server without
+  TLS fails with a clear error), servers other than version 17, and a server
+  that is far away. Other limits: the program opens one connection per call and
+  does not pool connections, so a server over a slow network makes each call
+  slower; two processes recording a backoff are serialised with a Postgres
+  advisory lock with the fixed key 6678241091312392647 (derived from the name
+  `llm-harness:relational`), so another application that takes an advisory lock
+  with that exact key on the same database would block them (very unlikely); the
+  existing ledger history in the SQLite file is not copied to Postgres; and
+  the existing memories in the SQLite file are not copied to Postgres. Agent
+  memory on Postgres was checked (live tests) against PostgreSQL 17 only; other
+  server versions, TLS and large collections or performance were NOT tested.
+- The pgvector backend was checked against PostgreSQL 17.11 (image
+  `pgvector/pgvector:pg17`, pgvector 0.8.7) with psycopg 3.3.7 over a plain
+  connection, with SQLite as the relational store and a fake embedding model.
+  Not tested: a TLS connection that succeeds, servers or pgvector versions other
+  than these, and a real embedding model. Other limits: the vector database uses
+  the same `[postgres] password` as the relational Postgres database, so ONE
+  password serves both Postgres uses, and a vector database that needs a
+  DIFFERENT password is not supported; there is no index, so search is exact and
+  slows down as a collection grows, and an index created by hand would not be used
+  by the program's current queries (checked with EXPLAIN on 3000 rows: they order
+  by the plain vector column, and an expression index on a cast only matches
+  queries that use the same cast); an optional approximate index is the planned
+  roadmap item `pgvector-index`, which has to change the queries; changing `[storage.vector]` does not move
+  vectors (the workaround is in pgvector, step 8); and the payload findings of
+  pgvector, step 9 (key order is not kept, very large floats come back as
+  integers, a NUL character in a payload string is refused, values outside the
+  float32 range are refused).
 - Nothing was verified in a real browser except by the author's own manual run.
 - Markdown was not looked at in a real browser or terminal (layout, CSS and
   code colours are unchecked); table column alignment is dropped in the GUI.

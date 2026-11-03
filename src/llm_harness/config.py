@@ -1,11 +1,12 @@
 """Configuration loader: providers and secrets (config.toml), models (models.yaml)."""
 
+import importlib.util
 import math
 import os
 import tomllib
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 import yaml
 from pydantic import (
@@ -202,15 +203,12 @@ def default_data_dir() -> Path:
     return Path.home() / ".local" / "share" / "llm-harness"
 
 
-# Backends the program can use now, and backends that are recognised but come
-# with a later feature: naming them tells the user the config is not wrong, the
-# feature is just not here yet.
+# Backends the program can use; anything else is rejected by name.
 _AVAILABLE_BACKENDS = {
-    "relational": ("sqlite",),
-    "vector": ("qdrant-edge", "none"),
+    "relational": ("sqlite", "postgres"),
+    "vector": ("qdrant-edge", "qdrant", "pgvector", "none"),
     "files": ("local",),
 }
-_PLANNED_BACKENDS = {"relational": ("postgres",), "vector": ("qdrant",), "files": ()}
 
 
 def _check_backend(kind: str, value: str) -> str:
@@ -219,12 +217,6 @@ def _check_backend(kind: str, value: str) -> str:
         return value
     valid = ", ".join(available)
     # The message is built here: pydantic's template syntax has no !r.
-    if value in _PLANNED_BACKENDS[kind]:
-        raise PydanticCustomError(
-            "backend_planned",
-            f"{value!r} is not available yet (planned feature "
-            f"storage-backends-remote); use one of: {valid}",
-        )
     raise PydanticCustomError(
         "backend_unknown", f"unknown backend {value!r}; use one of: {valid}"
     )
@@ -248,9 +240,120 @@ def _check_storage_path(value: object) -> object:
     return path
 
 
+_POSTGRES_SSLMODES = (
+    "disable",
+    "allow",
+    "prefer",
+    "require",
+    "verify-ca",
+    "verify-full",
+)
+_POSTGRES_QUERY_KEYS = ("sslmode", "connect_timeout")
+_POSTGRES_URL_EXAMPLE = "postgresql://user@db.example:5432/llm_harness"
+
+
+def _postgres_driver_installed() -> bool:
+    """True when the optional `postgres` extra is installed; a function so tests patch it."""
+    return importlib.util.find_spec("psycopg") is not None
+
+
+def _postgres_url_error(code: str, message: str) -> PydanticCustomError:
+    # Every message avoids echoing the url (or any part of it): it may carry a secret.
+    return PydanticCustomError(code, message)
+
+
+def _check_postgres_query(query: str) -> None:
+    pairs = parse_qsl(query, keep_blank_values=True, separator="&")
+    names = [name for name, _ in pairs]
+    allowed = ", ".join(_POSTGRES_QUERY_KEYS)
+    for name in names:
+        if name not in _POSTGRES_QUERY_KEYS:
+            # A parameter name is not a secret, but a stray word may be one.
+            shown = (
+                f"query parameter {name!r}"
+                if name.isidentifier()
+                else "a query parameter"
+            )
+            raise _postgres_url_error(
+                "url_query_unknown",
+                f"url has {shown} that is not allowed (credentials and other "
+                f"settings do not belong in config.toml); allowed: {allowed}",
+            )
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise _postgres_url_error(
+            "url_query_duplicate",
+            f"url repeats the query parameter {duplicates[0]!r}; give each once",
+        )
+    for name, value in pairs:
+        if name == "sslmode" and value not in _POSTGRES_SSLMODES:
+            raise _postgres_url_error(
+                "url_sslmode",
+                "url sslmode must be one of: " + ", ".join(_POSTGRES_SSLMODES),
+            )
+        if name == "connect_timeout" and not (
+            value.isascii() and value.isdigit() and 1 <= int(value) <= 120
+        ):
+            raise _postgres_url_error(
+                "url_connect_timeout",
+                "url connect_timeout must be a whole number of seconds, 1 to 120",
+            )
+
+
+def _check_postgres_url(url: str) -> None:
+    """Raise unless `url` is a postgres URL with one host, a database and no secret."""
+    invalid = _postgres_url_error(
+        "url_invalid",
+        "url must be a postgresql:// or postgres:// URL with a host and a "
+        f"database name, for example {_POSTGRES_URL_EXAMPLE}",
+    )
+    if any(c.isspace() or not c.isprintable() for c in url):
+        raise _postgres_url_error(
+            "url_characters", "url must not contain whitespace or control characters"
+        )
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        raise invalid from None
+    if parts.scheme not in ("postgresql", "postgres"):
+        raise invalid
+    if "," in parts.netloc:
+        raise _postgres_url_error(
+            "url_multihost",
+            "url must name exactly one host; several hosts are not supported",
+        )
+    if not host:
+        raise invalid
+    database = parts.path[1:]
+    if not database or "/" in database:
+        raise _postgres_url_error(
+            "url_database",
+            "url must end with one database name, as in /llm_harness",
+        )
+    try:
+        port = parts.port
+    except ValueError:
+        port = 0  # not a number, or above 65535
+    if port is not None and not 1 <= port <= 65535:
+        raise _postgres_url_error("url_port", "url port must be 1 to 65535")
+    if ":" in parts.netloc.rpartition("@")[0]:
+        raise _postgres_url_error(
+            "url_credentials",
+            "url must not contain a password (user:pass@); credentials do not "
+            "belong in config.toml, put it in secrets.toml under [postgres] "
+            'as password = "..."',
+        )
+    if parts.fragment:
+        raise _postgres_url_error("url_fragment", "url must not contain a #fragment")
+    _check_postgres_query(parts.query)
+
+
 class RelationalConfig(_Frozen):
     backend: str = "sqlite"
     path: Path | None = None
+    # Only for backend "postgres": the server address and database (no password).
+    url: str | None = None
 
     @field_validator("backend")
     @classmethod
@@ -259,13 +362,70 @@ class RelationalConfig(_Frozen):
 
     _path_rule = field_validator("path", mode="before")(_check_storage_path)
 
+    @model_validator(mode="after")
+    def _check_url_rules(self) -> Self:
+        if self.backend != "postgres":
+            if self.url is not None:
+                raise PydanticCustomError(
+                    "url_unused", 'url is only used with backend = "postgres"'
+                )
+            return self
+        if self.url is None:
+            raise PydanticCustomError(
+                "url_missing",
+                'backend "postgres" requires url, for example '
+                f'url = "{_POSTGRES_URL_EXAMPLE}"',
+            )
+        if self.path is not None:
+            raise PydanticCustomError(
+                "path_unused", 'path is only used with a local backend, not "postgres"'
+            )
+        _check_postgres_url(self.url)
+        if not _postgres_driver_installed():
+            raise PydanticCustomError(
+                "extra_missing",
+                'backend "postgres" needs the optional extra postgres, which is not '
+                "installed; run: uv sync --extra postgres",
+            )
+        return self
+
     def resolved_path(self, data_dir: Path) -> Path:
         return self.path or data_dir / "harness.db"
+
+
+def _qdrant_client_installed() -> bool:
+    """True when the optional `remote` extra is installed; a function so tests patch it."""
+    return importlib.util.find_spec("qdrant_client") is not None
+
+
+def _check_qdrant_url(url: str) -> None:
+    """Raise unless `url` is an absolute http(s) URL with a host and no userinfo."""
+    try:
+        parts = urlsplit(url)
+        has_host = bool(parts.hostname)
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError:
+        parts, has_host = None, False
+    if parts is None or parts.scheme not in ("http", "https") or not has_host:
+        # The message does not echo the url: it may carry credentials.
+        raise PydanticCustomError(
+            "url_invalid",
+            "url must be an absolute http:// or https:// URL with a host, "
+            "for example https://qdrant.example:6333",
+        )
+    if "@" in parts.netloc:
+        raise PydanticCustomError(
+            "url_credentials",
+            "url must not contain credentials (user:pass@); credentials do not "
+            "belong in config.toml",
+        )
 
 
 class VectorConfig(_Frozen):
     backend: str = "qdrant-edge"
     path: Path | None = None
+    # Only for backends "qdrant" and "pgvector": the server address (no secrets).
+    url: str | None = None
 
     @field_validator("backend")
     @classmethod
@@ -273,6 +433,49 @@ class VectorConfig(_Frozen):
         return _check_backend("vector", value)
 
     _path_rule = field_validator("path", mode="before")(_check_storage_path)
+
+    @model_validator(mode="after")
+    def _check_url_rules(self) -> Self:
+        if self.backend not in ("qdrant", "pgvector"):
+            if self.url is not None:
+                raise PydanticCustomError(
+                    "url_unused",
+                    'url is only used with backend = "qdrant" or "pgvector"',
+                )
+            return self
+        if self.url is None:
+            example = (
+                _POSTGRES_URL_EXAMPLE
+                if self.backend == "pgvector"
+                else "https://qdrant.example:6333"
+            )
+            raise PydanticCustomError(
+                "url_missing",
+                f'backend "{self.backend}" requires url, for example url = "{example}"',
+            )
+        if self.path is not None:
+            raise PydanticCustomError(
+                "path_unused",
+                f'path is only used with a local backend, not "{self.backend}"',
+            )
+        if self.backend == "pgvector":
+            # The relational postgres url rules, unchanged.
+            _check_postgres_url(self.url)
+            if not _postgres_driver_installed():
+                raise PydanticCustomError(
+                    "extra_missing",
+                    'backend "pgvector" needs the optional extra postgres, which is '
+                    "not installed; run: uv sync --extra postgres",
+                )
+            return self
+        _check_qdrant_url(self.url)
+        if not _qdrant_client_installed():
+            raise PydanticCustomError(
+                "extra_missing",
+                'backend "qdrant" needs the optional extra remote, which is not '
+                "installed; run: uv sync --extra remote",
+            )
+        return self
 
     def resolved_path(self, data_dir: Path) -> Path:
         return self.path or data_dir / "vectors"
@@ -313,6 +516,9 @@ class ToolsConfig(_Frozen):
     # Registers the `memory_*` tools (short English notes kept per user_id); needs
     # user_id. The writes run without an approval prompt and show a one-line notice.
     memory: StrictBool = False
+    # Adds vector search to `memory`; needs an `embedding` model and falls back to
+    # keyword search on any problem.
+    memory_vectors: StrictBool = False
     # Longest a command may run, in seconds (1 to 120).
     command_timeout_seconds: Annotated[StrictInt, Field(ge=1, le=120)] = 30
     # Program names or absolute paths that may run; empty allows any command not denied.
@@ -408,6 +614,9 @@ class HarnessConfig(_Frozen):
     storage: StorageConfig = StorageConfig()
     tools: ToolsConfig = ToolsConfig()
     agents: list[AgentConfig] = []
+    # From secrets.toml; each is read only when its backend is selected.
+    qdrant_api_key: Secret | None = None
+    postgres_password: Secret | None = None
 
     _user_id_rule = field_validator("user_id", mode="before")(_check_user_id)
 
@@ -533,6 +742,14 @@ def load_config(config_dir: Path) -> HarnessConfig:
 
     models = _load_models(models_path)
     agents = _load_agents(agents_path, models)
+    # secrets_file imports ConfigError from here, so import it late.
+    from llm_harness.secrets_file import load_secrets
+
+    uses_pgvector = storage.vector.backend == "pgvector"
+    uses_postgres = storage.relational.backend == "postgres" or uses_pgvector
+    uses_qdrant = storage.vector.backend == "qdrant"
+    # One read serves all backends; the file stays closed when none needs a secret.
+    secrets = load_secrets(config_dir) if uses_postgres or uses_qdrant else None
     try:
         return HarnessConfig(
             providers=providers,
@@ -541,6 +758,10 @@ def load_config(config_dir: Path) -> HarnessConfig:
             storage=storage,
             tools=tools,
             agents=agents,
+            qdrant_api_key=secrets.qdrant_api_key if secrets and uses_qdrant else None,
+            postgres_password=(
+                secrets.postgres_password if secrets and uses_postgres else None
+            ),
         )
     except ValidationError as exc:
         raise _format_validation_error(MODELS_FILE, exc) from None
@@ -768,15 +989,25 @@ base_url = "http://localhost:11434"
 # Where data lives; every key is optional and the values below are what you
 # get when you write nothing. Paths must be absolute (or start with ~).
 # Write these tables after user_id.
-# Relational data (usage ledger): "sqlite" is the only backend available now.
+# Relational data (usage ledger): "sqlite" (a local file) or "postgres".
 # [storage.relational]
-# backend = "sqlite"
-# path = "/absolute/path/harness.db"   # default: ~/.local/share/llm-harness/harness.db
+# backend = "sqlite"                   # or "postgres"
+# path = "/absolute/path/harness.db"   # sqlite only; default: ~/.local/share/llm-harness/harness.db
+# url = "postgresql://user@db.example:5432/llm_harness"   # postgres only, required; no password in it
 
-# Vector search: "qdrant-edge" (local), or "none" to turn vector search off.
+# Vector search: "qdrant-edge" (local files), "qdrant" (a qdrant server),
+# "pgvector" (PostgreSQL with the pgvector extension) or "none" to turn vector
+# search off.
 # [storage.vector]
-# backend = "qdrant-edge"              # or "none" to turn vector search off
-# path = "/absolute/path"              # default: ~/.local/share/llm-harness/vectors
+# backend = "qdrant-edge"              # or "qdrant", "pgvector", or "none"
+# path = "/absolute/path"              # qdrant-edge only; default: ~/.local/share/llm-harness/vectors
+# url = "http://127.0.0.1:6333"        # qdrant and pgvector only, required; no password in it
+# The qdrant backend needs the optional package: uv sync --extra remote.
+# If the server requires an API key, put it in secrets.toml next to this file
+# (see the README, "Remote qdrant"), never in this file.
+# The pgvector backend needs the optional package: uv sync --extra postgres, and
+# a url like "postgresql://user@db.example:5432/database"; its password goes in
+# secrets.toml under [postgres] (see the README, "pgvector").
 
 # Files: "local" is the only backend available now.
 # [storage.files]
@@ -792,6 +1023,7 @@ base_url = "http://localhost:11434"
 # web_relax_tls_strict = false         # true only behind a TLS-inspecting proxy; chain and host name stay checked
 # run_command = true                   # tool: run a program (argv, no shell); every call needs your approval
 # memory = true                       # tools: short English notes kept per user_id (needs user_id); saves run with no prompt, one notice line
+# memory_vectors = true               # memory: also search by meaning (needs a model tagged "embedding"); falls back to keyword search on any problem
 # command_timeout_seconds = 30         # longest a command may run, 1 to 120
 # command_allow = ["git", "/usr/bin/make"]   # match the program (argv[0]) only; empty allows any command not denied
 # command_deny = ["rm*"]               # deny wins over allow; a built-in deny list (shells, sudo, curl, ...) always applies

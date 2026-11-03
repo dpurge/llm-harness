@@ -36,6 +36,25 @@ class SchemaTooNewError(Exception):
     """The database was written by a newer version of this program."""
 
 
+class RelationalStoreError(Exception):
+    """A relational step failed; `str(exc)` never shows server text, a url or a password."""
+
+
+def database_error_classes() -> tuple[type[Exception], ...]:
+    """Every driver error class a relational call can raise: sqlite3, plus psycopg if installed.
+
+    A caller that must survive a database failure catches this tuple, so it does
+    not import a driver that a bare install lacks. The usage ledger in
+    `llm_harness.store` catches this tuple (`_database_errors`).
+    """
+    classes: tuple[type[Exception], ...] = (sqlite3.Error,)
+    try:
+        import psycopg
+    except ImportError:
+        return classes
+    return (*classes, psycopg.Error)
+
+
 @dataclass(frozen=True)
 class ReadOnlySchema:
     """What a database file records about its schema, read without changing it."""
@@ -92,6 +111,9 @@ def _check_namespace(namespace: str) -> None:
 
 
 class SqliteRelationalStore:
+    # The usage ledger picks its dialect-specific migrations by this name.
+    dialect = "sqlite"
+
     def __init__(self, path: Path) -> None:
         self._path = path
         self._lock = threading.Lock()  # guards `_prepared`

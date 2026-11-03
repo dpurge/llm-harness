@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from pydantic import TypeAdapter
 
+import llm_harness.config as config_module
 from llm_harness.config import (
     EXAMPLE_AGENTS_YAML,
     EXAMPLE_CONFIG_TOML,
@@ -1137,30 +1138,10 @@ def test_each_valid_backend_loads(tmp_path: Path, table: str, backend: str):
 
 
 @pytest.mark.parametrize(
-    ("table", "backend"), [("relational", "postgres"), ("vector", "qdrant")]
-)
-def test_planned_backends_are_rejected_by_name(
-    tmp_path: Path, table: str, backend: str
-):
-    message = storage_error(tmp_path, f'[storage.{table}]\nbackend = "{backend}"\n')
-    assert message.startswith(f"invalid config.toml: storage.{table}.backend: ")
-    assert f"'{backend}' is not available yet" in message
-    assert "storage-backends-remote" in message
-
-
-def test_planned_vector_backend_message_is_exact(tmp_path: Path):
-    message = storage_error(tmp_path, '[storage.vector]\nbackend = "qdrant"\n')
-    assert message == (
-        "invalid config.toml: storage.vector.backend: 'qdrant' is not available yet "
-        "(planned feature storage-backends-remote); use one of: qdrant-edge, none"
-    )
-
-
-@pytest.mark.parametrize(
     ("table", "valid"),
     [
-        ("relational", "sqlite"),
-        ("vector", "qdrant-edge, none"),
+        ("relational", "sqlite, postgres"),
+        ("vector", "qdrant-edge, qdrant, pgvector, none"),
         ("files", "local"),
     ],
 )
@@ -1169,6 +1150,101 @@ def test_unknown_backend_lists_valid_values(tmp_path: Path, table: str, valid: s
     assert (
         f"storage.{table}.backend: unknown backend 'x'; use one of: {valid}" in message
     )
+
+
+QDRANT_URL = "https://qdrant.example:6333"
+
+
+def qdrant_toml(extra: str = f'url = "{QDRANT_URL}"\n') -> str:
+    return f'[storage.vector]\nbackend = "qdrant"\n{extra}'
+
+
+@pytest.fixture
+def client_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config_module, "_qdrant_client_installed", lambda: True)
+
+
+def test_qdrant_with_a_valid_url_loads(tmp_path: Path, client_installed: None):
+    storage = load_storage(tmp_path, qdrant_toml())
+    assert (storage.vector.backend, storage.vector.url) == ("qdrant", QDRANT_URL)
+    assert storage.vector.path is None
+
+
+def test_http_url_with_port_loads(tmp_path: Path, client_installed: None):
+    storage = load_storage(tmp_path, qdrant_toml('url = "http://10.0.0.5:6333"\n'))
+    assert storage.vector.url == "http://10.0.0.5:6333"
+
+
+def test_qdrant_without_url_is_rejected_naming_url(
+    tmp_path: Path, client_installed: None
+):
+    message = storage_error(tmp_path, qdrant_toml(""))
+    assert message.startswith("invalid config.toml: storage.vector: ")
+    assert "requires url" in message
+
+
+@pytest.mark.parametrize(
+    "url", ["ftp://h:1", "qdrant.example:6333", "//qdrant.example", "http://", "/x"]
+)
+def test_qdrant_url_must_be_absolute_http_with_host(
+    tmp_path: Path, client_installed: None, url: str
+):
+    message = storage_error(tmp_path, qdrant_toml(f'url = "{url}"\n'))
+    assert "url must be an absolute http:// or https:// URL with a host" in message
+
+
+def test_qdrant_url_with_a_bad_port_is_rejected(tmp_path: Path, client_installed: None):
+    message = storage_error(tmp_path, qdrant_toml('url = "http://h:notaport"\n'))
+    assert "url must be an absolute http:// or https:// URL" in message
+
+
+def test_qdrant_url_with_userinfo_is_rejected_without_echo(
+    tmp_path: Path, client_installed: None
+):
+    message = storage_error(
+        tmp_path, qdrant_toml('url = "https://user:s3cret@qdrant.example"\n')
+    )
+    assert "credentials do not belong in config.toml" in message
+    assert "s3cret" not in message
+
+
+def test_qdrant_with_path_is_rejected(tmp_path: Path, client_installed: None):
+    message = storage_error(
+        tmp_path, qdrant_toml(f'url = "{QDRANT_URL}"\npath = "/v"\n')
+    )
+    assert "path is only used with a local backend" in message
+
+
+@pytest.mark.parametrize("backend", ["qdrant-edge", "none"])
+def test_url_with_a_local_backend_is_rejected(tmp_path: Path, backend: str):
+    message = storage_error(
+        tmp_path,
+        f'[storage.vector]\nbackend = "{backend}"\nurl = "{QDRANT_URL}"\n',
+    )
+    assert 'url is only used with backend = "qdrant" or "pgvector"' in message
+
+
+def test_qdrant_without_the_client_names_the_extra_and_the_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(config_module, "_qdrant_client_installed", lambda: False)
+    message = storage_error(tmp_path, qdrant_toml())
+    assert "optional extra remote" in message
+    assert "not installed" in message
+    assert "uv sync --extra remote" in message
+
+
+@pytest.mark.parametrize("backend", ["qdrant-edge", "none"])
+def test_local_backends_never_check_for_the_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+):
+    def fail() -> bool:
+        raise AssertionError("the client check must not run")
+
+    monkeypatch.setattr(config_module, "_qdrant_client_installed", fail)
+    storage = load_storage(tmp_path, f'[storage.vector]\nbackend = "{backend}"\n')
+    assert storage.vector.backend == backend
+    assert storage.vector.url is None
 
 
 def test_unknown_key_in_a_storage_table_is_rejected(tmp_path: Path):

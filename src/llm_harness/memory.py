@@ -11,13 +11,17 @@ so a tool can return them to the model as an observation.
 import asyncio
 import re
 import unicodedata
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypeVar
 
 from llm_harness.redact import redact
-from llm_harness.storage.relational import Migration, RelationalStore
+from llm_harness.storage.relational import (
+    Migration,
+    RelationalStore,
+    database_error_classes,
+)
 from llm_harness.trace import UNCUT
 
 MEMORY_NAMESPACE = "memory"
@@ -55,7 +59,79 @@ MEMORY_MIGRATIONS: tuple[Migration, ...] = (
             VALUES (new.id, new.text, new.keywords);
         END""",
     ),
+    (
+        # Vector index bookkeeping (see memory_index.py). A marker row means "this
+        # memory is embedded in this collection"; the triggers drop it when the
+        # embedded content changes, so staleness is recorded atomically with the write.
+        """CREATE TABLE memory_vectors (
+            collection TEXT NOT NULL,
+            memory_id INTEGER NOT NULL,
+            PRIMARY KEY (collection, memory_id)
+        )""",
+        """CREATE TABLE memory_vector_meta (
+            collection TEXT PRIMARY KEY,
+            model_id TEXT NOT NULL,
+            dim INTEGER NOT NULL
+        )""",
+        """CREATE TRIGGER memories_vectors_stale AFTER UPDATE OF text, keywords
+        ON memories BEGIN
+            DELETE FROM memory_vectors WHERE memory_id = old.id;
+        END""",
+        """CREATE TRIGGER memories_vectors_gone AFTER DELETE ON memories BEGIN
+            DELETE FROM memory_vectors WHERE memory_id = old.id;
+        END""",
+    ),
 )
+
+# The same two steps on PostgreSQL; both tuples must keep the same number of steps
+# (the version numbers mean the same thing, and store.py reports `len` of the SQLite one).
+# `search` is a generated tsvector with a GIN index instead of an FTS5 table, so no
+# trigger maintains it. The marker triggers become one PL/pgSQL function, because a
+# Postgres trigger needs a function; `UPDATE OF text, keywords` keeps an
+# `updated_at`-only update from clearing the marker, as in SQLite (spike, PostgreSQL 17).
+MEMORY_MIGRATIONS_POSTGRES: tuple[Migration, ...] = (
+    (
+        """CREATE TABLE memories (
+            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            keywords TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            search tsvector GENERATED ALWAYS AS (
+                to_tsvector('english', text || ' ' || keywords)
+            ) STORED
+        )""",
+        "CREATE INDEX memories_user_id ON memories (user_id)",
+        "CREATE INDEX memories_search ON memories USING gin (search)",
+    ),
+    (
+        """CREATE TABLE memory_vectors (
+            collection TEXT NOT NULL,
+            memory_id BIGINT NOT NULL,
+            PRIMARY KEY (collection, memory_id)
+        )""",
+        """CREATE TABLE memory_vector_meta (
+            collection TEXT PRIMARY KEY,
+            model_id TEXT NOT NULL,
+            dim INTEGER NOT NULL
+        )""",
+        """CREATE FUNCTION memories_clear_markers() RETURNS trigger AS $$
+        BEGIN
+            DELETE FROM memory_vectors WHERE memory_id = OLD.id;
+            RETURN NULL;
+        END
+        $$ LANGUAGE plpgsql""",
+        """CREATE TRIGGER memories_vectors_stale AFTER UPDATE OF text, keywords
+        ON memories FOR EACH ROW EXECUTE FUNCTION memories_clear_markers()""",
+        """CREATE TRIGGER memories_vectors_gone AFTER DELETE
+        ON memories FOR EACH ROW EXECUTE FUNCTION memories_clear_markers()""",
+    ),
+)
+_MIGRATIONS_BY_DIALECT: dict[str, tuple[Migration, ...]] = {
+    "sqlite": MEMORY_MIGRATIONS,
+    "postgres": MEMORY_MIGRATIONS_POSTGRES,
+}
 
 MAX_TEXT_CHARS = 1500
 MAX_KEYWORDS = 8
@@ -86,11 +162,36 @@ _STOP_WORDS = frozenset(
     who whom why will with won would wouldn y you your yours yourself yourselves
     """.split()  # noqa: SIM905  (150 words read better as prose than one per line)
 )
+_T = TypeVar("_T")
 _COLUMNS = "id, user_id, text, keywords, created_at, updated_at"
+_SEARCH_SQLITE = (
+    "SELECT m.id, m.user_id, m.text, m.keywords, m.created_at, m.updated_at "
+    "FROM memories_fts JOIN memories AS m ON m.id = memories_fts.rowid "
+    "WHERE memories_fts MATCH ? AND m.user_id = ? "
+    "ORDER BY bm25(memories_fts), m.id DESC LIMIT ?"
+)
+# Plain ts_rank, not a length-normalised one: it gave the same top hit and order as
+# bm25 on every spike query, the normalised variants flipped one.
+_SEARCH_POSTGRES = (
+    "SELECT m.id, m.user_id, m.text, m.keywords, m.created_at, m.updated_at "
+    "FROM memories AS m, websearch_to_tsquery('english', ?) AS q "
+    "WHERE m.search @@ q AND m.user_id = ? "
+    "ORDER BY ts_rank(m.search, q) DESC, m.id DESC LIMIT ?"
+)
 
 
 class MemoryValidationError(ValueError):
     """The input is not an acceptable memory; the message says what to change."""
+
+
+class MemoryStorageError(RuntimeError):
+    """A PostgreSQL call of the memory store failed; the message is the type name only.
+
+    A psycopg message names the host, port and user, quotes a failing row or says what
+    the server refused, and `redact` knows only key and url shapes, so no front end,
+    tool observation, notice or trace may carry it. Raised `from None`: the original
+    is not kept either (a traceback prints a chained cause).
+    """
 
 
 @dataclass(frozen=True)
@@ -168,8 +269,8 @@ def _check_keywords(keywords: object) -> tuple[str, ...]:
     return tuple(unique)
 
 
-def _match_expression(query: object) -> str | None:
-    """The user's meaningful words as quoted OR terms; None when there is none.
+def _query_words(query: object) -> list[str]:
+    """The user's meaningful words, at most `_MAX_QUERY_TERMS`; empty when there is none.
 
     Stop words are dropped before the cap, so a long message keeps its first
     `_MAX_QUERY_TERMS` meaningful words; a message of stop words only has no usable word.
@@ -177,9 +278,22 @@ def _match_expression(query: object) -> str | None:
     if not isinstance(query, str):
         raise MemoryValidationError("query must be a string")
     words = [word for word in _WORD.findall(query) if word.lower() not in _STOP_WORDS]
-    words = words[:_MAX_QUERY_TERMS]
+    return words[:_MAX_QUERY_TERMS]
+
+
+def _match_expression(query: object) -> str | None:
+    """The words as quoted FTS5 OR terms (SQLite); None when there is none."""
     # \w never matches a double quote, so each word is a complete FTS5 string.
-    return " OR ".join(f'"{word}"' for word in words) or None
+    return " OR ".join(f'"{word}"' for word in _query_words(query)) or None
+
+
+def _websearch_expression(words: list[str]) -> str:
+    """The words as quoted `websearch_to_tsquery` OR terms (PostgreSQL).
+
+    A quoted word can never act as an operator, so `or`, `and` and `not` are safe
+    (and a word cannot hold a double quote).
+    """
+    return " or ".join(f'"{word}"' for word in words)
 
 
 def _row_to_memory(row: tuple) -> Memory:
@@ -200,10 +314,22 @@ class MemoryStore:
         relational: RelationalStore,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
+        dialect = getattr(relational, "dialect", None)
+        if dialect not in _MIGRATIONS_BY_DIALECT:
+            raise ValueError(
+                f"no memory schema for dialect {dialect!r}; "
+                f"known: {', '.join(_MIGRATIONS_BY_DIALECT)}"
+            )
+        self._migrations = _MIGRATIONS_BY_DIALECT[dialect]
+        self._dialect = dialect
         self._relational = relational
         self._clock = clock
         self._migrate_lock = asyncio.Lock()
         self._migrated = False
+
+    def take_notice(self) -> str | None:
+        """A one-line notice for the human, once; None here (only an index raises one)."""
+        return None
 
     async def save(self, user_id: str, text: str, keywords: Sequence[str]) -> Memory:
         user_id = _check_user_id(user_id)
@@ -211,7 +337,7 @@ class MemoryStore:
         checked = _check_keywords(keywords)
         await self._ensure_migrated()
         now = self._now()
-        rows = await self._relational.query(
+        rows = await self._query(
             "INSERT INTO memories (user_id, text, keywords, created_at, updated_at) "
             f"VALUES (?, ?, ?, ?, ?) RETURNING {_COLUMNS}",
             (user_id, text, _KEYWORD_SEPARATOR.join(checked), now, now),
@@ -240,7 +366,7 @@ class MemoryStore:
         await self._ensure_migrated()
         assignments.append("updated_at = ?")
         params.append(self._now())
-        rows = await self._relational.query(
+        rows = await self._query(
             f"UPDATE memories SET {', '.join(assignments)} "
             f"WHERE id = ? AND user_id = ? RETURNING {_COLUMNS}",
             (*params, id, user_id),
@@ -251,7 +377,7 @@ class MemoryStore:
         """Hard-delete one entry; False when this user has no such id."""
         user_id = _check_user_id(user_id)
         await self._ensure_migrated()
-        rows = await self._relational.query(
+        rows = await self._query(
             "DELETE FROM memories WHERE id = ? AND user_id = ? RETURNING id",
             (id, user_id),
         )
@@ -260,27 +386,25 @@ class MemoryStore:
     async def get(self, user_id: str, id: int) -> Memory | None:
         user_id = _check_user_id(user_id)
         await self._ensure_migrated()
-        rows = await self._relational.query(
+        rows = await self._query(
             f"SELECT {_COLUMNS} FROM memories WHERE id = ? AND user_id = ?",
             (id, user_id),
         )
         return _row_to_memory(rows[0]) if rows else None
 
     async def search(self, user_id: str, query: str, k: int = 5) -> "list[Memory]":
-        """The best matches by bm25 over text and keywords, at most `k` (1 to 10)."""
+        """The best matches (bm25 on SQLite, ts_rank on PostgreSQL), at most `k` (1 to 10)."""
         user_id = _check_user_id(user_id)
-        expression = _match_expression(query)
-        if expression is None:
+        words = _query_words(query)
+        if not words:
             return []
         await self._ensure_migrated()
         limit = max(1, min(MAX_SEARCH_RESULTS, k))
-        rows = await self._relational.query(
-            "SELECT m.id, m.user_id, m.text, m.keywords, m.created_at, m.updated_at "
-            "FROM memories_fts JOIN memories AS m ON m.id = memories_fts.rowid "
-            "WHERE memories_fts MATCH ? AND m.user_id = ? "
-            "ORDER BY bm25(memories_fts), m.id DESC LIMIT ?",
-            (expression, user_id, limit),
-        )
+        if self._dialect == "postgres":
+            statement, expression = _SEARCH_POSTGRES, _websearch_expression(words)
+        else:
+            statement, expression = _SEARCH_SQLITE, _match_expression(query)
+        rows = await self._query(statement, (expression, user_id, limit))
         return [_row_to_memory(row) for row in rows]
 
     # Last in the class: a method named `list` hides the builtin in annotations
@@ -291,12 +415,31 @@ class MemoryStore:
         """Newest-updated first."""
         user_id = _check_user_id(user_id)
         await self._ensure_migrated()
-        rows = await self._relational.query(
+        rows = await self._query(
             f"SELECT {_COLUMNS} FROM memories WHERE user_id = ? "
             "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
             (user_id, max(0, limit), max(0, offset)),
         )
         return [_row_to_memory(row) for row in rows]
+
+    async def _query(self, statement: str, params: Sequence[Any]) -> "list[tuple]":
+        return await self._driver_errors_as_type_only(
+            self._relational.query(statement, params)
+        )
+
+    async def _driver_errors_as_type_only(self, call: Awaitable[_T]) -> _T:
+        """Await a relational call; a PostgreSQL driver error becomes its type name only.
+
+        SQLite messages keep their text (no host or credentials in them), as before.
+        """
+        try:
+            return await call
+        except database_error_classes() as error:
+            if self._dialect != "postgres":
+                raise
+            raise MemoryStorageError(
+                f"memory storage failed ({type(error).__name__})"
+            ) from None
 
     def _now(self) -> str:
         return self._clock().astimezone(UTC).strftime(_TIMESTAMP_FORMAT)
@@ -304,5 +447,7 @@ class MemoryStore:
     async def _ensure_migrated(self) -> None:
         async with self._migrate_lock:
             if not self._migrated:
-                await self._relational.migrate(MEMORY_NAMESPACE, MEMORY_MIGRATIONS)
+                await self._driver_errors_as_type_only(
+                    self._relational.migrate(MEMORY_NAMESPACE, self._migrations)
+                )
                 self._migrated = True

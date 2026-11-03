@@ -1,16 +1,22 @@
 """A read-only report of the three stores, for `llm-harness --storage-status`.
 
 It never creates a file or a directory and never writes or migrates. The one
-side effect is the vector lock probe: it briefly opens each collection that
-already exists (which the app does on first use anyway) and closes it again.
+side effect is the local vector lock probe: it briefly opens each collection that
+already exists (which the app does on first use anyway) and closes it again. A
+remote `qdrant` vector store is never contacted. A `postgres` relational store and a
+`pgvector` vector store are contacted through a read-only session and only ever shown
+by their exception types: never the user, the password, the url or the server's text.
 """
 
+import asyncio
 import os
 import sqlite3
 from pathlib import Path
 
-from llm_harness.config import HarnessConfig
+from llm_harness.config import ConfigError, HarnessConfig
 from llm_harness.storage.files import FileStoreError, LocalFileStore
+from llm_harness.storage.pgvector import PgVectorStatus, PgVectorStore
+from llm_harness.storage.postgres import PostgresConnectError, PostgresRelationalStore
 from llm_harness.storage.qdrant_edge import (
     QdrantEdgeVectorStore,
     existing_collection_names,
@@ -26,14 +32,45 @@ _NEWER = "newer than this version of llm-harness"
 async def storage_status(
     config: HarnessConfig, *, relational_path: Path, data_dir: Path
 ) -> list[str]:
-    """The report lines for the stores `config` names; `relational_path` is the ledger's."""
+    """The report lines for the stores `config` names.
+
+    `relational_path` is the SQLite ledger's; a `postgres` ledger has none.
+    """
     storage = config.storage
-    lines = [f"relational: {storage.relational.backend}  {relational_path}"]
-    lines += _relational_lines(relational_path)
-    vector_root = storage.vector.resolved_path(data_dir)
-    if storage.vector.backend == "none":
-        lines.append('vector: none  (disabled: [storage.vector] backend = "none")')
+    if storage.relational.backend == "postgres":
+        if storage.relational.url is None:
+            # Config validation guarantees the url; this guards a hand-built config.
+            raise ConfigError(
+                'backend "postgres" needs [storage.relational] url in config.toml'
+            )
+        store = PostgresRelationalStore(
+            storage.relational.url, config.postgres_password
+        )
+        lines = [f"relational: postgres  {store.label}"]
+        lines += await _postgres_lines(store)
     else:
+        lines = [f"relational: {storage.relational.backend}  {relational_path}"]
+        lines += _relational_lines(relational_path)
+    if storage.vector.backend == "qdrant":
+        # Remote: no local path to look at, no server contact, and the api key is
+        # neither used nor printed here (config loading has already read it).
+        lines.append(
+            f"vector: qdrant  {storage.vector.url}  "
+            "(remote server, not contacted by --storage-status)"
+        )
+    elif storage.vector.backend == "none":
+        lines.append('vector: none  (disabled: [storage.vector] backend = "none")')
+    elif storage.vector.backend == "pgvector":
+        if storage.vector.url is None:
+            # Config validation guarantees the url; this guards a hand-built config.
+            raise ConfigError(
+                'backend "pgvector" needs [storage.vector] url in config.toml'
+            )
+        vector_store = PgVectorStore(storage.vector.url, config.postgres_password)
+        lines.append(f"vector: pgvector  {vector_store.label}")
+        lines += await _pgvector_lines(vector_store)
+    else:
+        vector_root = storage.vector.resolved_path(data_dir)
         lines.append(f"vector: {storage.vector.backend}  {vector_root}")
         lines += await _vector_lines(vector_root)
     files_root = storage.files.resolved_root(data_dir)
@@ -58,6 +95,56 @@ def _relational_lines(path: Path) -> list[str]:
     except (sqlite3.Error, OSError, ValueError) as exc:
         return [*lines, f"  schema: not readable: {exc}"]
     return [*lines, *_schema_lines(schema)]
+
+
+async def _postgres_lines(store: PostgresRelationalStore) -> list[str]:
+    try:
+        versions = await asyncio.to_thread(store.read_schema_versions_sync)
+    except PostgresConnectError as exc:
+        return [f"  {exc}"]
+    except Exception as exc:  # noqa: BLE001 - any read failure, shown by type
+        # The driver's text can quote a row or name the user: the type only.
+        return [f"  schema: not readable ({type(exc).__name__})"]
+    if versions is None:
+        return ["  schema: nothing to read yet"]
+    return _schema_lines(ReadOnlySchema(versions=versions, user_version=0))
+
+
+async def _pgvector_lines(store: PgVectorStore) -> list[str]:
+    try:
+        status = await asyncio.to_thread(store.read_status_sync)
+    except PostgresConnectError as exc:
+        return [f"  {exc}"]
+    except Exception as exc:  # noqa: BLE001 - any read failure, shown by type
+        # The driver's text can quote a row or name the user: the type only.
+        return [f"  not readable ({type(exc).__name__})"]
+    return _pgvector_status_lines(status)
+
+
+def _pgvector_status_lines(status: PgVectorStatus) -> list[str]:
+    if status.extension_version is None:
+        if status.extension_available:
+            return [
+                (
+                    "  extension: not created in this database "
+                    "(an administrator runs: CREATE EXTENSION vector;)"
+                )
+            ]
+        return [
+            (
+                "  extension: not installed on this server "
+                "(install the pgvector package, then run: CREATE EXTENSION vector;)"
+            )
+        ]
+    lines = [f"  extension: vector {status.extension_version}"]
+    if status.collections is None:
+        return [*lines, "  collections: not set up yet (it is set up on first use)"]
+    if not status.collections:
+        return [*lines, "  no collections yet"]
+    return lines + [
+        f"  collection {name}: {dim} dimensions, {distance}"
+        for name, dim, distance in status.collections
+    ]
 
 
 def _schema_lines(schema: ReadOnlySchema) -> list[str]:

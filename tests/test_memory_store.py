@@ -1,9 +1,16 @@
-"""`MemoryStore`: validation, per-user isolation, FTS5 search and its sync with edits.
+"""`MemoryStore`: validation, per-user isolation, search and its sync with edits.
 
-Everything runs on a throwaway SQLite file under `tmp_path` and a fake clock.
+Offline everything runs on a throwaway SQLite file under `tmp_path` and a fake clock.
+Every test that takes the `store` fixture also runs on a real PostgreSQL server as the
+`postgres` parameter, deselected unless `-m live` (set-up in the docstring of
+`tests/test_live_memory_postgres.py`). A test that also takes `db`, the SQLite file,
+reads FTS5 rows, triggers or the file itself, and stays SQLite-only: the hook
+`pytest_generate_tests` below adds the `postgres` parameter only when `db` is not among
+the test's fixtures. A Postgres twin of each such test is in the live module.
 """
 
 import sqlite3
+from collections.abc import Iterator
 from contextlib import closing
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -17,7 +24,10 @@ from llm_harness.memory import (
     MemoryValidationError,
     _match_expression,
 )
-from llm_harness.storage.relational import SqliteRelationalStore
+from llm_harness.redact import Secret
+from llm_harness.storage.postgres import PostgresRelationalStore
+from llm_harness.storage.relational import RelationalStore, SqliteRelationalStore
+from tests.live_postgres import memory_target, reset_memory_schema
 
 START = datetime(2026, 11, 2, 9, 30, 15, tzinfo=UTC)
 START_TEXT = "2026-11-02T09:30:15Z"
@@ -45,9 +55,38 @@ def clock() -> FakeClock:
     return FakeClock()
 
 
+def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    if "backend" not in metafunc.fixturenames:
+        return
+    backends: list = ["sqlite"]
+    if "db" not in metafunc.fixturenames:
+        backends.append(pytest.param("postgres", marks=pytest.mark.live))
+    metafunc.parametrize("backend", backends, indirect=True)
+
+
 @pytest.fixture
-def store(db: Path, clock: FakeClock) -> MemoryStore:
-    return MemoryStore(SqliteRelationalStore(db), clock)
+def backend(request: pytest.FixtureRequest) -> str:
+    return request.param
+
+
+@pytest.fixture
+def relational(
+    backend: str, request: pytest.FixtureRequest
+) -> Iterator[RelationalStore]:
+    if backend == "sqlite":
+        yield SqliteRelationalStore(request.getfixturevalue("db"))
+        return
+    url, password = memory_target()
+    reset_memory_schema(url, password)  # the program must create everything itself
+    try:
+        yield PostgresRelationalStore(url, Secret(password) if password else None)
+    finally:
+        reset_memory_schema(url, password)
+
+
+@pytest.fixture
+def store(relational: RelationalStore, clock: FakeClock) -> MemoryStore:
+    return MemoryStore(relational, clock)
 
 
 def fts_hits(db: Path, word: str) -> list[tuple]:
@@ -65,15 +104,17 @@ async def test_save_and_get_round_trip_with_exact_timestamps(store: MemoryStore)
     assert await store.get("alice", saved.id) == saved
 
 
-async def test_the_default_clock_gives_an_utc_timestamp_with_z(db: Path):
-    saved = await MemoryStore(SqliteRelationalStore(db)).save("alice", "a fact", ["x"])
+async def test_the_default_clock_gives_an_utc_timestamp_with_z(
+    relational: RelationalStore,
+):
+    saved = await MemoryStore(relational).save("alice", "a fact", ["x"])
     assert datetime.strptime(saved.created_at, "%Y-%m-%dT%H:%M:%SZ")
     assert saved.updated_at == saved.created_at
 
 
-async def test_a_non_utc_clock_is_converted_to_utc(db: Path):
+async def test_a_non_utc_clock_is_converted_to_utc(relational: RelationalStore):
     plus_two = timezone(timedelta(hours=2))
-    store = MemoryStore(SqliteRelationalStore(db), lambda: START.astimezone(plus_two))
+    store = MemoryStore(relational, lambda: START.astimezone(plus_two))
     assert (await store.save("alice", "a fact", ["x"])).created_at == START_TEXT
 
 

@@ -34,12 +34,14 @@ from llm_harness.config import (
     write_examples,
 )
 from llm_harness.display import format_switch, format_usage_report, sanitize_text
+from llm_harness.embeddings import build_embedder_factory
 from llm_harness.memory_command import handle_memory_text
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.providers import ProviderFactory, build_provider
 from llm_harness.providers.base import ChatProvider
 from llm_harness.router import RouterFactory, make_router_factory
 from llm_harness.storage import Storage, open_storage
+from llm_harness.storage.qdrant_remote import insecure_key_warning
 from llm_harness.storage.status import storage_status
 from llm_harness.store import Store
 from llm_harness.subagents import SubagentFactoryMaker, make_subagent_factory_maker
@@ -502,6 +504,12 @@ def main(
             run_command=config.tools.run_command,
             memory=config.tools.memory,
             user_id=config.user_id,
+            memory_vectors=config.tools.memory_vectors,
+            embedder_factory=(
+                build_embedder_factory(config, provider_factory)
+                if config.tools.memory_vectors
+                else None
+            ),
             command_allow=config.tools.command_allow,
             command_deny=config.tools.command_deny,
             command_timeout_seconds=config.tools.command_timeout_seconds,
@@ -513,12 +521,31 @@ def main(
     # One storage, one ledger and one router factory per process; nothing touches
     # the disk until first use.
     db_path = _relational_path(config, data_dir)
-    storage = open_storage(
-        config.storage,
-        data_dir if data_dir is not None else default_data_dir(),
-        relational_path=db_path,
+    try:
+        storage = open_storage(
+            config.storage,
+            data_dir if data_dir is not None else default_data_dir(),
+            relational_path=db_path,
+            qdrant_api_key=config.qdrant_api_key,
+            postgres_password=config.postgres_password,
+        )
+    except ConfigError as exc:
+        print(f"error: {exc}", file=stderr)
+        return 1
+    # The key warning is about the qdrant api key; a pgvector url has no http form.
+    if config.storage.vector.backend == "qdrant" and config.storage.vector.url:
+        insecure = insecure_key_warning(
+            config.storage.vector.url, config.qdrant_api_key
+        )
+        if insecure:
+            print(insecure, file=stderr)
+    # Postgres: the configured relational store (connects at the first model call);
+    # SQLite: the ledger file, as before.
+    store = (
+        Store(relational=storage.relational)
+        if config.storage.relational.backend == "postgres"
+        else Store(db_path)
     )
-    store = Store(db_path)
     router_factory = make_router_factory(
         config,
         provider_factory,

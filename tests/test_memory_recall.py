@@ -356,6 +356,8 @@ async def test_a_new_turn_replaces_the_previous_recall(storage, clock) -> None:
 class RaisingRelational:
     """A RelationalStore double whose every call fails."""
 
+    dialect = "sqlite"
+
     def __init__(self, error: BaseException) -> None:
         self._error = error
 
@@ -448,10 +450,10 @@ async def test_a_stored_injection_cannot_close_the_block_end_to_end(
 
 def test_recall_store_is_the_store_the_tools_share(storage, clock) -> None:
     tools = memory_registry(clock)
-    shared = recall_store(tools, storage.relational)
-    assert shared is recall_store(tools, storage.relational)
-    assert shared is tools.get("memory_search").memories.store_for(storage.relational)
-    assert recall_store(registry(), storage.relational) is None
+    shared = recall_store(tools, storage)
+    assert shared is recall_store(tools, storage)
+    assert shared is tools.get("memory_search").memories.store_for(storage)
+    assert recall_store(registry(), storage) is None
 
 
 async def test_the_request_preview_shows_the_last_recall_block(storage, clock) -> None:

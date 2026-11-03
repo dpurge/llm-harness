@@ -1,9 +1,9 @@
 ---
 title: Agent memory
 kind: feature
-status: implementing
+status: done
 version: 1
-updated: 2026-11-02
+updated: 2026-11-03
 branch: main
 ---
 
@@ -95,7 +95,7 @@ Risks:
 
 ## Implementation Notes
 
-Slice 1 (store and tools) is implemented in three steps. Slice 2 (auto recall) is implemented; slices 3 (reflection) and 4 (`/memory` command) are not started.
+Slice 1 (store and tools) is implemented in three steps. Slice 2 (auto recall) is implemented. Slices 3 (reflection) and 4 (`/memory` command) are also implemented; see the step "3, reflection and 4, /memory command" below.
 
 Step 1a, the store. Files: `src/llm_harness/memory.py`, `tests/test_memory_store.py`.
 - `MemoryStore` (save, update, forget, get, search, list) over `storage.relational`, with the migration list `MEMORY_MIGRATIONS` under the schema namespace `memory`: the table `memories`, an FTS5 table `memories_fts` (external content, `tokenize='porter unicode61'`) and three triggers that keep it in step. It migrates lazily on first use.
@@ -114,7 +114,7 @@ Step 1b, the tools and the switch. Files: `src/llm_harness/memory_tools.py`, `te
 
 Step 1c, documentation. `README.md` section "Agent memory" and the `[tools]` sample line, and a `CHANGELOG.md` entry under Unreleased / Added.
 
-Status after slice 2: slice 2 (auto recall) is done; slices 3 (reflection) and 4 (`/memory`) are not started, so the feature stays `implementing`. No real-model run of recall exists, only scripted fake models.
+Status after slice 2 (as written then; slices 3 and 4 were later found to be already implemented, see the step "3, reflection and 4, /memory command"): slice 2 (auto recall) is done. No real-model run of recall exists, only scripted fake models.
 
 Step 2a, automatic recall. Files: `src/llm_harness/memory_recall.py`, `tests/test_memory_recall.py`; edits in `orchestrator.py`, `memory_tools.py`, `context.py`, `inspect_state.py`, `trace.py`, `prompts/orchestrator.md`, `tests/test_context.py`, `tests/test_gui.py` (one line in the stand-in double).
 - Recall runs in `Orchestrator.send` (`_recall`), once at the start of the turn, with the user's text (the answer when a question is pending). No new constructor parameter: the shared store is reached through `recall_store(tools, relational)` in `memory_tools.py`, so recall and `memory_search` see the same data.
@@ -138,14 +138,56 @@ Test suite after 1b: 2802 passed, 7 deselected (marker `live`), 0 failed, 0 skip
 
 Not done and not yet seen: a real-model run of the tools. One try with `gemma4:12b` returned invalid JSON; the scripted run through the real CLI path worked.
 
+Step 3, reflection and 4, /memory command. Both slices were implemented earlier and committed in `4cf4fb3` (message "Command executor", which also holds unrelated work). The spec had not been updated; this was found on 2026-11-03 by checking the repository.
+- Reflection, `src/llm_harness/memory_reflection.py`: `parse_reflection`, `apply_reflection`, `build_reflection_request`, called from `Orchestrator._reflect` in `orchestrator.py`. Turn filter: only turns with tool results or a changed goal. It runs only after `respond`, not after `ask_user` or a failed turn. A failed or invalid reflection yields a failure Notice and the turn still ends with Done.
+- `/memory` command, `src/llm_harness/memory_command.py`: `handle_memory_text` with list, show and delete; used by `cli.py`, `tui/app.py` and `gui/app.py`.
+- Tests: `tests/test_memory_reflection.py`, `tests/test_memory_reflection_wiring.py`, `tests/test_memory_reflection_ui.py`, `tests/test_memory_command.py`, `tests/test_memory_command_ui.py`.
+
+Step 3c, notice after memory_update (2026-11-03). New optional tool attribute `notify_result` (default False), bool-checked by `_check_tool` and read by `tool_notifies()` in `src/llm_harness/tools.py`; set only on `MemoryUpdateTool` in `memory_tools.py`. After a successful run, `Orchestrator.send` (`orchestrator.py`, about line 457) yields one Notice with the stored text and keywords. The update result is now `updated memory #N: <text> (keywords: ...; created ..., updated ...)`. Tests added in `tests/test_memory_tools.py` and `tests/test_memory_reflection_ui.py` (one each for CLI, TUI, GUI). The dead helper `_present` (no call site) was removed from `memory_reflection.py`.
+
+Deviations from Acceptance Criterion 10 (the criterion text is not edited): (a) the reflection forget notice is `memory forgot #N` and the tool forget notice is the call line with the id, because the text is gone after deletion; (b) `memory_update` called with a missing id also yields a Notice, `no memory #N`, because the tool returns that as a normal result; (c) for `memory_save` and `memory_forget` the notice stays the pre-run call line.
+
+Deviation from Criterion 13: the TUI has width tests but no "large text" check, because a terminal has no font size.
+
+B4 documentation review and B5 closeout are done (see Documentation Review and Documentation Updates).
+
 ## Validation
 
-Not started.
+Command `uv run pytest -q` in the project root, run 2026-11-03 after the step 3c change: 3086 passed, 0 failed, 0 skipped, 7 deselected (the `live` marker, `addopts = '-m "not live"'` in `pyproject.toml:41`; those 7 were not run and are unverified); 1 DeprecationWarning from google/genai (third-party). Before step 3c the same command gave 3073 passed.
+
+`uv run ruff check src tests`: all checks passed. The project has no type checker configured.
+
+Criteria 9, 11, 12 and 13 were mapped to code and tests by a read-only review (the reviewer cites, for example, `orchestrator.py:534` for the turn filter and `test_memory_reflection_wiring.py:579` for the approver test). Criterion 12's update path was not read line by line.
+
+Not done: no real-model run of reflection or recall (an earlier try with `gemma4:12b` returned invalid JSON).
 
 ## Documentation Review
 
-Not started.
+Checked 2026-11-03 against the code: `README.md` (section "Agent memory"), `CHANGELOG.md`, `specs/mission.md`, `specs/tech-stack.md`.
+
+README drift (before the update; line numbers of the old file):
+- `README.md:559-563` (intro) said reflection and `/memory` "are not built".
+- `README.md:678` said there was no screen to list or delete memories and `/memory` was planned.
+- `README.md:689-690` "Not built yet" listed the reflection step and the `/memory` command as planned; only vector search is really not built.
+- `README.md:~758` "Known weak points" and `README.md:~1103` (known limits) said only recall / the memory tools had not been seen with a real model; reflection was not mentioned.
+- Missing: no description of the reflection step, the `/memory` command, the notice lines, or the reflection constants (60 seconds, 500/2000/3000, 500 x 8, 200, notice 300) in "Fixed values".
+
+Changelog entries proposed (all `CHANGELOG.md`, category Added, under `## [Unreleased]`; no Changed entry, the memory feature is unreleased):
+- {CHANGELOG.md, Added, "Memory reflection: after an answer to a turn that used a tool or changed the goal, one short model call may save, update or forget a note without asking you; it shows a one-line notice, refuses secrets, and a failed reflection never fails the turn."}
+- {CHANGELOG.md, Added, "`/memory` command (`/memory list [PAGE]`, `/memory show ID`, `/memory delete ID`) to list, read and delete your saved memories in `--plain`, the terminal UI and the GUI, with no model call."}
+- {CHANGELOG.md, Added, "`memory_update` now shows the stored record in a notice after it runs."}
+
+CI review: not applicable (the project has no `.github/workflows`, Makefile, Dockerfile or Taskfile; `ls -a` of the root shows only `.agent .gitignore CHANGELOG.md README.md pyproject.toml specs src tests uv.lock` besides tool caches; `find . -maxdepth 3 -name '*.yml'` outside `.venv` and `specs` found nothing; `pyproject.toml` has `[tool.pytest.ini_options]` and no release, publish or changelog tooling, so nothing tags a release or rewrites `## [Unreleased]`).
+
+Constitution files (not edited; proposals only):
+- `specs/mission.md` line 21: "What does not exist yet" lists "memory ... tools" and says external memory that uses `user_id` is not used yet; its "What exists today" list has no memory. It is already stale since slice 1 (tools) and recall. Proposed change: move memory into "What exists today" ("optional per-user memory kept in SQLite: four memory tools, automatic recall of the top notes at the start of a turn, a reflection step after a turn that may save, update or forget a note, and a `/memory` command to list, show and delete notes; keyword search only") and delete "memory" and "external memory that uses `user_id`" from the not-yet-exists list. Needs a human-approved update.
+- `specs/tech-stack.md` line 53: the Tools bullet says "planned: RAG query, memory access, ..." and ends with "Not built: ... roadmap: `memory`, then `command-execution-docker`". Proposed change: add a "Built (`memory`, 2026-11-03)" sentence naming `memory.py`, `memory_tools.py`, `memory_recall.py`, `memory_reflection.py`, `memory_command.py`, the prompt `prompts/reflection.md`, `[tools] memory`, and the tool attribute `notify_result`; remove "memory access" from planned. Needs a human-approved update. `grep -n -i 'reflect'` finds nothing in either file.
 
 ## Documentation Updates
 
-Not started.
+Done 2026-11-03.
+- `README.md`, section "Agent memory": intro rewritten (reflection and `/memory` now described, only vector search not built); the "no screen to list or delete" paragraph now points to `/memory`; "Not built yet" lists only vector search; new subsections "Reflection" (with the notice table) and "The /memory command" after "Known weak points"; "Fixed values" intro and table got the reflection and notice constants; the weak-point bullet and the known-limits bullet (section near the end) now also say reflection was not seen with a real model.
+- `CHANGELOG.md`, `## [Unreleased]` / `### Added`: three lines (reflection, `/memory`, `memory_update` notice).
+- Constitution files: `specs/mission.md` and `specs/tech-stack.md` updated 2026-11-03 with human approval, see those files (the proposals in Documentation Review above were applied).
+- `specs/roadmap.md`: the `## Now` line for this feature was removed at closeout.
+- `specs/memory.md`: two entries appended (a `[gotcha]` on `notify_result` and a `[build]` on the test suite).

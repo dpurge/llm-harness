@@ -24,6 +24,7 @@ from llm_harness.memory import Memory, MemoryStore
 from llm_harness.memory_command import (
     MEMORY_OFF,
     USAGE,
+    VECTORS_OFF,
     MemoryCommand,
     handle_memory_text,
     parse_memory_command,
@@ -67,6 +68,8 @@ START = datetime(2026, 11, 2, 9, 30, 15, tzinfo=UTC)
         ("/memory show ²", USAGE_COMMAND),
         ("/memory delete", USAGE_COMMAND),
         ("/memory delete 01", USAGE_COMMAND),
+        ("/memory reindex", MemoryCommand("reindex")),
+        ("/memory reindex 1", USAGE_COMMAND),
         ("/memory forget 1", USAGE_COMMAND),
         ("/memory LIST", USAGE_COMMAND),
         ("/memoryx", None),
@@ -340,6 +343,15 @@ def test_plain_lists_shows_and_deletes_without_calling_the_model(
     assert "likes tea" in result.out  # type: ignore[attr-defined]
     assert "deleted memory #1: likes tea" in out
     assert out[-1] == "(no memories)"
+    assert provider.requests == []  # type: ignore[attr-defined]
+
+
+def test_plain_reindex_answers_without_calling_the_model(
+    config_dir: Path, tmp_path: Path
+) -> None:
+    memory_config(config_dir)
+    result, provider = run_plain(config_dir, tmp_path / "data", "/memory reindex\n")
+    assert result.out == VECTORS_OFF + "\n"  # type: ignore[attr-defined]
     assert provider.requests == []  # type: ignore[attr-defined]
 
 

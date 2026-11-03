@@ -15,9 +15,7 @@ import asyncio
 import contextlib
 import json
 import os
-import re
 import threading
-import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -25,6 +23,13 @@ from typing import Any
 import qdrant_edge as q
 
 from llm_harness.storage.files import make_private_dirs
+from llm_harness.storage.vector_common import (
+    NAME_PATTERN,
+    ORIGINAL_ID_KEY,
+    check_name,
+    checked_filter,
+    point_id,
+)
 from llm_harness.storage.vectors import (
     DISTANCES,
     VectorHit,
@@ -33,13 +38,8 @@ from llm_harness.storage.vectors import (
     VectorStoreLockedError,
 )
 
-# Never change this: every stored point id is derived from it, so a new value
-# would orphan every point already on disk.
-_ID_NAMESPACE = uuid.UUID("7c0b6f3e-5d1a-4e8b-9a52-3f4d8e1c6b27")
-_ORIGINAL_ID_KEY = "_id"
 _META_FILENAME = "meta.json"
 _SHARD_DIRNAME = "shard"
-_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _LOCK_MARKERS = ("WouldBlock", "Can't init WAL")
 
 _ENGINE_DISTANCES = {
@@ -47,17 +47,6 @@ _ENGINE_DISTANCES = {
     "dot": q.Distance.Dot,
     "euclid": q.Distance.Euclid,
 }
-
-
-def _check_name(name: str) -> None:
-    if not isinstance(name, str) or not _NAME_PATTERN.fullmatch(name):
-        raise VectorStoreError(
-            "a collection name is a lowercase letter then up to 63 of a-z, 0-9 and '_'"
-        )
-
-
-def _point_id(original: str) -> str:
-    return str(uuid.uuid5(_ID_NAMESPACE, original))
 
 
 def _write_private(path: Path, text: str) -> None:
@@ -81,13 +70,13 @@ def existing_collection_names(root: Path) -> list[str]:
     return sorted(
         entry.name
         for entry in entries
-        if _NAME_PATTERN.fullmatch(entry.name) and (entry / _META_FILENAME).is_file()
+        if NAME_PATTERN.fullmatch(entry.name) and (entry / _META_FILENAME).is_file()
     )
 
 
 def read_collection_meta(root: Path, name: str) -> tuple[int, str]:
     """The stored (dimension, distance) of an existing collection, else `VectorStoreError`."""
-    _check_name(name)
+    check_name(name)
     return QdrantEdgeVectorStore._read_meta(name, root / name / _META_FILENAME)
 
 
@@ -116,7 +105,7 @@ class QdrantEdgeVectorStore:
     async def ensure_collection(
         self, name: str, dim: int, distance: str = "cosine"
     ) -> None:
-        _check_name(name)
+        check_name(name)
         if isinstance(dim, bool) or not isinstance(dim, int) or dim < 1:
             raise VectorStoreError(f"the dimension must be a positive int, got {dim!r}")
         if distance not in DISTANCES:
@@ -126,7 +115,7 @@ class QdrantEdgeVectorStore:
         await self._run(name, self._ensure, name, dim, distance)
 
     async def upsert(self, collection: str, points: Sequence[VectorPoint]) -> None:
-        _check_name(collection)
+        check_name(collection)
         await self._run(collection, self._upsert, collection, points)
 
     async def search(
@@ -136,13 +125,13 @@ class QdrantEdgeVectorStore:
         k: int,
         filter: Mapping[str, str | int | bool] | None = None,
     ) -> list[VectorHit]:
-        _check_name(collection)
+        check_name(collection)
         if isinstance(k, bool) or not isinstance(k, int) or k < 1:
             raise VectorStoreError(f"k must be a positive int, got {k!r}")
         return await self._run(collection, self._search, collection, vector, k, filter)
 
     async def delete(self, collection: str, ids: Sequence[str]) -> None:
-        _check_name(collection)
+        check_name(collection)
         await self._run(collection, self._delete, collection, ids)
 
     async def close(self) -> None:
@@ -257,32 +246,19 @@ class QdrantEdgeVectorStore:
                 f"got a vector of {len(vector)}"
             )
 
-    @staticmethod
-    def _checked_filter(
-        filter: Mapping[str, str | int | bool] | None,
-    ) -> Mapping[str, str | int | bool]:
-        # Verified on qdrant-edge-py 0.9.0: `MatchValue(True)` matches the integer 1
-        # and never a stored boolean, so a bool filter would return wrong results silently.
-        for key, value in (filter or {}).items():
-            if isinstance(value, bool):
-                raise VectorStoreError(
-                    f"cannot filter on {key!r} with a bool: store 0 or 1, or a string, instead"
-                )
-        return filter or {}
-
     def _upsert(self, name: str, points: Sequence[VectorPoint]) -> None:
         with self._lock:
             collection = self._get(name)
             engine_points = []
             for point in points:
                 self._check_vector(name, collection, point.vector)
-                if _ORIGINAL_ID_KEY in point.payload:
+                if ORIGINAL_ID_KEY in point.payload:
                     raise VectorStoreError(
-                        f"the payload key {_ORIGINAL_ID_KEY!r} is reserved for the point id"
+                        f"the payload key {ORIGINAL_ID_KEY!r} is reserved for the point id"
                     )
-                payload = {**point.payload, _ORIGINAL_ID_KEY: point.id}
+                payload = {**point.payload, ORIGINAL_ID_KEY: point.id}
                 engine_points.append(
-                    q.Point(_point_id(point.id), list(point.vector), payload)
+                    q.Point(point_id(point.id), list(point.vector), payload)
                 )
             if not engine_points:
                 return
@@ -301,7 +277,7 @@ class QdrantEdgeVectorStore:
             self._check_vector(name, collection, vector)
             conditions = [
                 q.FieldCondition(key=key, match=q.MatchValue(value=value))
-                for key, value in self._checked_filter(filter).items()
+                for key, value in checked_filter(filter).items()
             ]
             request = q.SearchRequest(
                 query=q.Query.Nearest(list(vector)),
@@ -313,7 +289,7 @@ class QdrantEdgeVectorStore:
         hits = []
         for point in found:
             payload = dict(point.payload or {})
-            original = payload.pop(_ORIGINAL_ID_KEY)
+            original = payload.pop(ORIGINAL_ID_KEY)
             # The engine reports euclid as a distance (smaller is nearer); the
             # interface promises higher is nearer for every distance.
             score = -point.score if collection.distance == "euclid" else point.score
@@ -326,7 +302,7 @@ class QdrantEdgeVectorStore:
             if not ids:
                 return
             collection.shard.update(
-                q.UpdateOperation.delete_points([_point_id(i) for i in ids])
+                q.UpdateOperation.delete_points([point_id(i) for i in ids])
             )
             collection.shard.flush()
 

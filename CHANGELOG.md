@@ -42,6 +42,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - Tool `run_command` (off by default; switch on with `[tools] run_command = true`) runs one local program from an `argv` list, with no shell; every call needs your approval and shows the exact arguments. `[tools] command_allow` and `command_deny` lists plus a built-in deny list (shells, `sudo`, `env`, `curl`, ...) refuse programs before you are asked; they guard against mistakes and are not a sandbox. `command_timeout_seconds` (default 30, 1 to 120) limits the run time; a timeout kills the whole process group. The child gets a scrubbed environment and no stdin, and its output is capped.
 - Optional agent memory tools `memory_search`, `memory_save`, `memory_update` and `memory_forget` (off by default; switch on with `[tools] memory = true` and a `user_id`): short English notes kept per user with 1 to 8 keywords and created/updated times, searched by keyword; the saves run without an approval prompt and show one `tool <name> <arguments>` line.
 - Automatic memory recall: when memory is on, the orchestrator searches memory with your message at the start of each turn and puts the top 5 matching notes (at most 6000 characters, in a `<memory-entries>` data block under `## Memory`) into every model request of that turn; a failed or empty recall changes nothing, and the Trace tab shows a `recall` span. Common English words are ignored in memory searches, for recall and for `memory_search`.
+- Memory reflection: after an answer to a turn that used a tool or changed the goal, one short model call may save, update or forget a note without asking you; it shows a one-line notice, refuses secrets, and a failed reflection never fails the turn.
+- `/memory` command (`/memory list [PAGE]`, `/memory show ID`, `/memory delete ID`) to list, read and delete your saved memories in `--plain`, the terminal UI and the GUI, with no model call.
+- `memory_update` now shows the stored record in a notice after it runs.
+- Optional meaning-based (vector) memory search, switched on with `[tools] memory_vectors = true` (needs `memory`, a `user_id` and an `embedding` model): recall, `memory_search` and reflection merge keyword and vector hits, and fall back to keyword search with one notice on any problem.
+- `/memory reindex` indexes the memories that have no vector yet and answers `reindexed N of M memories`; it also switches vector search back on after a failure (it retries the embedding model and the vector store, and answers `vector search is off: <reason>` if the problem remains).
+- Remote qdrant vector backend: `[storage.vector] backend = "qdrant"` with a `url`, the optional extra `remote`, an optional API key in `~/.config/llm-harness/secrets.toml` (mode 0600), one warning line for a key sent over plain http, and `--storage-status` showing the remote store without contacting it; see the README section "Remote qdrant".
+- Postgres relational backend: `[storage.relational] backend = "postgres"` with a `url`, the optional extra `postgres` and an optional password in `~/.config/llm-harness/secrets.toml` under `[postgres]` keep the usage ledger and schema versions on a Postgres server; `--storage-status` reports it read-only; agent memory works with it too (next entry); see the README section "Postgres".
+- pgvector vector backend: `[storage.vector] backend = "pgvector"` with a `url` keeps the vectors in a PostgreSQL database with the pgvector extension, which an administrator creates with `CREATE EXTENSION vector;`; it uses the same optional extra `postgres` and the optional `[postgres] password` in `~/.config/llm-harness/secrets.toml`; `--storage-status` reports the extension and the collections read-only; it works with SQLite as the relational store, so agent memory keeps working; see the README section "pgvector".
+- Agent memory now works with `[storage.relational] backend = "postgres"` (`[tools] memory = true` is no longer refused with it): the notes live on the server and are searched with PostgreSQL full-text search (the `english` configuration), which finds the same notes as SQLite on the corpus used to check it but may rank them differently, and does not fold accents (`cafe` does not match `café`); memories saved in SQLite are not copied to Postgres; see the README sections "Postgres" and "Agent memory".
 
 ### Changed
 
@@ -55,8 +64,14 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - The starting model is now chosen by the `orchestrator` tag instead of `default`; `default` only marks the last-resort fallback.
 - The ledger path can now be set with `[storage.relational] path`, and the ledger file gets a `schema_versions` table on first start (existing rows are not touched).
 - Embedding models are hidden from the model selectors and rejected by `--model`; an entry tagged `embedding` together with `chat`, `default` or `orchestrator` is a config error; the example config files the program offers to write now explain every key in comments, and `models.yaml` includes a commented-out embedding example.
+- The unknown-backend error for `[storage.relational]` now lists `sqlite, postgres` (postgres was recognised but rejected before).
+- The error for a `url` with the `qdrant-edge` or `none` vector backend now reads `url is only used with backend = "qdrant" or "pgvector"`, and the unknown-backend error for `[storage.vector]` now lists `qdrant-edge, qdrant, pgvector, none`.
 
 ### Removed
 
 - The chat history is no longer sent to the model; each step sends only the instructions, the state and the latest observation.
 - The `ChatSession` class (`src/llm_harness/session.py`).
+
+### Fixed
+
+- An embedding call that gets no answer now fails after 60 seconds instead of waiting forever; it shows as a connection error, and memory vector search switches off with one notice.

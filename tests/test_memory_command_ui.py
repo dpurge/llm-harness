@@ -13,7 +13,7 @@ from llm_harness.config import StorageConfig, VectorConfig
 from llm_harness.gui import app as gui_app
 from llm_harness.gui.app import register_page
 from llm_harness.memory import MemoryStore
-from llm_harness.memory_command import MEMORY_OFF
+from llm_harness.memory_command import MEMORY_OFF, VECTORS_OFF
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.storage import Storage, open_storage
 from llm_harness.tui.app import ChatApp
@@ -136,6 +136,13 @@ async def test_tui_output_is_plain_text_filling_the_width(storage: Storage) -> N
         assert not any(rule in ChatApp.CSS for rule in ("max-width", "width: 80"))
 
 
+async def test_tui_reindex_answers(storage: Storage) -> None:
+    app = tui_app(storage, TuiFactory(TUI_REPLY))
+    async with app.run_test() as pilot:
+        await tui_send(pilot, app, "/memory reindex")
+        assert tui_texts(app, "note") == [VECTORS_OFF]  # no memory_vectors in this rig
+
+
 async def test_tui_memory_off_answers_one_line(storage: Storage) -> None:
     app = tui_app(storage, TuiFactory(TUI_REPLY), user_id=None)
     async with app.run_test() as pilot:
@@ -213,6 +220,12 @@ async def test_gui_output_is_full_width_large_text_not_markup(
     assert "llm-secondary" not in label.classes  # main content: the 18px base
     assert ".llm-page { font-size: 18px; }" in gui_app._PAGE_CSS
     assert type(label).__name__ == "Label"  # a text node, never ui.html or markdown
+
+
+async def test_gui_reindex_answers(user: User, storage: Storage) -> None:
+    await open_gui(user, storage, GuiFactory(GUI_REPLY))
+    await gui_command(user, "/memory reindex", 1)
+    assert gui_texts(user, "memory") == [VECTORS_OFF]
 
 
 async def test_gui_memory_off_answers_one_line(user: User, storage: Storage) -> None:

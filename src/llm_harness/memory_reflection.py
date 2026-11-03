@@ -93,10 +93,6 @@ def reflection_schema() -> dict[str, Any]:
     }
 
 
-def _present(data: dict[str, Any], *names: str) -> list[str]:
-    return [name for name in names if data.get(name) is not None]
-
-
 def _check_types(data: dict[str, Any]) -> None:
     id_ = data.get("id")
     # bool is an int subclass: `true` must not pass as note 1.

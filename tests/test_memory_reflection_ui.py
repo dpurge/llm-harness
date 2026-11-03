@@ -16,6 +16,7 @@ from nicegui.testing import User
 from llm_harness.cli import _run_turn
 from llm_harness.config import StorageConfig, VectorConfig
 from llm_harness.gui.app import register_page
+from llm_harness.memory import MemoryStore
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.storage import Storage, open_storage
 from llm_harness.tui.app import ChatApp
@@ -93,6 +94,29 @@ def tools():
     return registry
 
 
+UPDATED = "updated memory #1: Prefers metric units. (keywords: metric;"
+
+
+def update_scripts() -> list[list]:
+    none = [
+        TextDelta(
+            text='{"action": "none", "id": null, "text": null, "keywords": null}'
+        ),
+        Done(),
+    ]
+    return [
+        reply_events(call("memory_update", id=1, keywords=["metric"]), SET_GOAL),
+        reply_events(RESPOND),
+        none,
+    ]
+
+
+async def seed(storage: Storage) -> None:
+    await MemoryStore(storage.relational).save(
+        "alice", "Prefers metric units.", ["units"]
+    )
+
+
 # --- plain CLI --------------------------------------------------------------------
 
 
@@ -143,6 +167,20 @@ async def test_the_cli_prints_nothing_for_a_none_reflection(storage) -> None:
     ]
 
 
+async def test_the_cli_prints_the_memory_update_result(storage) -> None:
+    await seed(storage)
+    orchestrator = Orchestrator(
+        ScriptedSteps(update_scripts()),
+        model_cfg(),
+        tools=tools(),
+        storage=storage,
+        user_id="alice",
+    )
+    out, err = io.StringIO(), io.StringIO()
+    assert await _run_turn(orchestrator, "hi", out, err)
+    assert [line for line in err.getvalue().splitlines() if UPDATED in line]
+
+
 # --- TUI --------------------------------------------------------------------------
 
 
@@ -181,6 +219,22 @@ async def test_the_tui_shows_a_failure_as_a_note_and_the_turn_is_done(storage) -
         assert "not valid JSON" in notice
         assert texts(app, "error") == []
         assert app.query_one("#prompt").disabled is False
+
+
+async def test_the_tui_shows_the_memory_update_result(storage) -> None:
+    await seed(storage)
+    config = CONFIG.model_copy(update={"agents": [AGENT], "user_id": "alice"})
+    app = ChatApp(
+        config,
+        MODEL_1,
+        router_factory_for(config, StepFactory(update_scripts()), None),
+        False,
+        storage=storage,
+        tools=tools(),
+    )
+    async with app.run_test() as pilot:
+        await tui_send(pilot, app, "hi")
+        assert [n for n in texts(app, "note") if n.startswith(UPDATED)]
 
 
 # --- web GUI ----------------------------------------------------------------------
@@ -226,3 +280,21 @@ async def test_the_gui_shows_a_failure_as_a_note(user: User, storage) -> None:
         lambda: any(e.text.startswith(FAILED_START) for e in elements(user, "note"))
     )
     assert not elements(user, "error")
+
+
+async def test_the_gui_shows_the_memory_update_result(user: User, storage) -> None:
+    await seed(storage)
+    config = GUI_CONFIG.model_copy(update={"agents": [AGENT], "user_id": "alice"})
+    register_page(
+        config,
+        GUI_MODEL,
+        router_factory_for(config, GuiStepFactory(update_scripts()), None),
+        False,
+        storage=storage,
+        tools=tools(),
+    )
+    await user.open("/")
+    await send(user, "hi")
+    await wait_for(
+        lambda: any(e.text.startswith(UPDATED) for e in elements(user, "note"))
+    )

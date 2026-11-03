@@ -13,6 +13,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from llm_harness.embeddings import Embedder
 from llm_harness.memory import (
     MAX_KEYWORD_CHARS,
     MAX_KEYWORDS,
@@ -21,7 +22,8 @@ from llm_harness.memory import (
     Memory,
     MemoryStore,
 )
-from llm_harness.storage.relational import RelationalStore
+from llm_harness.memory_index import IndexedMemoryStore
+from llm_harness.storage import Storage
 from llm_harness.tools import Tool, ToolContext, ToolRegistry
 
 _ENGLISH = "Memories are short English notes, written in English whatever language the chat is in."
@@ -66,18 +68,28 @@ def _block(memory: Memory) -> str:
 
 
 class MemoryTools:
-    """Shares one `MemoryStore` per relational store among the four tools.
+    """Shares one `MemoryStore` per storage among the four tools.
 
-    `clock` None means the store's own UTC-now default.
-    The store migrates lazily on first use, once per `MemoryStore`; building one per
-    call would repeat that check, so it is cached here. The relational store is only
-    known at run time (`ctx.storage`), and a different one gets its own `MemoryStore`.
+    `clock` None means the store's own UTC-now default. With `vectors` on and an
+    `embedder_factory`, the store is an `IndexedMemoryStore` (vector search with a
+    keyword fallback); otherwise the plain keyword `MemoryStore`.
+    The store migrates lazily on first use, once per store; building one per call
+    would repeat that check, so it is cached here. The storage is only known at run
+    time (`ctx.storage`), and a different one gets its own store.
     """
 
-    def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self,
+        clock: Callable[[], datetime] | None = None,
+        *,
+        vectors: bool = False,
+        embedder_factory: Callable[[], Embedder] | None = None,
+    ) -> None:
         self._clock = clock
+        self._vectors = vectors
+        self._embedder_factory = embedder_factory
         self._store: MemoryStore | None = None
-        self._relational: RelationalStore | None = None
+        self._storage: Storage | None = None
 
     def tools(self) -> list[Tool]:
         return [
@@ -87,15 +99,23 @@ class MemoryTools:
             MemoryForgetTool(self),
         ]
 
-    def store_for(self, relational: RelationalStore) -> MemoryStore:
-        if self._store is None or self._relational is not relational:
-            self._store = (
-                MemoryStore(relational)
-                if self._clock is None
-                else MemoryStore(relational, self._clock)
-            )
-            self._relational = relational
+    def store_for(self, storage: Storage) -> MemoryStore:
+        if self._store is None or self._storage is not storage:
+            self._store = self._build_store(storage)
+            self._storage = storage
         return self._store
+
+    def _build_store(self, storage: Storage) -> MemoryStore:
+        if self._vectors and self._embedder_factory is not None:
+            return IndexedMemoryStore(
+                storage.relational,
+                vectors=storage.vectors,
+                embedder_factory=self._embedder_factory,
+                clock=self._clock,
+            )
+        if self._clock is None:
+            return MemoryStore(storage.relational)
+        return MemoryStore(storage.relational, self._clock)
 
     def resolve(self, ctx: ToolContext) -> tuple[MemoryStore, str] | str:
         """The store and user for this call, or the one-line error to return."""
@@ -103,7 +123,7 @@ class MemoryTools:
             return _NO_USER
         if ctx.storage is None:
             return _NO_STORAGE
-        return self.store_for(ctx.storage.relational), ctx.user_id
+        return self.store_for(ctx.storage), ctx.user_id
 
 
 class MemorySearchTool:
@@ -165,6 +185,7 @@ class MemoryUpdateTool:
     input_model = MemoryUpdateInput
     risk = "write"
     prompts = False
+    notify_result = True
 
     def __init__(self, memories: MemoryTools) -> None:
         self.tags = ["orchestrator"]
@@ -180,7 +201,11 @@ class MemoryUpdateTool:
         )
         if memory is None:
             return f"no memory #{arguments.id}"
-        return f"updated memory #{memory.id} ({_stamps(memory)})"
+        keywords = ", ".join(memory.keywords)
+        return (
+            f"updated memory #{memory.id}: {memory.text} "
+            f"(keywords: {keywords}; {_stamps(memory)})"
+        )
 
 
 class MemoryForgetTool:
@@ -207,9 +232,7 @@ class MemoryForgetTool:
         return f"no memory #{arguments.id}"
 
 
-def recall_store(
-    tools: ToolRegistry, relational: RelationalStore
-) -> MemoryStore | None:
+def recall_store(tools: ToolRegistry, storage: Storage) -> MemoryStore | None:
     """The `MemoryStore` the registered memory tools share, or None when memory is off.
 
     The orchestrator's automatic recall reads through this store, so a recall and a
@@ -219,4 +242,4 @@ def recall_store(
     tool = tools.get(MemorySearchTool.name)
     if not isinstance(tool, MemorySearchTool):
         return None
-    return tool.memories.store_for(relational)
+    return tool.memories.store_for(storage)

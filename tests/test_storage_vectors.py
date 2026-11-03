@@ -1,7 +1,11 @@
 """The vector store contract, run against every adapter, plus the qdrant-edge specifics.
 
-`store_factory` is parametrized over adapters so a later remote adapter reuses
-every contract test by adding one entry. Everything lives under `tmp_path`.
+`store_factory` is parametrized over adapters, so every test that takes `store` or
+`store_factory` runs on the edge backend, on the remote backend (against the fake
+client in `tests/fake_qdrant_client.py`, offline) and on the pgvector backend (against
+the stand-in server in `tests/fake_pgvector.py`, offline, and under `-m live` against a
+real server, see `tests/test_live_pgvector.py` for the commands). A test that uses `root`
+or builds `QdrantEdgeVectorStore` itself is edge-only. Everything lives under `tmp_path`.
 """
 
 import asyncio
@@ -9,18 +13,24 @@ import os
 import stat
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 
 import pytest
 
+from llm_harness.redact import Secret
+from llm_harness.storage.pgvector import PgVectorStore
 from llm_harness.storage.qdrant_edge import QdrantEdgeVectorStore
+from llm_harness.storage.qdrant_remote import QdrantRemoteVectorStore
 from llm_harness.storage.vectors import (
     VectorPoint,
     VectorStore,
     VectorStoreError,
     VectorStoreLockedError,
 )
+from tests.fake_pgvector import FakePgVectorServer
+from tests.fake_qdrant_client import FakeQdrantClient, FakeQdrantServer
+from tests.live_postgres import pgvector_target, reset_vector_schema
 
 LOCK_MESSAGE = "vector store is in use by another llm-harness process"
 CHILD_TIMEOUT_SECONDS = 20
@@ -33,12 +43,42 @@ def root(tmp_path: Path) -> Path:
     return tmp_path / "vectors"
 
 
-@pytest.fixture(params=["qdrant_edge"])
-def store_factory(request: pytest.FixtureRequest, root: Path) -> StoreFactory:
+@pytest.fixture(
+    params=[
+        "qdrant_edge",
+        "qdrant_remote",
+        "pgvector_fake",
+        pytest.param("pgvector", marks=pytest.mark.live),
+    ]
+)
+def store_factory(request: pytest.FixtureRequest, root: Path) -> Iterator[StoreFactory]:
+    # One per test: every instance built by the factory shares one "server".
+    server = FakeQdrantServer()
+    pg_server = FakePgVectorServer()
     factories: dict[str, StoreFactory] = {
         "qdrant_edge": lambda: QdrantEdgeVectorStore(root),
+        "qdrant_remote": lambda: QdrantRemoteVectorStore(
+            "http://qdrant.test:6333",
+            client_factory=lambda: FakeQdrantClient(server),
+        ),
+        "pgvector_fake": lambda: PgVectorStore(
+            "postgresql://vector.test:5432/vectors_test", connect_factory=pg_server
+        ),
     }
-    return factories[request.param]
+    if request.param != "pgvector":
+        yield factories[request.param]
+        return
+    # The real server: every test starts, and ends, on a database where the store has to
+    # create the tables and the schema version itself (this runs `_prepare` each time).
+    url, password = pgvector_target()
+    factories["pgvector"] = lambda: PgVectorStore(
+        url, Secret(password) if password else None
+    )
+    reset_vector_schema(url, password)
+    try:
+        yield factories["pgvector"]
+    finally:
+        reset_vector_schema(url, password)
 
 
 @pytest.fixture
@@ -291,10 +331,8 @@ async def test_close_is_idempotent_and_later_use_is_refused(store: VectorStore) 
         await store.ensure_collection("tools", 2)
 
 
-async def test_close_without_any_collection_creates_nothing(
-    store: VectorStore, root: Path
-) -> None:
-    await store.close()
+async def test_edge_close_without_any_collection_creates_nothing(root: Path) -> None:
+    await QdrantEdgeVectorStore(root).close()
     assert not root.exists()
 
 
@@ -354,6 +392,8 @@ async def test_cancellation_is_not_swallowed(root: Path) -> None:
 _CHILD = """
 import asyncio, sys
 from pathlib import Path
+from llm_harness.redact import Secret
+from llm_harness.storage.pgvector import PgVectorStore
 from llm_harness.storage.qdrant_edge import QdrantEdgeVectorStore
 
 async def main():
