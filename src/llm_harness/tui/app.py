@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+from collections.abc import Awaitable, Callable
 from typing import ClassVar
 
 from rich.text import Text
@@ -22,6 +23,7 @@ from textual.widgets import (
 from textual.worker import Worker, WorkerCancelled
 
 from llm_harness.approval import ApprovalRequest
+from llm_harness.commands import TUI, help_answer, parse_help
 from llm_harness.config import (
     ConfigError,
     HarnessConfig,
@@ -31,7 +33,12 @@ from llm_harness.config import (
 )
 from llm_harness.display import format_switch, format_usage_report, sanitize_text
 from llm_harness.markdown_render import parser_factory
-from llm_harness.memory_command import handle_memory_text
+from llm_harness.memory_add import PendingProposals, ProposeResult
+from llm_harness.memory_command import (
+    SLOW_ACTIONS,
+    handle_memory_text,
+    parse_memory_command,
+)
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.providers.base import ChatProvider
 from llm_harness.redact import redact
@@ -66,7 +73,7 @@ from llm_harness.types import (
 
 _QUIT_COMMANDS = frozenset({"/quit", "/exit"})
 _IMPORT_BUSY = "import failed: a turn is running, try again after it"
-_PLACEHOLDER = "Message, Enter to send, /export, /import <path>, /quit to exit"
+_PLACEHOLDER = "Message, Enter to send, /help, /export, /import <path>, /quit to exit"
 _APPROVAL_PLACEHOLDER = "Allow this call? y/N (Enter on an empty line keeps waiting)"
 _APPROVE_ANSWERS = frozenset({"y", "yes"})  # the same rule as the CLI approver
 CHAT_TAB = "tab-chat"
@@ -134,6 +141,8 @@ class ChatApp(App[int]):
         self._router: ChatProvider | None = None
         self._orchestrator: Orchestrator | None = None
         self._turn: Worker[None] | None = None
+        # The `/memory add` preview that waits for `confirm`; this chat only.
+        self._pending = PendingProposals()
         # Set only while a write or exec call waits for the human's answer.
         self._pending_approval: asyncio.Future[bool] | None = None
 
@@ -169,6 +178,7 @@ class ChatApp(App[int]):
         self.query_one("#prompt", Input).focus()
 
     async def on_unmount(self) -> None:
+        self._pending.clear()
         if self._router is not None:
             await self._router.aclose()
         if self._storage is not None:
@@ -190,6 +200,7 @@ class ChatApp(App[int]):
         self._router = router
         self._model = model
         self._is_manual = is_manual
+        self._pending.clear()  # a new chat or another model starts without a preview
         self._orchestrator = Orchestrator(
             router,
             model,
@@ -288,13 +299,20 @@ class ChatApp(App[int]):
             pending.set_result(text.strip().lower() in _APPROVE_ANSWERS)
             self.query_one("#prompt", Input).value = ""
             return
+        help_request = parse_help(text)
+        if help_request is not None:
+            await self._show(help_answer(TUI, help_request), "note")
+            self.query_one("#prompt", Input).value = ""
+            return
         command = parse_command(text)
         if command is not None:
             await self._run_state_command(command)
             return
-        memory_answer = await handle_memory_text(
-            text.strip(), self._tools, self._storage, self._config.user_id
-        )
+        memory_command = parse_memory_command(text.strip())
+        if memory_command is not None and memory_command.action in SLOW_ACTIONS:
+            self._start_memory_add(text.strip())
+            return
+        memory_answer = await self._memory_answer(text.strip())
         if memory_answer is not None:
             await self._show(memory_answer, "note")
             self.query_one("#prompt", Input).value = ""
@@ -311,6 +329,59 @@ class ChatApp(App[int]):
         self._turn = self.run_worker(
             self._run_turn(self._orchestrator, text), group="turn"
         )
+
+    async def _memory_answer(
+        self, text: str, orchestrator: Orchestrator | None = None
+    ) -> str | None:
+        return await handle_memory_text(
+            text,
+            self._tools,
+            self._storage,
+            self._config.user_id,
+            memory_admins=self._config.tools.memory_admins,
+            propose=None if orchestrator is None else self._proposer(orchestrator),
+            pending=self._pending,
+            no_model="no working model: pick another and press Ctrl+N",
+        )
+
+    def _proposer(
+        self, orchestrator: Orchestrator
+    ) -> Callable[[str, bool], Awaitable[ProposeResult]]:
+        async def propose(paste: str, shared: bool) -> ProposeResult:
+            await self._show("[memory: proposing...]", "note")
+            return await orchestrator.propose_memories(paste, shared)
+
+        return propose
+
+    def _start_memory_add(self, text: str) -> None:
+        """`/memory add` calls the model: it runs in the turn group so Escape cancels it."""
+        if self._turn_is_running():
+            return
+        prompt = self.query_one("#prompt", Input)
+        prompt.value = ""
+        prompt.disabled = True
+        self._turn = self.run_worker(
+            self._run_memory_add(text, self._orchestrator), group="turn"
+        )
+
+    async def _run_memory_add(
+        self, text: str, orchestrator: Orchestrator | None
+    ) -> None:
+        restore_text: str | None = None
+        try:
+            answer = await self._memory_answer(text, orchestrator)
+            if answer is not None:
+                await self._show(answer, "note")
+        except asyncio.CancelledError:
+            # Only synchronous work here: the task is already being cancelled.
+            self._chat_log.mount(Static("cancelled", markup=False, classes="note"))
+            restore_text = text
+            raise
+        except Exception as exc:  # noqa: BLE001 - shown as one safe line, never a traceback
+            await self._show(_unexpected_error_line(exc), "error")
+            restore_text = text
+        finally:
+            self._end_turn(restore_text)
 
     async def _run_state_command(self, command: StateCommand) -> None:
         """`/export` and `/import`: local, never sent to the model, never echoed.

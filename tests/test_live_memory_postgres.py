@@ -62,6 +62,7 @@ from llm_harness.memory import (
 from llm_harness.memory_command import (
     MemoryCommand,
     handle_memory_text,
+    parse_memory_command,
     run_memory_command,
 )
 from llm_harness.memory_index import IndexedMemoryStore, collection_name
@@ -406,13 +407,13 @@ def columns(live: Live, table: str) -> list[tuple]:
 
 
 @bounded
-async def test_the_first_use_creates_the_whole_schema_at_version_two(
+async def test_the_first_use_creates_the_whole_schema_at_version_three(
     live: Live,
 ) -> None:
-    assert len(MEMORY_MIGRATIONS_POSTGRES) == 2
+    assert len(MEMORY_MIGRATIONS_POSTGRES) == 3
     assert live.sql("SELECT to_regclass('memories')") == [(None,)]
     await live.store().save("u1", "a fact", ["x"])
-    assert live.memory_version() == [(2,)]
+    assert live.memory_version() == [(3,)]
     assert columns(live, "memories") == [
         ("id", "bigint", "NO", "YES", "ALWAYS", "NEVER"),
         ("user_id", "text", "NO", "NO", None, "NEVER"),
@@ -421,7 +422,12 @@ async def test_the_first_use_creates_the_whole_schema_at_version_two(
         ("created_at", "text", "NO", "NO", None, "NEVER"),
         ("updated_at", "text", "NO", "NO", None, "NEVER"),
         ("search", "tsvector", "YES", "NO", None, "ALWAYS"),
+        ("shared", "integer", "NO", "NO", None, "NEVER"),
     ]
+    assert live.sql(
+        "SELECT column_default FROM information_schema.columns "
+        "WHERE table_name = 'memories' AND column_name = 'shared'"
+    ) == [("0",)]
     ((expression,),) = live.sql(
         "SELECT generation_expression FROM information_schema.columns "
         "WHERE table_name = 'memories' AND column_name = 'search'"
@@ -481,7 +487,7 @@ async def test_a_second_instance_does_not_migrate_again(live: Live) -> None:
     )  # CREATE would fail if it ran again
     assert live.sql("SELECT 'memories'::regclass::oid") == table
     assert live.sql("SELECT 'memories_clear_markers'::regproc::oid") == function
-    assert live.memory_version() == [(2,)]
+    assert live.memory_version() == [(3,)]
     assert live.sql("SELECT count(*) FROM memories") == [(1,)]
 
 
@@ -500,7 +506,7 @@ async def test_two_instances_using_memory_first_in_threads_leave_one_schema(
             f.result(timeout=20) for f in [pool.submit(first_use, n) for n in range(4)]
         ]
     assert sorted(ids) == [1, 2, 3, 4]
-    assert live.memory_version() == [(2,)]
+    assert live.memory_version() == [(3,)]
     assert live.sql("SELECT count(*) FROM memories") == [(4,)]
 
 
@@ -512,7 +518,7 @@ async def test_two_instances_using_memory_first_through_gather_leave_one_schema(
         *(live.store().save("u1", f"note {n}", ["x"]) for n in range(4))
     )
     assert sorted(m.id for m in saved) == [1, 2, 3, 4]
-    assert live.memory_version() == [(2,)]
+    assert live.memory_version() == [(3,)]
 
 
 @bounded
@@ -525,7 +531,7 @@ async def test_storage_status_prints_the_memory_schema_line(
         relational_path=tmp_path / "never-used.db",
         data_dir=tmp_path,
     )
-    assert "  schema: memory version 2 (the code expects 2)" in lines
+    assert "  schema: memory version 3 (the code expects 3)" in lines
     assert list(tmp_path.iterdir()) == []  # status created nothing
 
 
@@ -755,6 +761,319 @@ async def test_postgres_memory_with_the_real_pgvector_store_searches_by_meaning(
         lambda: reset_vector_schema(live_vector.url, live_vector.password),
     )
     assert live_vector.sql("SELECT count(*) FROM vector_points") == [(2,)]
+
+
+# --- (f2) shared notes: the real ALTER TABLE, the real filters --------------------------
+
+
+@bounded
+async def test_a_v2_database_with_rows_is_upgraded_by_step_three_and_rows_stay_private(
+    live: Live,
+) -> None:
+    """The first production `ALTER TABLE`, on a real server: old rows read `shared = 0`."""
+    await live.relational().migrate("memory", MEMORY_MIGRATIONS_POSTGRES[:2])
+    assert live.memory_version() == [(2,)]
+    live.sql(
+        "INSERT INTO memories (user_id, text, keywords, created_at, updated_at) "
+        "VALUES ('alice', 'Likes green tea', 'tea', 'then', 'then'), "
+        "('alice', 'Prefers metric units', 'metric', 'then', 'then')"
+    )
+    store = live.store()
+    notes = await store.list("alice")
+    assert [(m.text, m.shared) for m in notes] == [
+        ("Prefers metric units", False),
+        ("Likes green tea", False),
+    ]
+    assert live.memory_version() == [(3,)]
+    assert live.sql("SELECT shared FROM memories ORDER BY id") == [(0,), (0,)]
+    assert [m.text for m in await store.search("alice", "tea")] == ["Likes green tea"]
+    assert await store.search("bob", "tea") == []  # an old row is private
+    assert await store.get("bob", notes[0].id) is None
+    await live.store().get("alice", 1)  # a second instance: no migration, no error
+    assert live.memory_version() == [(3,)]
+
+
+@bounded
+async def test_shared_notes_are_read_by_another_user_and_owner_only_to_change(
+    live: Live,
+) -> None:
+    store = live.store()
+    mine = await store.save("bob", "Bob drinks tea", ["tea"])
+    note = await store.save("alice", "Team rule: tea is free", ["tea", "rule"])
+    private = await store.save("alice", "Alice private tea habit", ["tea"])
+    live.sql(
+        "INSERT INTO memory_vectors (collection, memory_id) VALUES ('c', %s), ('c', %s)",
+        (note.id, private.id),
+    )
+
+    published = await store.set_shared("alice", note.id, True)
+    assert published is not None and published.shared is True
+    assert live.sql("SELECT shared FROM memories WHERE id = %s", (note.id,)) == [(1,)]
+    assert published.updated_at == note.updated_at
+    assert [r[1] for r in markers(live)] == [private.id]  # only the flipped note's
+
+    other = live.store()  # another instance, as another person's program
+    assert await other.get("bob", note.id) == published
+    assert await other.get("bob", private.id) is None
+    assert {m.id for m in await other.search("bob", "tea")} == {mine.id, note.id}
+    assert await other.list("bob") == [published, mine]
+    for user in ("alice", "bob"):
+        assert await other.update(user, note.id, text="changed") is None
+        assert await other.forget(user, note.id) is False
+    assert live.sql("SELECT text FROM memories WHERE id = %s", (note.id,)) == [
+        ("Team rule: tea is free",)
+    ]
+    assert await other.set_shared("bob", note.id, False) is None  # owner only
+    assert await other.set_shared("alice", 999, True) is None
+
+    back = await other.set_shared("alice", note.id, False)
+    assert back is not None and back.shared is False
+    assert await other.get("bob", note.id) is None
+    assert [m.id for m in await other.search("bob", "tea")] == [mine.id]
+    assert await other.forget("alice", note.id) is True
+
+
+@bounded
+async def test_set_shared_with_a_driver_failure_is_a_type_name_only_error(
+    live: Live,
+) -> None:
+    store = live.store()
+    note = await store.save("alice", "a fact", ["x"])
+    live.sql("DROP TABLE memory_vectors")  # the marker delete now fails on the server
+    with pytest.raises(MemoryStorageError) as info:
+        await store.set_shared("alice", note.id, True)
+    assert str(info.value) == "memory storage failed (UndefinedTable)"
+
+
+@bounded
+async def test_the_real_pgvector_store_filters_on_the_shared_payload_and_unpublish_removes_it(
+    live_vector: Live,
+) -> None:
+    secret = Secret(live_vector.password) if live_vector.password else None
+    vectors = PgVectorStore(live_vector.url, secret)
+    store = IndexedMemoryStore(live_vector.relational(), vectors, embedder, clock)
+
+    def payloads() -> list[tuple]:
+        return live_vector.sql(
+            "SELECT id, payload FROM vector_points ORDER BY id::bigint"
+        )
+
+    note = await store.save("alice", "Partner is allergic to peanuts", ["allergy"])
+    tea = await store.save("alice", "Likes tea", ["tea"])
+    assert store.index_off_reason is None
+    assert payloads() == [
+        (str(note.id), {"user_id": "alice"}),
+        (str(tea.id), {"user_id": "alice"}),
+    ]
+
+    # Private: another user finds nothing, by keyword or by meaning.
+    assert await store.search("bob", QUERY_BY_MEANING) == []
+
+    published = await store.set_shared("alice", note.id, True)
+    assert published is not None and published.shared is True
+    assert store.index_off_reason is None
+    assert live_vector.sql(
+        "SELECT id FROM vector_points WHERE payload @> '{\"shared\": 1}'::jsonb"
+    ) == [(str(note.id),)]
+    assert live_vector.sql(
+        "SELECT payload ? 'shared' FROM vector_points WHERE id = %s", (str(note.id),)
+    ) == [(True,)]
+    assert len(markers(live_vector)) == 2  # cleared by the flip, written again
+
+    # No keyword in common with the note: a hit is the shared vector search.
+    assert await live_vector.store().search("bob", QUERY_BY_MEANING) == []
+    found = await store.search("bob", QUERY_BY_MEANING)
+    assert [m.id for m in found] == [
+        note.id
+    ]  # the shared one; alice's tea stays hidden
+    assert found[0].shared is True
+    # The owner finds it through both searches, listed once.
+    assert [m.id for m in await store.search("alice", QUERY_BY_MEANING)].count(
+        note.id
+    ) == 1
+
+    # Reindex of another user embeds the shared note once per collection.
+    assert await store.reindex("bob") == (0, 0)
+
+    await store.set_shared("alice", note.id, False)
+    assert live_vector.sql(
+        "SELECT payload ? 'shared' FROM vector_points WHERE id = %s", (str(note.id),)
+    ) == [(False,)]
+    assert live_vector.sql(
+        "SELECT count(*) FROM vector_points WHERE payload @> '{\"shared\": 1}'::jsonb"
+    ) == [(0,)]
+    assert await store.search("bob", QUERY_BY_MEANING) == []
+    assert payloads()[0] == (str(note.id), {"user_id": "alice"})
+
+
+@bounded
+async def test_a_shared_note_unindexed_by_a_flip_is_embedded_by_another_users_reindex(
+    live_vector: Live,
+) -> None:
+    secret = Secret(live_vector.password) if live_vector.password else None
+    store = IndexedMemoryStore(
+        live_vector.relational(),
+        PgVectorStore(live_vector.url, secret),
+        embedder,
+        clock,
+    )
+    note = await live_vector.store().save("alice", "Likes tea", ["tea"])
+    await live_vector.store().set_shared(
+        "alice", note.id, True
+    )  # plain store, no vectors
+    assert await store.reindex("bob") == (1, 1)
+    assert live_vector.sql("SELECT payload FROM vector_points") == [
+        ({"user_id": "alice", "shared": 1},)
+    ]
+    assert await store.reindex("carol") == (0, 0)  # the marker is per note id
+
+
+async def command(store: MemoryStore, text: str, user: str, admins=("alice",)) -> str:
+    parsed = parse_memory_command(text)
+    assert parsed is not None
+    return await run_memory_command(store, user, parsed, memory_admins=admins)
+
+
+@bounded
+async def test_publish_and_unpublish_commands_on_the_real_postgres_store(
+    live: Live,
+) -> None:
+    store = live.store()
+    note = await store.save("alice", "Team rule: tea is free", ["tea"])
+    other = live.store()  # another instance, as bob's program
+    publish = f"/memory publish {note.id}"
+    assert await command(other, publish, "bob") == (
+        "only memory admins may publish or unpublish shared memories"
+    )
+    assert await command(other, publish, "bob", admins=("bob",)) == (
+        f"no memory #{note.id}"  # a private note of another user is never revealed
+    )
+    assert await command(other, publish, "alice") == f"published memory #{note.id}"
+    assert await command(other, publish, "alice") == (
+        f"memory #{note.id} is already shared"
+    )
+    assert live.sql("SELECT shared FROM memories WHERE id = %s", (note.id,)) == [(1,)]
+    assert (await command(store, "/memory", "bob")).startswith(
+        f"#{note.id} [shared] [tea] (updated "
+    )
+    assert f"#{note.id} [shared]" in await command(store, "/memory search tea", "bob")
+    assert f"#{note.id} [shared]" in await command(
+        store, f"/memory show {note.id}", "bob"
+    )
+    unpublish = f"/memory unpublish {note.id}"
+    assert await command(store, unpublish, "alice") == f"unpublished memory #{note.id}"
+    assert (
+        await command(store, unpublish, "alice") == f"memory #{note.id} is not shared"
+    )
+    assert await command(store, "/memory", "bob") == "(no memories)"
+    assert (
+        await command(store, "/memory search tea", "bob") == 'no memories match "tea"'
+    )
+
+
+@bounded
+async def test_publish_command_with_the_real_pgvector_store_sets_the_payload(
+    live_vector: Live,
+) -> None:
+    secret = Secret(live_vector.password) if live_vector.password else None
+    store = IndexedMemoryStore(
+        live_vector.relational(),
+        PgVectorStore(live_vector.url, secret),
+        embedder,
+        clock,
+    )
+    note = await store.save("alice", "Partner is allergic to peanuts", ["allergy"])
+    assert await command(store, f"/memory publish {note.id}", "alice") == (
+        f"published memory #{note.id}"
+    )
+    assert [m.id for m in await store.search("bob", QUERY_BY_MEANING)] == [note.id]
+    assert await command(store, f"/memory unpublish {note.id}", "alice") == (
+        f"unpublished memory #{note.id}"
+    )
+    assert await store.search("bob", QUERY_BY_MEANING) == []
+
+
+NOT_ADMIN_FORGET = "only memory admins may forget shared memories"
+
+
+@bounded
+async def test_forget_command_on_the_real_postgres_store(live: Live) -> None:
+    store = live.store()
+    note = await store.save("alice", "Team rule: tea is free", ["tea"])
+    private = await store.save("alice", "Alice private", ["secret"])
+    await store.set_shared("alice", note.id, True)
+    await live.store().save("bob", "Bob private", ["bobby"])
+    other = live.store()  # another instance, as the admin's program
+    forget = f"/memory forget {note.id}"
+    # The creator is not an admin; a non-admin never causes a lookup.
+    assert await command(other, forget, "alice", admins=("carol",)) == NOT_ADMIN_FORGET
+    assert await command(other, "/memory forget 999", "bob", admins=()) == (
+        NOT_ADMIN_FORGET
+    )
+    assert live.sql("SELECT count(*) FROM memories WHERE id = %s", (note.id,)) == [(1,)]
+    # A private note of another user: never revealed, never deleted.
+    assert await command(
+        other, f"/memory forget {private.id}", "carol", ("carol",)
+    ) == (f"no memory #{private.id}")
+    assert await command(
+        other, f"/memory forget {private.id}", "alice", ("alice",)
+    ) == (f"memory #{private.id} is not shared; use /memory delete {private.id}")
+    assert live.sql("SELECT count(*) FROM memories WHERE id = %s", (private.id,)) == [
+        (1,)
+    ]
+    for memory_id in (note.id, private.id):  # marker rows the delete trigger must clear
+        live.sql(
+            "INSERT INTO memory_vectors (collection, memory_id) VALUES ('c1', %s)",
+            (memory_id,),
+        )
+    # The admin forgets it for everyone.
+    assert await command(other, forget, "carol", admins=("carol",)) == (
+        f"forgot shared memory #{note.id}: Team rule: tea is free"
+    )
+    assert live.sql("SELECT count(*) FROM memories WHERE id = %s", (note.id,)) == [(0,)]
+    assert markers(live) == [
+        ("c1", private.id)
+    ]  # only the forgotten note's marker went
+    assert await command(store, forget, "carol", admins=("carol",)) == (
+        f"no memory #{note.id}"
+    )
+    for user in ("alice", "bob", "carol"):
+        assert f"#{note.id} " not in await command(store, "/memory", user)
+        assert await command(store, "/memory search tea", user) == (
+            'no memories match "tea"'
+        )
+    assert live.sql("SELECT count(*) FROM memories") == [
+        (2,)
+    ]  # both private notes stay
+
+
+@bounded
+async def test_forget_command_with_the_real_pgvector_store_removes_the_point(
+    live_vector: Live,
+) -> None:
+    secret = Secret(live_vector.password) if live_vector.password else None
+    store = IndexedMemoryStore(
+        live_vector.relational(),
+        PgVectorStore(live_vector.url, secret),
+        embedder,
+        clock,
+    )
+    note = await store.save("alice", "Partner is allergic to peanuts", ["allergy"])
+    await command(store, f"/memory publish {note.id}", "alice")
+    assert [m.id for m in await store.search("bob", QUERY_BY_MEANING)] == [note.id]
+    assert live_vector.sql("SELECT count(*) FROM vector_points") == [(1,)]
+    assert live_vector.sql("SELECT count(*) FROM memory_vectors") == [(1,)]
+    assert await command(
+        store, f"/memory forget {note.id}", "carol", admins=("carol",)
+    ) == (f"forgot shared memory #{note.id}: Partner is allergic to peanuts")
+    assert live_vector.sql(
+        "SELECT count(*) FROM vector_points WHERE id = %s", (str(note.id),)
+    ) == [(0,)]
+    assert live_vector.sql("SELECT count(*) FROM vector_points") == [(0,)]
+    assert live_vector.sql("SELECT count(*) FROM memory_vectors") == [(0,)]
+    assert await store.search("bob", QUERY_BY_MEANING) == []
+    assert await store.search("alice", QUERY_BY_MEANING) == []
+    assert store.index_off_reason is None
 
 
 # --- (g) concurrency, with separate store instances ------------------------------------

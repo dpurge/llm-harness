@@ -2,9 +2,11 @@
 
 Not `specs/memory.md` (the developer log of `/code`). A memory is a short text
 plus 1 to 8 keywords; both are indexed by an FTS5 table that triggers keep in
-step with `memories`. Every query filters by `user_id`. Timestamps come from the
-injected clock only. Text or keywords that look like a secret are refused, not
-stored masked. Validation errors are `MemoryValidationError` with a short message,
+step with `memories`. Every query filters by `user_id`, except that a read also
+returns shared notes (`shared = 1`: one global set, readable by every user, changed
+only by the creator through `set_shared`). Timestamps come from the injected clock
+only. Text or keywords that look like a secret are refused, not stored masked.
+Validation errors are `MemoryValidationError` with a short message,
 so a tool can return them to the model as an observation.
 """
 
@@ -81,9 +83,14 @@ MEMORY_MIGRATIONS: tuple[Migration, ...] = (
             DELETE FROM memory_vectors WHERE memory_id = old.id;
         END""",
     ),
+    (
+        # The first production ALTER TABLE: 1 marks a note every user may read.
+        # `user_id` stays the creator. The FTS table and triggers do not see the column.
+        "ALTER TABLE memories ADD COLUMN shared INTEGER NOT NULL DEFAULT 0",
+    ),
 )
 
-# The same two steps on PostgreSQL; both tuples must keep the same number of steps
+# The same three steps on PostgreSQL; both tuples must keep the same number of steps
 # (the version numbers mean the same thing, and store.py reports `len` of the SQLite one).
 # `search` is a generated tsvector with a GIN index instead of an FTS5 table, so no
 # trigger maintains it. The marker triggers become one PL/pgSQL function, because a
@@ -127,6 +134,7 @@ MEMORY_MIGRATIONS_POSTGRES: tuple[Migration, ...] = (
         """CREATE TRIGGER memories_vectors_gone AFTER DELETE
         ON memories FOR EACH ROW EXECUTE FUNCTION memories_clear_markers()""",
     ),
+    ("ALTER TABLE memories ADD COLUMN shared INTEGER NOT NULL DEFAULT 0",),
 )
 _MIGRATIONS_BY_DIALECT: dict[str, tuple[Migration, ...]] = {
     "sqlite": MEMORY_MIGRATIONS,
@@ -140,6 +148,11 @@ MAX_SEARCH_RESULTS = 10
 _MAX_QUERY_TERMS = 32  # a long query must not become a huge MATCH expression
 
 _TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# ASCII digits only: `\d` would accept other scripts' digits, and `fullmatch` refuses a
+# trailing newline that `$` would let through.
+_TIMESTAMP_PATTERN = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
+)
 # Stored newline-joined, not space-joined: a keyword may contain a space, and FTS5
 # treats a newline as a separator just like a space, so the split is lossless.
 _KEYWORD_SEPARATOR = "\n"
@@ -163,19 +176,19 @@ _STOP_WORDS = frozenset(
     """.split()  # noqa: SIM905  (150 words read better as prose than one per line)
 )
 _T = TypeVar("_T")
-_COLUMNS = "id, user_id, text, keywords, created_at, updated_at"
+_COLUMNS = "id, user_id, text, keywords, created_at, updated_at, shared"
 _SEARCH_SQLITE = (
-    "SELECT m.id, m.user_id, m.text, m.keywords, m.created_at, m.updated_at "
+    "SELECT m.id, m.user_id, m.text, m.keywords, m.created_at, m.updated_at, m.shared "
     "FROM memories_fts JOIN memories AS m ON m.id = memories_fts.rowid "
-    "WHERE memories_fts MATCH ? AND m.user_id = ? "
+    "WHERE memories_fts MATCH ? AND (m.user_id = ? OR m.shared = 1) "
     "ORDER BY bm25(memories_fts), m.id DESC LIMIT ?"
 )
 # Plain ts_rank, not a length-normalised one: it gave the same top hit and order as
 # bm25 on every spike query, the normalised variants flipped one.
 _SEARCH_POSTGRES = (
-    "SELECT m.id, m.user_id, m.text, m.keywords, m.created_at, m.updated_at "
+    "SELECT m.id, m.user_id, m.text, m.keywords, m.created_at, m.updated_at, m.shared "
     "FROM memories AS m, websearch_to_tsquery('english', ?) AS q "
-    "WHERE m.search @@ q AND m.user_id = ? "
+    "WHERE m.search @@ q AND (m.user_id = ? OR m.shared = 1) "
     "ORDER BY ts_rank(m.search, q) DESC, m.id DESC LIMIT ?"
 )
 
@@ -202,6 +215,46 @@ class Memory:
     keywords: tuple[str, ...]
     created_at: str
     updated_at: str
+    shared: bool = False  # readable by every user; `user_id` is still the creator
+
+
+def check_timestamp(value: object, now: str) -> str:
+    """`value` when it is a real `YYYY-MM-DDTHH:MM:SSZ` stamp not later than `now`.
+
+    A caller-chosen timestamp must not pin a note to the future: `list` and recall
+    order by `updated_at`, so a far-future value would sort first until the clock
+    caught up. An old value only sorts a note lower, so the lower bound is open. The
+    message never echoes `value`: it comes from a file the human did not write.
+    """
+    if not isinstance(value, str) or not _TIMESTAMP_PATTERN.fullmatch(value):
+        raise MemoryValidationError("timestamp must look like 2026-11-02T09:30:15Z")
+    try:
+        datetime.strptime(value, _TIMESTAMP_FORMAT)
+    except ValueError:
+        raise MemoryValidationError("timestamp is not a real date and time") from None
+    if value > now:  # the same fixed-width format sorts like time
+        raise MemoryValidationError("timestamp is later than the current time")
+    return value
+
+
+def _timestamp_pair(
+    created_at: object, updated_at: object, now: str
+) -> tuple[str, str]:
+    """Both stamps for a new row; a missing member never makes the pair invalid.
+
+    Both missing: `now`. One missing: it copies the other, so `updated` is never
+    before `created`. Both given: `updated` before `created` is refused.
+    """
+    if created_at is None and updated_at is None:
+        return now, now
+    created = None if created_at is None else check_timestamp(created_at, now)
+    updated = None if updated_at is None else check_timestamp(updated_at, now)
+    created = updated if created is None else created
+    updated = created if updated is None else updated
+    assert created is not None and updated is not None
+    if updated < created:
+        raise MemoryValidationError("updated timestamp is earlier than the created one")
+    return created, updated
 
 
 def _utc_now() -> datetime:
@@ -269,6 +322,14 @@ def _check_keywords(keywords: object) -> tuple[str, ...]:
     return tuple(unique)
 
 
+def validate_note(text: object, keywords: object) -> tuple[str, tuple[str, ...]]:
+    """The trimmed text and the distinct keywords, or `MemoryValidationError`.
+
+    The store's own checks, public so a caller can test a note before it saves it.
+    """
+    return _check_text(text), _check_keywords(keywords)
+
+
 def _query_words(query: object) -> list[str]:
     """The user's meaningful words, at most `_MAX_QUERY_TERMS`; empty when there is none.
 
@@ -297,7 +358,7 @@ def _websearch_expression(words: list[str]) -> str:
 
 
 def _row_to_memory(row: tuple) -> Memory:
-    id_, user_id, text, keywords, created_at, updated_at = row
+    id_, user_id, text, keywords, created_at, updated_at, shared = row
     return Memory(
         id_,
         user_id,
@@ -305,6 +366,7 @@ def _row_to_memory(row: tuple) -> Memory:
         tuple(keywords.split(_KEYWORD_SEPARATOR)),
         created_at,
         updated_at,
+        bool(shared),
     )
 
 
@@ -331,18 +393,55 @@ class MemoryStore:
         """A one-line notice for the human, once; None here (only an index raises one)."""
         return None
 
-    async def save(self, user_id: str, text: str, keywords: Sequence[str]) -> Memory:
+    async def save(
+        self,
+        user_id: str,
+        text: str,
+        keywords: Sequence[str],
+        shared: bool = False,
+        *,
+        created_at: str | None = None,
+        updated_at: str | None = None,
+    ) -> Memory:
+        """Store a note, private unless `shared`.
+
+        No tool passes `shared`: only the human `/memory add --shared` command does,
+        after its own admin check (this method authorises nothing). The same holds for
+        `created_at` and `updated_at`, which only `/memory import` passes to keep a
+        file's timestamps; None means the injected clock, as for every other caller.
+        """
         user_id = _check_user_id(user_id)
-        text = _check_text(text)
-        checked = _check_keywords(keywords)
-        await self._ensure_migrated()
+        text, checked = validate_note(text, keywords)
         now = self._now()
+        created, updated = _timestamp_pair(created_at, updated_at, now)
+        await self._ensure_migrated()
         rows = await self._query(
-            "INSERT INTO memories (user_id, text, keywords, created_at, updated_at) "
-            f"VALUES (?, ?, ?, ?, ?) RETURNING {_COLUMNS}",
-            (user_id, text, _KEYWORD_SEPARATOR.join(checked), now, now),
+            "INSERT INTO memories (user_id, text, keywords, created_at, updated_at, shared) "
+            f"VALUES (?, ?, ?, ?, ?, ?) RETURNING {_COLUMNS}",
+            (
+                user_id,
+                text,
+                _KEYWORD_SEPARATOR.join(checked),
+                created,
+                updated,
+                1 if shared else 0,
+            ),
         )
         return _row_to_memory(rows[0])
+
+    def current_timestamp(self) -> str:
+        """The injected clock's time in the store's format (for an export header)."""
+        return self._now()
+
+    async def has_text(self, user_id: str, text: str) -> bool:
+        """True when this user's own note or any shared note has exactly this text."""
+        user_id = _check_user_id(user_id)
+        await self._ensure_migrated()
+        rows = await self._query(
+            "SELECT 1 FROM memories WHERE text = ? AND (user_id = ? OR shared = 1) LIMIT 1",
+            (text, user_id),
+        )
+        return bool(rows)
 
     async def update(
         self,
@@ -351,7 +450,11 @@ class MemoryStore:
         text: str | None = None,
         keywords: Sequence[str] | None = None,
     ) -> Memory | None:
-        """Change text and/or keywords; None when this user has no such id."""
+        """Change text and/or keywords; None when this user has no such id.
+
+        A shared note is refused for everyone, its creator included: a model tool or the
+        reflection step runs as the creator and must never alter what every user reads.
+        """
         user_id = _check_user_id(user_id)
         if text is None and keywords is None:
             raise MemoryValidationError("give text, keywords or both to update")
@@ -368,26 +471,66 @@ class MemoryStore:
         params.append(self._now())
         rows = await self._query(
             f"UPDATE memories SET {', '.join(assignments)} "
-            f"WHERE id = ? AND user_id = ? RETURNING {_COLUMNS}",
+            f"WHERE id = ? AND user_id = ? AND shared = 0 RETURNING {_COLUMNS}",
             (*params, id, user_id),
         )
         return _row_to_memory(rows[0]) if rows else None
 
     async def forget(self, user_id: str, id: int) -> bool:
-        """Hard-delete one entry; False when this user has no such id."""
+        """Hard-delete one entry; False when this user has no such id or it is shared."""
         user_id = _check_user_id(user_id)
         await self._ensure_migrated()
         rows = await self._query(
-            "DELETE FROM memories WHERE id = ? AND user_id = ? RETURNING id",
+            "DELETE FROM memories WHERE id = ? AND user_id = ? AND shared = 0 RETURNING id",
             (id, user_id),
         )
         return bool(rows)
 
-    async def get(self, user_id: str, id: int) -> Memory | None:
+    async def forget_shared(self, id: int) -> Memory | None:
+        """Hard-delete one SHARED note whoever created it; None when it is private or unknown.
+
+        Only the human `/memory forget` command calls this, never a tool. It does no
+        authorisation: the admin check lives in the command layer. `shared = 1` keeps it
+        from touching a private note. The marker rows go through the delete trigger.
+        """
+        await self._ensure_migrated()
+        rows = await self._query(
+            f"DELETE FROM memories WHERE id = ? AND shared = 1 RETURNING {_COLUMNS}",
+            (id,),
+        )
+        return _row_to_memory(rows[0]) if rows else None
+
+    async def set_shared(self, user_id: str, id: int, shared: bool) -> Memory | None:
+        """Publish or unpublish the creator's own note; None when this user has no such id.
+
+        Only the human `/memory` commands call this, never a tool. `updated_at` stays (the
+        text did not change). The markers go too: the marker triggers fire only on a text
+        or keyword change, and the vector payload carries the flag, so every collection
+        must embed the note again (`IndexedMemoryStore` does it for the current one).
+        """
         user_id = _check_user_id(user_id)
         await self._ensure_migrated()
         rows = await self._query(
-            f"SELECT {_COLUMNS} FROM memories WHERE id = ? AND user_id = ?",
+            "UPDATE memories SET shared = ? WHERE id = ? AND user_id = ? "
+            f"RETURNING {_COLUMNS}",
+            (1 if shared else 0, id, user_id),
+        )
+        if not rows:
+            return None
+        await self._driver_errors_as_type_only(
+            self._relational.execute(
+                "DELETE FROM memory_vectors WHERE memory_id = ?", (id,)
+            )
+        )
+        return _row_to_memory(rows[0])
+
+    async def get(self, user_id: str, id: int) -> Memory | None:
+        """The user's own note or a shared one; None for another user's private note."""
+        user_id = _check_user_id(user_id)
+        await self._ensure_migrated()
+        rows = await self._query(
+            f"SELECT {_COLUMNS} FROM memories "
+            "WHERE id = ? AND (user_id = ? OR shared = 1)",
             (id, user_id),
         )
         return _row_to_memory(rows[0]) if rows else None
@@ -412,11 +555,11 @@ class MemoryStore:
     async def list(
         self, user_id: str, limit: int = 50, offset: int = 0
     ) -> "list[Memory]":
-        """Newest-updated first."""
+        """The user's own and the shared notes, newest-updated first."""
         user_id = _check_user_id(user_id)
         await self._ensure_migrated()
         rows = await self._query(
-            f"SELECT {_COLUMNS} FROM memories WHERE user_id = ? "
+            f"SELECT {_COLUMNS} FROM memories WHERE (user_id = ? OR shared = 1) "
             "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
             (user_id, max(0, limit), max(0, offset)),
         )

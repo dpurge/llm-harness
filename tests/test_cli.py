@@ -17,6 +17,7 @@ import pytest
 
 import llm_harness.store as store_module
 from llm_harness.cli import _chat_loop, _read_line, _run_turn, main, resolve_think
+from llm_harness.commands import help_overview
 from llm_harness.config import (
     AGENTS_FILE,
     CONFIG_FILE,
@@ -30,6 +31,7 @@ from llm_harness.config import (
     ProviderConfig,
     load_config,
 )
+from llm_harness.memory_command import USAGE as MEMORY_USAGE
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.providers.base import ChatProvider
 from llm_harness.router import RouterFactory
@@ -1035,6 +1037,41 @@ def test_quit_commands_end_cleanly_without_a_model_call(
     )
     assert result.code == 0
     assert provider.requests == []
+
+
+def test_help_prints_the_overview_to_stdout_without_a_model_call(
+    config_dir: Path,
+) -> None:
+    provider, factory = scripted(*reply_events())
+    result = run_cli(["--plain"], config_dir, stdin="/help\n/HELP\n", factory=factory)
+    assert result.code == 0
+    assert result.out == f"{help_overview('plain')}\n" * 2
+    assert provider.requests == []
+    assert "/export" not in result.out
+
+
+def test_help_detail_and_unknown_name_in_plain_mode(config_dir: Path) -> None:
+    provider, factory = scripted(*reply_events())
+    result = run_cli(
+        ["--plain"],
+        config_dir,
+        stdin="/help memory\n/help /exit\n/help export\n",
+        factory=factory,
+    )
+    assert (
+        result.out.splitlines()[: len(MEMORY_USAGE.splitlines())]
+        == MEMORY_USAGE.splitlines()
+    )
+    assert result.out.endswith(
+        'usage: /exit\n  leave the chat (same as /quit)\nno help for "export"; type /help\n'
+    )
+    assert provider.requests == []
+
+
+def test_helpx_is_a_normal_message_in_plain_mode(config_dir: Path) -> None:
+    provider, factory = scripted(*reply_events())
+    run_cli(["--plain"], config_dir, stdin="/helpx\n", factory=factory)
+    assert len(provider.requests) == 1
 
 
 def test_text_that_merely_contains_quit_is_a_normal_message(config_dir: Path) -> None:

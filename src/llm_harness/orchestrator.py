@@ -30,6 +30,12 @@ from llm_harness.context import (
     retry_observation,
 )
 from llm_harness.memory import MemoryValidationError
+from llm_harness.memory_add import (
+    ProposalError,
+    ProposeResult,
+    build_add_request,
+    parse_proposals,
+)
 from llm_harness.memory_recall import RECALL_K, format_recall_block
 from llm_harness.memory_reflection import (
     ReflectionError,
@@ -159,7 +165,8 @@ def _notice_line(text: str) -> str:
 
 def _failure_reason(error: Exception) -> str:
     if isinstance(
-        error, ReflectionError | MemoryValidationError | _ReflectionCallError
+        error,
+        ReflectionError | ProposalError | MemoryValidationError | _ReflectionCallError,
     ):
         return str(error)
     return f"{type(error).__name__}: {error}"
@@ -581,15 +588,7 @@ class Orchestrator:
                     memories,
                     self._think,
                 )
-                with self._recorder.span("llm_call", request.model, span) as call:
-                    call.attributes["model"] = request.model
-                    call.attributes["messages"] = [
-                        message.model_dump() for message in request.messages
-                    ]
-                    try:
-                        await self._collect_reflection(request, attempt, call)
-                    finally:
-                        call.attributes["reply"] = attempt.text
+                await self._side_call(request, attempt, span)
                 action = parse_reflection(attempt.text)
                 span.attributes["action"] = action.action
                 span.attributes["id"] = action.id
@@ -615,6 +614,49 @@ class Orchestrator:
         index_notice = self._vector_notice()
         if index_notice:
             yield Notice(text=index_notice)
+
+    async def _side_call(self, request, attempt: _Attempt, parent: SpanHandle) -> None:
+        """One side-model call inside an `llm_call` span; the reply lands in `attempt`."""
+        with self._recorder.span("llm_call", request.model, parent) as call:
+            call.attributes["model"] = request.model
+            call.attributes["messages"] = [
+                message.model_dump() for message in request.messages
+            ]
+            try:
+                await self._collect_reflection(request, attempt, call)
+            finally:
+                call.attributes["reply"] = attempt.text
+
+    async def propose_memories(self, paste: str, shared: bool = False) -> ProposeResult:
+        """`/memory add`: one model call proposes only the new facts of `paste`.
+
+        Same gate, timeout and one attempt as the reflection, no tools. Makes no call
+        and returns `off` when memory is not on. Every `Exception` becomes
+        `ProposeResult.error`; cancellation propagates. Nothing is stored here, and
+        `shared` only goes into the trace (the command checks the admin).
+        """
+        target = self._memory_target()
+        store = None if target is None else recall_store(self._tools, target[0])
+        if target is None or store is None:
+            return ProposeResult(off=True)
+        attempt = _Attempt()
+        with self._recorder.span("memory_add", "memory add") as span:
+            span.attributes["shared"] = shared
+            span.attributes["characters"] = len(paste)
+            try:
+                memories = await store.search(target[1], paste, RECALL_K)
+                request = build_add_request(
+                    self._model_cfg, paste, memories, self._think
+                )
+                await self._side_call(request, attempt, span)
+                notes = parse_proposals(attempt.text)
+            except Exception as error:  # noqa: BLE001 - one line for the command
+                reason = _failure_reason(error)
+                span.status = "error"
+                span.attributes["error"] = reason
+                return ProposeResult(report=attempt.report, error=reason)
+            span.attributes["notes"] = len(notes)
+            return ProposeResult(notes, attempt.report)
 
     async def _collect_reflection(
         self, request, attempt: _Attempt, call: SpanHandle

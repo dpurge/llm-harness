@@ -525,6 +525,26 @@ class ToolsConfig(_Frozen):
     command_allow: list[str] = []
     # Program names or absolute paths that never run; wins over command_allow.
     command_deny: list[str] = []
+    # `user_id` values that may run `/memory publish` and `/memory unpublish`; empty
+    # means nobody can publish a shared memory.
+    memory_admins: list[str] = []
+
+    @field_validator("memory_admins")
+    @classmethod
+    def _memory_admin_rules(cls, values: list[str]) -> list[str]:
+        for value in values:
+            try:
+                _check_user_id(value)
+            except ValueError as error:
+                raise ValueError(
+                    str(error).replace("user_id", "memory_admins entry", 1)
+                ) from None
+        duplicates = sorted({v for v in values if values.count(v) > 1})
+        if duplicates:
+            raise ValueError(
+                f"memory_admins has duplicate entries: {', '.join(duplicates)}"
+            )
+        return values
 
     @field_validator("command_allow", "command_deny")
     @classmethod
@@ -1024,6 +1044,7 @@ base_url = "http://localhost:11434"
 # run_command = true                   # tool: run a program (argv, no shell); every call needs your approval
 # memory = true                       # tools: short English notes kept per user_id (needs user_id); saves run with no prompt, one notice line
 # memory_vectors = true               # memory: also search by meaning (needs a model tagged "embedding"); falls back to keyword search on any problem
+# memory_admins = ["alice"]           # memory: user_id values that may /memory publish and unpublish shared notes; default none
 # command_timeout_seconds = 30         # longest a command may run, 1 to 120
 # command_allow = ["git", "/usr/bin/make"]   # match the program (argv[0]) only; empty allows any command not denied
 # command_deny = ["rm*"]               # deny wins over allow; a built-in deny list (shells, sudo, curl, ...) always applies

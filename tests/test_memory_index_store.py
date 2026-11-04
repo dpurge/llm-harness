@@ -157,6 +157,70 @@ async def test_forget_with_nothing_ever_indexed_makes_no_vector_call(rig: Rig) -
     assert rig.vectors.calls == []
 
 
+async def test_forget_shared_deletes_the_vector_and_the_marker(rig: Rig) -> None:
+    memory = await rig.store.save("u1", "Likes tea", ["tea"])
+    await rig.store.set_shared("u1", memory.id, True)
+    await rig.store.get("u2", memory.id)  # a reader changes nothing
+    # set_shared embeds the note again, so the point and the marker exist now
+    assert str(memory.id) in rig.points()
+    forgotten = await rig.store.forget_shared(memory.id)
+    assert forgotten is not None and forgotten.user_id == "u1" and forgotten.shared
+    assert rig.points() == {}
+    assert rig.markers() == []
+    assert rig.calls("delete") == [("delete", (COLLECTION, (str(memory.id),)))]
+
+
+async def test_forget_shared_of_a_private_or_unknown_id_makes_no_vector_call(
+    rig: Rig,
+) -> None:
+    private = await rig.store.save("u1", "Likes tea", ["tea"])
+    assert await rig.store.forget_shared(private.id) is None
+    assert await rig.store.forget_shared(999) is None
+    assert rig.calls("delete") == []
+    assert str(private.id) in rig.points()
+    assert await rig.store.get("u1", private.id) == private
+
+
+async def test_forget_shared_in_a_new_process_deletes_the_old_vector(db: Path) -> None:
+    first = Rig(db)
+    memory = await first.store.save("u1", "Likes tea", ["tea"])
+    await first.store.set_shared("u1", memory.id, True)
+    second = Rig(db)
+    second.store = IndexedMemoryStore(
+        SqliteRelationalStore(db), first.vectors, second.factory, lambda: NOW
+    )
+    assert await second.store.forget_shared(memory.id) is not None
+    assert first.points() == {}
+    assert second.store.index_off_reason is None
+
+
+async def test_forget_shared_with_the_index_off_deletes_the_row_and_calls_nothing(
+    db: Path,
+) -> None:
+    rig = Rig(db, upsert=VectorStoreError("disk full"))
+    memory = await rig.store.save("u1", "Likes tea", ["tea"])
+    await rig.store.set_shared("u1", memory.id, True)
+    assert rig.store.take_notice() is not None
+    calls = len(rig.vectors.calls)
+    assert await rig.store.forget_shared(memory.id) is not None
+    assert await rig.store.get("u1", memory.id) is None
+    assert len(rig.vectors.calls) == calls
+    assert rig.store.take_notice() is None
+
+
+async def test_forget_shared_with_a_failing_vector_delete_still_deletes_the_row(
+    rig: Rig,
+) -> None:
+    memory = await rig.store.save("u1", "Likes tea", ["tea"])
+    await rig.store.set_shared("u1", memory.id, True)
+    rig.vectors.fail_on["delete"] = VectorStoreError("down")
+    assert await rig.store.forget_shared(memory.id) is not None
+    assert await rig.store.get("u1", memory.id) is None
+    assert rig.store.index_off_reason == "VectorStoreError: down"
+    assert "vector search is off" in (rig.store.take_notice() or "")
+    assert rig.store.take_notice() is None
+
+
 async def test_a_vector_failure_keeps_the_memory_and_turns_the_index_off(
     db: Path,
 ) -> None:
@@ -291,7 +355,21 @@ async def test_each_point_carries_only_its_own_user(rig: Rig) -> None:
     assert points[str(second.id)].payload == {"user_id": "bob"}
 
 
-async def test_a_version_1_database_migrates_to_2_and_keeps_its_data(db: Path) -> None:
+async def test_save_with_shared_writes_the_shared_payload_and_the_row(rig: Rig) -> None:
+    shared = await rig.store.save("alice", "Team rule", ["rule"], shared=True)
+    private = await rig.store.save("alice", "Alice habit", ["habit"])
+    assert shared.shared is True and private.shared is False
+    points = rig.points()
+    assert points[str(shared.id)].payload == {"user_id": "alice", "shared": 1}
+    assert points[str(private.id)].payload == {"user_id": "alice"}
+    assert rig.sql("SELECT id, shared FROM memories ORDER BY id") == [
+        (shared.id, 1),
+        (private.id, 0),
+    ]
+    assert [m.id for m in await rig.store.list("bob")] == [shared.id]
+
+
+async def test_a_version_1_database_migrates_to_3_and_keeps_its_data(db: Path) -> None:
     relational = SqliteRelationalStore(db)
     await relational.migrate("memory", MEMORY_MIGRATIONS[:1])
     await relational.execute(
@@ -303,8 +381,8 @@ async def test_a_version_1_database_migrates_to_2_and_keeps_its_data(db: Path) -
     rig = Rig(db)
     assert rig.sql(
         "SELECT version FROM schema_versions WHERE namespace = 'memory'"
-    ) == [(2,)]
-    assert rig.sql("SELECT text FROM memories") == [("Likes tea",)]
+    ) == [(3,)]
+    assert rig.sql("SELECT text, shared FROM memories") == [("Likes tea", 0)]
     names = {
         r[0] for r in rig.sql("SELECT name FROM sqlite_master WHERE type = 'trigger'")
     }
@@ -382,14 +460,21 @@ async def test_an_exact_keyword_hit_stays_first_when_the_vectors_disagree(
     assert ids["peanuts"] in [m.id for m in found]
 
 
-async def test_every_vector_search_carries_the_user_filter(rig: Rig) -> None:
+async def test_every_store_search_makes_two_vector_searches_own_then_shared(
+    rig: Rig,
+) -> None:
     await seed_sample(rig.store, "alice")
     await rig.store.search("alice", DIET_QUERY)
     await rig.store.search("alice", "tea")
     searches = vector_searches(rig)
-    assert len(searches) == 2
-    assert all(call[1][3] == {"user_id": "alice"} for call in searches)
+    assert len(searches) == 4
+    assert [call[1][3] for call in searches] == [
+        {"user_id": "alice"},
+        {"shared": 1},
+    ] * 2
     assert all(call[1][2] == 10 for call in searches)
+    shared_value = searches[1][1][3]["shared"]
+    assert shared_value == 1 and type(shared_value) is int  # a bool is refused
 
 
 async def test_one_user_never_sees_the_notes_of_another(rig: Rig) -> None:
@@ -417,7 +502,7 @@ async def test_a_vector_hit_of_another_user_is_dropped_even_without_the_filter(
     mine = await rig.store.save("alice", "Likes tea", ["tea"])
     found = await rig.store.search("alice", DIET_QUERY, 5)
     assert [m.id for m in found] == [mine.id]
-    assert len(vector_searches(rig)) == 1
+    assert len(vector_searches(rig)) == 2  # own and shared, both unfiltered here
 
 
 async def test_an_orphan_vector_is_dropped_and_the_rest_returned(rig: Rig) -> None:
@@ -503,7 +588,7 @@ async def test_a_query_of_stop_words_still_reaches_the_vector_side(rig: Rig) -> 
         == []
     )
     found = await rig.store.search("u1", "what can I do", 3)
-    assert len(vector_searches(rig)) == 1
+    assert len(vector_searches(rig)) == 2  # own and shared
     assert {m.id for m in found} <= set(ids.values()) and found
 
 
@@ -520,3 +605,199 @@ async def test_search_does_not_load_keyword_hits_again(rig: Rig) -> None:
     found = await rig.store.search("u1", "trip", 3)
     assert found[0].id == ids["trip"]
     assert len(rig.calls("ensure_collection")) == 1
+
+
+# --- shared notes (memory-shared-scope) ----------------------------------------------
+
+
+async def test_the_payload_carries_shared_only_on_a_shared_note_and_follows_a_flip(
+    rig: Rig,
+) -> None:
+    note = await rig.store.save("alice", "Likes tea", ["tea"])
+    assert rig.points()[str(note.id)].payload == {"user_id": "alice"}
+    published = await rig.store.set_shared("alice", note.id, True)
+    assert published is not None and published.shared is True
+    payload = rig.points()[str(note.id)].payload
+    assert payload == {"user_id": "alice", "shared": 1}
+    assert type(payload["shared"]) is int  # a bool is refused by every backend
+    assert rig.markers() == [
+        (COLLECTION, note.id)
+    ]  # cleared by the flip, written again
+    assert len(rig.points()) == 1  # the same point, replaced
+    await rig.store.set_shared("alice", note.id, False)
+    assert rig.points()[str(note.id)].payload == {"user_id": "alice"}
+    assert rig.markers() == [(COLLECTION, note.id)]
+
+
+async def test_a_flip_embeds_the_one_note_once_and_a_miss_embeds_nothing(
+    rig: Rig,
+) -> None:
+    note = await rig.store.save("alice", "Likes tea", ["tea"])
+    embeds = len(rig.provider.calls)
+    assert await rig.store.set_shared("bob", note.id, True) is None
+    assert len(rig.provider.calls) == embeds
+    await rig.store.set_shared("alice", note.id, True)
+    assert len(rig.provider.calls) == embeds + 1
+    assert rig.provider.calls[-1][1] == ["Likes tea [tea]"]
+
+
+async def test_a_shared_vector_only_hit_survives_for_another_user(rig: Rig) -> None:
+    ids = await seed_sample(rig.store, "alice")
+    await rig.store.set_shared("alice", ids["peanuts"], True)
+    base = MemoryStore(SqliteRelationalStore(rig.db), lambda: NOW)
+    assert await base.search("bob", DIET_QUERY) == []  # no keyword hit at all
+    found = await rig.store.search("bob", DIET_QUERY, 5)
+    assert [m.id for m in found] == [ids["peanuts"]]
+    assert found[0].shared is True
+    # the private notes of alice never reach bob, with or without the vector filter
+    assert ids["tea"] not in [m.id for m in found]
+
+
+async def test_a_shared_vector_only_hit_survives_with_a_store_that_ignores_filters(
+    db: Path,
+) -> None:
+    class IgnoresFilter(FakeVectorStore):
+        async def search(self, collection, vector, k, filter=None):
+            return await super().search(collection, vector, k, None)
+
+    rig = Rig(db)
+    rig.vectors = IgnoresFilter()
+    rig.store = IndexedMemoryStore(
+        SqliteRelationalStore(db), rig.vectors, rig.factory, lambda: NOW
+    )
+    private = await rig.store.save(
+        "alice", "Partner is allergic to peanuts", ["allergy"]
+    )
+    shared = await rig.store.save(
+        "alice", "Allergic to peanuts, avoid the meal", ["allergy"]
+    )  # no word of the query: a vector-only hit
+    await rig.store.set_shared("alice", shared.id, True)
+    found = await rig.store.search("bob", DIET_QUERY, 5)
+    assert shared.id in [m.id for m in found]  # kept: `get` accepts a shared note
+    assert private.id not in [m.id for m in found]  # dropped: private to alice
+
+
+async def test_a_note_of_the_user_found_by_both_searches_is_not_listed_twice(
+    rig: Rig,
+) -> None:
+    ids = await seed_sample(rig.store, "alice")
+    await rig.store.set_shared("alice", ids["peanuts"], True)
+    found = await rig.store.search("alice", DIET_QUERY, 5)
+    assert [m.id for m in found].count(ids["peanuts"]) == 1
+
+
+async def test_an_unpublished_note_leaves_the_vector_search_of_another_user(
+    rig: Rig,
+) -> None:
+    ids = await seed_sample(rig.store, "alice")
+    await rig.store.set_shared("alice", ids["peanuts"], True)
+    assert await rig.store.search("bob", DIET_QUERY, 5)
+    await rig.store.set_shared("alice", ids["peanuts"], False)
+    assert await rig.store.search("bob", DIET_QUERY, 5) == []
+
+
+async def test_a_flip_with_the_index_off_flips_the_flag_and_repairs_by_reindex(
+    db: Path,
+) -> None:
+    rig = Rig(db, upsert=VectorStoreError("down"))
+    note = await rig.store.save("alice", "Likes tea", ["tea"])
+    assert rig.store.index_off_reason is not None
+    assert rig.markers() == []
+    flipped = await rig.store.set_shared("alice", note.id, True)  # no exception
+    assert flipped is not None and flipped.shared is True
+    assert rig.sql("SELECT shared FROM memories") == [(1,)]
+    assert rig.markers() == []
+    notice = rig.store.take_notice()
+    assert notice is not None and "vector search is off" in notice
+    assert rig.store.take_notice() is None  # once
+    rig.vectors.fail_on.clear()
+    assert await rig.store.set_shared("alice", note.id, True) is not None  # still off
+    assert rig.points() == {}
+    rig.store.resume()
+    assert await rig.store.reindex("alice") == (1, 1)
+    assert rig.points()[str(note.id)].payload == {"user_id": "alice", "shared": 1}
+
+
+async def test_a_failing_upsert_during_a_flip_still_flips_and_reports_once(
+    rig: Rig,
+) -> None:
+    note = await rig.store.save("alice", "Likes tea", ["tea"])
+    rig.vectors.fail_on["upsert"] = VectorStoreError("down")
+    flipped = await rig.store.set_shared("alice", note.id, True)
+    assert flipped is not None and flipped.shared is True
+    assert rig.markers() == []  # the repair is the plain reindex
+    assert "vector search is off" in (rig.store.take_notice() or "")
+    assert rig.store.take_notice() is None
+
+
+async def test_a_flip_on_a_plain_store_touches_no_vector_store(rig: Rig) -> None:
+    plain = MemoryStore(SqliteRelationalStore(rig.db), lambda: NOW)
+    note = await plain.save("alice", "Likes tea", ["tea"])
+    flipped = await plain.set_shared("alice", note.id, True)
+    assert flipped is not None and flipped.shared is True
+    assert await plain.get("bob", note.id) == flipped
+    assert rig.vectors.calls == [] and rig.provider.calls == []
+    assert rig.factory_calls == 0
+
+
+async def test_reindex_of_another_user_embeds_a_shared_note_once_per_collection(
+    rig: Rig,
+) -> None:
+    plain = MemoryStore(SqliteRelationalStore(rig.db), lambda: NOW)
+    note = await plain.save("alice", "Likes tea", ["tea"])
+    private = await plain.save("alice", "Private fact", ["private"])
+    await plain.set_shared("alice", note.id, True)
+    assert await rig.store.reindex("bob") == (1, 1)  # the shared one, not the private
+    assert set(rig.points()) == {str(note.id)}
+    assert rig.points()[str(note.id)].payload == {"user_id": "alice", "shared": 1}
+    assert rig.markers() == [(COLLECTION, note.id)]
+    assert await rig.store.reindex("carol") == (0, 0)  # the marker is per note id
+    assert str(private.id) not in rig.points()
+    # `--all` of another user rebuilds the readable notes only
+    assert await rig.store.reindex("bob", rebuild=True) == (1, 1)
+
+
+# --- explicit timestamps (memory-yaml-transfer) ------------------------------------------
+
+CREATED = "2026-10-01T08:00:00Z"
+UPDATED = "2026-10-02T08:00:00Z"
+
+
+async def test_save_with_timestamps_stores_them_and_embeds_once(rig: Rig) -> None:
+    memory = await rig.store.save(
+        "u1", "Likes tea", ["tea"], created_at=CREATED, updated_at=UPDATED
+    )
+    assert (memory.created_at, memory.updated_at) == (CREATED, UPDATED)
+    assert await rig.store.get("u1", memory.id) == memory
+    assert len(rig.provider.calls) == 1
+    assert len(rig.calls("upsert")) == 1
+    assert rig.points()[str(memory.id)].payload == {"user_id": "u1"}
+    assert rig.markers() == [(COLLECTION, memory.id)]
+
+
+async def test_a_failing_embedder_keeps_the_row_with_its_timestamps(rig: Rig) -> None:
+    rig.provider.raises = EmbeddingError("unknown", "provider down")
+    memory = await rig.store.save(
+        "u1", "Likes tea", ["tea"], created_at=CREATED, updated_at=UPDATED
+    )
+    stored = await rig.store.get("u1", memory.id)
+    assert stored is not None
+    assert (stored.created_at, stored.updated_at) == (CREATED, UPDATED)
+    assert rig.store.index_off_reason is not None
+    assert rig.store.take_notice() is not None
+    assert rig.store.take_notice() is None
+    embeds = len(rig.provider.calls)
+    await rig.store.save(
+        "u1", "Likes jam", ["jam"], created_at=CREATED, updated_at=UPDATED
+    )
+    assert len(rig.provider.calls) == embeds
+
+
+async def test_the_indexed_store_refuses_a_future_timestamp_before_any_write(
+    rig: Rig,
+) -> None:
+    with pytest.raises(MemoryValidationError):
+        await rig.store.save(
+            "u1", "Likes tea", ["tea"], updated_at="2099-01-01T00:00:00Z"
+        )
+    assert rig.provider.calls == [] and rig.calls("upsert") == []

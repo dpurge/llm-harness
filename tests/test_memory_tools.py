@@ -536,3 +536,137 @@ def test_the_state_tab_says_why_memory_is_off() -> None:
     assert text.endswith(MEMORY_NEEDS_USER_ID)
     assert tools_text(registry.all()) == tools_text(registry.all(), [])
     assert tools_text([], ["why"]) == "(none)\n\nwhy"
+
+
+# --- shared notes: no tool can create or change one ----------------------------------
+
+
+def test_the_write_tool_schemas_have_no_scope_parameter() -> None:
+    from llm_harness.memory_tools import (
+        MemoryForgetInput,
+        MemorySaveInput,
+        MemoryUpdateInput,
+    )
+
+    assert set(MemorySaveInput.model_json_schema()["properties"]) == {
+        "text",
+        "keywords",
+    }
+    assert set(MemoryUpdateInput.model_json_schema()["properties"]) == {
+        "id",
+        "text",
+        "keywords",
+    }
+    assert set(MemoryForgetInput.model_json_schema()["properties"]) == {"id"}
+
+
+def test_no_memory_tool_module_can_reach_set_shared() -> None:
+    import llm_harness.memory_reflection as reflection_module
+    import llm_harness.memory_tools as tools_module
+
+    for module in (tools_module, reflection_module):
+        assert "set_shared" not in open(module.__file__).read()  # noqa: SIM115
+
+
+def test_no_memory_tool_module_can_reach_forget_shared() -> None:
+    import llm_harness.memory_reflection as reflection_module
+    import llm_harness.memory_tools as tools_module
+
+    for module in (tools_module, reflection_module):
+        assert "forget_shared" not in open(module.__file__).read()  # noqa: SIM115
+
+
+def test_only_the_store_and_the_command_modules_mention_forget_shared() -> None:
+    import llm_harness
+
+    root = Path(llm_harness.__file__).parent
+    found = {
+        str(path.relative_to(root))
+        for path in root.rglob("*.py")
+        if "forget_shared" in path.read_text()
+    }
+    assert found == {"memory.py", "memory_index.py", "memory_command.py"}
+
+
+def test_no_memory_tool_module_can_reach_the_add_path() -> None:
+    import llm_harness.memory_reflection as reflection_module
+    import llm_harness.memory_tools as tools_module
+
+    for module in (tools_module, reflection_module):
+        source = open(module.__file__).read()  # noqa: SIM115
+        for name in ("propose_memories", "PendingProposals", "memory_add"):
+            assert name not in source
+
+
+def test_only_the_command_passes_a_shared_argument_to_save() -> None:
+    """The tool and reflection `save` calls give no `shared`; the command alone does."""
+    import re
+
+    import llm_harness
+
+    root = Path(llm_harness.__file__).parent
+    found = {
+        str(path.relative_to(root))
+        for path in root.rglob("*.py")
+        if re.search(r"\.save\([^)]*shared", path.read_text())
+    }
+    # the index store only forwards its parameter; the tools and the reflection are absent
+    assert found == {"memory_command.py", "memory_index.py"}
+
+
+async def test_a_shared_note_is_marked_in_the_search_block_and_kept_by_the_tools(
+    storage: Storage, tools: dict
+) -> None:
+    alice, bob = ctx_for(storage, "alice"), ctx_for(storage, "bob")
+    await invoke(tools, "memory_save", alice, text="Team rule: tea.", keywords=["tea"])
+    await invoke(tools, "memory_save", bob, text="Bob likes tea.", keywords=["tea"])
+    store = MemoryTools(None).store_for(storage)
+    assert await store.set_shared("alice", 1, True) is not None
+    found = (await invoke(tools, "memory_search", bob, query="tea")).splitlines()
+    assert len(found) == 2
+    assert sum("[shared]" in line for line in found) == 1
+    assert next(line for line in found if "Team rule" in line).startswith(
+        "#1 [shared] [tea] ("
+    )
+    # the owner's model cannot change or delete it; another user's cannot either
+    for ctx in (alice, bob):
+        assert (
+            await invoke(tools, "memory_update", ctx, id=1, text="x") == "no memory #1"
+        )
+        assert await invoke(tools, "memory_forget", ctx, id=1) == "no memory #1"
+    assert "Team rule: tea." in await invoke(tools, "memory_search", bob, query="tea")
+
+
+def test_only_the_store_index_command_and_transfer_pass_timestamps_to_save() -> None:
+    """No tool, reflection or other module can choose `created_at` or `updated_at`."""
+    import re
+
+    import llm_harness
+
+    root = Path(llm_harness.__file__).parent
+    found = {
+        str(path.relative_to(root))
+        for path in root.rglob("*.py")
+        if re.search(r"\b(created_at|updated_at)\s*=[^=]", path.read_text())
+    }
+    # memory_command.py and memory_transfer.py join in step 2 and step 1 respectively
+    assert found <= {
+        "memory.py",
+        "memory_index.py",
+        "memory_command.py",
+        "memory_transfer.py",
+    }
+    assert {"memory.py", "memory_index.py"} <= found
+
+
+def test_no_memory_tool_module_can_reach_the_timestamp_path_or_the_transfer() -> None:
+    import re
+
+    import llm_harness.memory_reflection as reflection_module
+    import llm_harness.memory_tools as tools_module
+
+    for module in (tools_module, reflection_module):
+        source = open(module.__file__).read()  # noqa: SIM115
+        # the tools only READ the fields of a `Memory`; no keyword argument is passed
+        assert not re.search(r"\b(created_at|updated_at)\s*=[^=]", source)
+        assert "memory_transfer" not in source

@@ -5,10 +5,12 @@ plain-text `step N: ...` note per step."""
 
 import asyncio
 import contextlib
+from collections.abc import Awaitable, Callable
 
 from nicegui import app, ui
 
 from llm_harness.approval import ApprovalRequest
+from llm_harness.commands import GUI, help_answer, parse_help
 from llm_harness.config import (
     ConfigError,
     HarnessConfig,
@@ -20,7 +22,12 @@ from llm_harness.display import format_switch, format_usage_report, sanitize_tex
 from llm_harness.gui import inspector
 from llm_harness.gui.security import LoopbackOnlyMiddleware
 from llm_harness.markdown_render import pygments_css, render_html, sanitize_html
-from llm_harness.memory_command import handle_memory_text
+from llm_harness.memory_add import PendingProposals, ProposeResult
+from llm_harness.memory_command import (
+    SLOW_ACTIONS,
+    handle_memory_text,
+    parse_memory_command,
+)
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.providers.base import ChatProvider
 from llm_harness.redact import redact
@@ -141,6 +148,8 @@ class ChatPage:
         self._router: ChatProvider | None = None
         self._orchestrator: Orchestrator | None = None
         self._turn: asyncio.Task[None] | None = None
+        # The `/memory add` preview that waits for `confirm`; this chat only.
+        self._pending = PendingProposals()
         self._is_closed = False
 
     async def build(self) -> None:
@@ -183,7 +192,9 @@ class ChatPage:
         self._log = ui.scroll_area().classes("w-full grow border").mark("log")
         with ui.row().classes("w-full items-center gap-2"):
             self._prompt = (
-                ui.input(placeholder="Message, Enter to send, /quit to exit")
+                ui.input(
+                    placeholder="Message, Enter to send, /help for commands, /quit to exit"
+                )
                 .classes("grow")
                 .style("min-width: 12rem")
                 .mark("prompt")
@@ -231,6 +242,7 @@ class ChatPage:
         self._router = router
         self._model = model
         self._is_manual = is_manual
+        self._pending.clear()  # a new chat or another model starts without a preview
         self._orchestrator = Orchestrator(
             router,
             model,
@@ -376,9 +388,16 @@ class ChatPage:
         if text.strip().lower() == _QUIT_COMMAND:
             await self._quit()
             return
-        memory_answer = await handle_memory_text(
-            text.strip(), self._tools, self._storage, self._config.user_id
-        )
+        help_request = parse_help(text)
+        if help_request is not None:
+            self._show(help_answer(GUI, help_request), "help", "w-full")
+            self._prompt.value = ""
+            return
+        memory_command = parse_memory_command(text.strip())
+        if memory_command is not None and memory_command.action in SLOW_ACTIONS:
+            self._start_memory_add(text.strip())
+            return
+        memory_answer = await self._memory_answer(text.strip())
         if memory_answer is not None:
             self._show(memory_answer, "memory", "w-full")
             self._prompt.value = ""
@@ -396,6 +415,57 @@ class ChatPage:
         self._set_busy(True)
         self._show(f"you: {sanitize_text(text)}", "user", "text-bold")
         self._turn = asyncio.create_task(self._run_turn(self._orchestrator, text))
+
+    async def _memory_answer(
+        self, text: str, orchestrator: Orchestrator | None = None
+    ) -> str | None:
+        return await handle_memory_text(
+            text,
+            self._tools,
+            self._storage,
+            self._config.user_id,
+            memory_admins=self._config.tools.memory_admins,
+            propose=(None if orchestrator is None else self._proposer(orchestrator)),
+            pending=self._pending,
+            no_model="no working model: pick another and press New chat",
+        )
+
+    def _proposer(
+        self, orchestrator: Orchestrator
+    ) -> Callable[[str, bool], Awaitable[ProposeResult]]:
+        async def propose(paste: str, shared: bool) -> ProposeResult:
+            self._show("[memory: proposing...]", "note", _DIM)
+            return await orchestrator.propose_memories(paste, shared)
+
+        return propose
+
+    def _start_memory_add(self, text: str) -> None:
+        """`/memory add` calls the model: it runs in the turn slot so Stop cancels it."""
+        if self._turn_is_running():
+            return
+        self._prompt.value = ""
+        self._set_busy(True)
+        self._turn = asyncio.create_task(self._run_memory_add(text, self._orchestrator))
+
+    async def _run_memory_add(
+        self, text: str, orchestrator: Orchestrator | None
+    ) -> None:
+        restore_text: str | None = None
+        try:
+            answer = await self._memory_answer(text, orchestrator)
+            if answer is not None:
+                self._show(answer, "memory", "w-full")
+        except asyncio.CancelledError:
+            if not self._is_closed:
+                self._show("cancelled", "note", _DIM)
+            restore_text = text
+            raise
+        except Exception as exc:  # noqa: BLE001 - shown as one safe line, never a traceback
+            if not self._is_closed:
+                self._show(_unexpected_error_line(exc), "error", "text-negative")
+            restore_text = text
+        finally:
+            self._end_turn(restore_text)
 
     async def _quit(self) -> None:
         await self._cancel_turn()

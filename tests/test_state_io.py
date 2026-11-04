@@ -218,3 +218,13 @@ def test_a_hostile_key_name_is_one_sanitised_line_with_a_secret_masked() -> None
     message = rejection(to_bytes(data))
     assert "\x1b" not in message and bidi not in message
     assert len(message) <= 260
+
+
+@pytest.mark.parametrize(
+    "data",
+    [b"version: " + b"9" * 5000, b"when: 2026-13-45"],
+)
+def test_a_constructor_value_error_is_a_one_line_refusal(data: bytes) -> None:
+    # a 5000-digit int and an impossible date raise a plain ValueError in pyyaml
+    with pytest.raises(StateImportError, match="not valid YAML"):
+        import_yaml(data)

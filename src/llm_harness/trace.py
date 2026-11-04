@@ -19,7 +19,14 @@ from llm_harness.redact import redact
 from llm_harness.types import _Frozen
 
 SpanKind = Literal[
-    "turn", "step", "llm_call", "tool_call", "subagent", "recall", "reflection"
+    "turn",
+    "step",
+    "llm_call",
+    "tool_call",
+    "subagent",
+    "recall",
+    "reflection",
+    "memory_add",
 ]
 SpanStatus = Literal["ok", "error", "rejected", "cancelled"]
 

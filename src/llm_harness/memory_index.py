@@ -79,6 +79,9 @@ def fuse_ranks(
 
 
 _COLLECTION_PREFIX = "memories_"
+# The vector filter is AND-equality only and refuses a bool on every backend, so the
+# flag is the int 1.
+_SHARED_FILTER = {"shared": 1}
 
 
 def collection_name(model_id: str) -> str:
@@ -91,6 +94,11 @@ def collection_name(model_id: str) -> str:
 
 def _embedded_text(memory: Memory) -> str:
     return f"{memory.text} [{', '.join(memory.keywords)}]"
+
+
+def _payload(memory: Memory) -> dict[str, object]:
+    """The vector point payload: the creator, plus `shared` = 1 on a shared note only."""
+    return {"user_id": memory.user_id, **(_SHARED_FILTER if memory.shared else {})}
 
 
 def _describe(error: Exception) -> str:
@@ -158,8 +166,24 @@ class IndexedMemoryStore(MemoryStore):
         self._notice_pending = False
         return f"memory vector search is off: {self._off_reason}; keyword search only"
 
-    async def save(self, user_id: str, text: str, keywords: Sequence[str]) -> Memory:
-        memory = await super().save(user_id, text, keywords)
+    async def save(
+        self,
+        user_id: str,
+        text: str,
+        keywords: Sequence[str],
+        shared: bool = False,
+        *,
+        created_at: str | None = None,
+        updated_at: str | None = None,
+    ) -> Memory:
+        memory = await super().save(
+            user_id,
+            text,
+            keywords,
+            shared,
+            created_at=created_at,
+            updated_at=updated_at,
+        )
         await self._index(memory)
         return memory
 
@@ -180,6 +204,23 @@ class IndexedMemoryStore(MemoryStore):
         if deleted:
             await self._guarded(partial(self._remove, id))
         return deleted
+
+    async def forget_shared(self, id: int) -> Memory | None:
+        memory = await super().forget_shared(id)
+        if memory is not None:
+            await self._guarded(partial(self._remove, id))
+        return memory
+
+    async def set_shared(self, user_id: str, id: int, shared: bool) -> Memory | None:
+        """Flip the flag, then embed that one note again so its payload follows at once.
+
+        The markers are already gone (`MemoryStore.set_shared`), so when the index is off
+        or the upsert fails, the plain `/memory reindex` repairs the point.
+        """
+        memory = await super().set_shared(user_id, id, shared)
+        if memory is not None:
+            await self._index(memory)
+        return memory
 
     async def search(self, user_id: str, query: str, k: int = 5) -> list[Memory]:
         """Keyword hits and vector hits fused by rank; keyword only when the index is off."""
@@ -208,7 +249,7 @@ class IndexedMemoryStore(MemoryStore):
             if memory_id not in found:
                 memory = await self.get(
                     user_id, memory_id
-                )  # drops orphans, other users
+                )  # drops orphans, private notes of others
                 if memory is not None:
                     found[memory_id] = memory
         fused = fuse_ranks([m.id for m in keyword], vector_ids, limit)
@@ -223,32 +264,43 @@ class IndexedMemoryStore(MemoryStore):
         )  # failures switch the index off
 
     async def reindex(
-        self, user_id: str, limit: int | None = None
+        self, user_id: str, limit: int | None = None, *, rebuild: bool = False
     ) -> tuple[int, int] | None:
-        """Index the user's memories that have no marker in the current collection.
+        """Index the memories the user can read (own and shared) that have no marker.
+
+        With `rebuild`, every readable memory is indexed whatever the markers say:
+        for a vector store that is new or empty while the markers are stale. The upsert
+        is idempotent and a marker is never removed, so a half-done run can be repeated.
 
         Returns `(indexed_now, unindexed_before)`, or None when the index is off (also
         when a failure inside has just switched it off; markers already written stay).
+        With `rebuild` the second number is all the readable memories.
         """
         user_id = _check_user_id(user_id)
-        return await self._guarded(partial(self._reindex, user_id, limit))
+        return await self._guarded(partial(self._reindex, user_id, limit, rebuild))
 
-    async def _reindex(self, user_id: str, limit: int | None) -> tuple[int, int]:
+    async def _reindex(
+        self, user_id: str, limit: int | None, rebuild: bool = False
+    ) -> tuple[int, int]:
         await self._ensure_migrated()
         collection = collection_name(self._get_embedder().model_id)
-        unindexed = (
-            "FROM memories WHERE user_id = ? AND NOT EXISTS ("
-            "SELECT 1 FROM memory_vectors v "
-            "WHERE v.collection = ? AND v.memory_id = memories.id)"
-        )
-        params = (user_id, collection)
-        rows = await self._relational.query(f"SELECT COUNT(*) {unindexed}", params)
+        if rebuild:
+            selected = "FROM memories WHERE (user_id = ? OR shared = 1)"
+            params: tuple = (user_id,)
+        else:
+            selected = (
+                "FROM memories WHERE (user_id = ? OR shared = 1) AND NOT EXISTS ("
+                "SELECT 1 FROM memory_vectors v "
+                "WHERE v.collection = ? AND v.memory_id = memories.id)"
+            )
+            params = (user_id, collection)
+        rows = await self._relational.query(f"SELECT COUNT(*) {selected}", params)
         total = rows[0][0]
         if total == 0:
             return (0, 0)
         take = total if limit is None else max(0, limit)
         rows = await self._relational.query(
-            f"SELECT {_COLUMNS} {unindexed} ORDER BY id LIMIT ?", (*params, take)
+            f"SELECT {_COLUMNS} {selected} ORDER BY id LIMIT ?", (*params, take)
         )
         memories = [_row_to_memory(row) for row in rows]
         for start in range(0, len(memories), REINDEX_BATCH_SIZE):
@@ -262,7 +314,7 @@ class IndexedMemoryStore(MemoryStore):
         await self._vectors.upsert(
             collection,
             [
-                VectorPoint(str(memory.id), vector, {"user_id": memory.user_id})
+                VectorPoint(str(memory.id), vector, _payload(memory))
                 for memory, vector in zip(batch, vectors, strict=True)
             ],
         )
@@ -275,10 +327,17 @@ class IndexedMemoryStore(MemoryStore):
 
     async def _vector_ids(self, user_id: str, query: str) -> list[int]:
         collection, vector = await self._embed_and_ensure(query[:MAX_QUERY_EMBED_CHARS])
-        hits = await self._vectors.search(
+        own = await self._vectors.search(
             collection, vector, VECTOR_SEARCH_LIMIT, filter={"user_id": user_id}
         )
-        return [int(hit.id) for hit in hits]
+        shared = await self._vectors.search(
+            collection, vector, VECTOR_SEARCH_LIMIT, filter=_SHARED_FILTER
+        )
+        return fuse_ranks(
+            [int(hit.id) for hit in own],
+            [int(hit.id) for hit in shared],
+            VECTOR_SEARCH_LIMIT,
+        )
 
     async def _index(self, memory: Memory) -> None:
         await self._guarded(partial(self._add, memory))
@@ -311,7 +370,7 @@ class IndexedMemoryStore(MemoryStore):
         collection, vector = await self._embed_and_ensure(_embedded_text(memory))
         await self._vectors.upsert(
             collection,
-            [VectorPoint(str(memory.id), vector, {"user_id": memory.user_id})],
+            [VectorPoint(str(memory.id), vector, _payload(memory))],
         )
         await self._relational.execute(
             "INSERT INTO memory_vectors (collection, memory_id) VALUES (?, ?) "

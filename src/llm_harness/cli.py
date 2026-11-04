@@ -13,6 +13,7 @@ from typing import Protocol, TextIO
 from llm_harness import store as store_module
 from llm_harness.approval import ApprovalRequest, Approver
 from llm_harness.builtin_tools import build_tool_registry
+from llm_harness.commands import PLAIN, help_answer, parse_help
 from llm_harness.config import (
     AGENTS_FILE,
     CONFIG_FILE,
@@ -35,6 +36,7 @@ from llm_harness.config import (
 )
 from llm_harness.display import format_switch, format_usage_report, sanitize_text
 from llm_harness.embeddings import build_embedder_factory
+from llm_harness.memory_add import PendingProposals, ProposeResult
 from llm_harness.memory_command import handle_memory_text
 from llm_harness.orchestrator import Orchestrator
 from llm_harness.providers import ProviderFactory, build_provider
@@ -230,6 +232,19 @@ def _ask_on_stderr(stdin: TextIO, stderr: TextIO) -> Approver:
     return approve
 
 
+def _propose_with_notice(
+    orchestrator: Orchestrator, stderr: TextIO
+) -> Callable[[str, bool], Awaitable[ProposeResult]]:
+    """`Orchestrator.propose_memories`, announced on stderr just before the model call."""
+
+    async def propose(paste: str, shared: bool) -> ProposeResult:
+        stderr.write("[memory: proposing...]\n")
+        stderr.flush()
+        return await orchestrator.propose_memories(paste, shared)
+
+    return propose
+
+
 async def _chat_loop(
     router: ChatProvider,
     stdin: TextIO,
@@ -251,6 +266,11 @@ async def _chat_loop(
             if text.lower() in _EXIT_COMMANDS:
                 return 0
             if not text:
+                continue
+            help_request = parse_help(text)
+            if help_request is not None:
+                stdout.write(f"{help_answer(PLAIN, help_request)}\n")
+                stdout.flush()
                 continue
             if memory_command is not None:
                 answer = await memory_command(text)
@@ -611,6 +631,9 @@ def main(
                     tools=tools,
                     storage=storage,
                     user_id=config.user_id,
+                    memory_admins=config.tools.memory_admins,
+                    propose=_propose_with_notice(orchestrator, stderr),
+                    pending=PendingProposals(),
                 ),
             )
         )

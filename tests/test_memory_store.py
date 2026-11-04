@@ -23,6 +23,8 @@ from llm_harness.memory import (
     MemoryStore,
     MemoryValidationError,
     _match_expression,
+    check_timestamp,
+    validate_note,
 )
 from llm_harness.redact import Secret
 from llm_harness.storage.postgres import PostgresRelationalStore
@@ -522,6 +524,34 @@ async def test_fts_follows_a_forget(store: MemoryStore, db: Path):
     assert await store.get("alice", saved.id) is None
 
 
+async def test_a_v2_database_with_rows_is_upgraded_to_3_and_its_rows_stay_private(
+    db: Path, clock: FakeClock
+):
+    relational = SqliteRelationalStore(db)
+    await relational.migrate("memory", MEMORY_MIGRATIONS[:2])  # the old two steps
+    await relational.execute(
+        "INSERT INTO memories (user_id, text, keywords, created_at, updated_at) "
+        "VALUES ('alice', 'Likes green tea', 'tea', 'then', 'then')"
+    )
+    store = MemoryStore(SqliteRelationalStore(db), clock)
+    assert [(m.text, m.shared) for m in await store.list("alice")] == [
+        ("Likes green tea", False)
+    ]
+    assert [m.id for m in await store.search("alice", "tea")] == [1]
+    assert await store.search("bob", "tea") == []  # an old row is private
+    assert await store.get("bob", 1) is None
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("SELECT * FROM schema_versions").fetchall() == [
+            ("memory", 3)
+        ]
+        assert conn.execute("SELECT shared FROM memories").fetchall() == [(0,)]
+    await MemoryStore(SqliteRelationalStore(db), clock).get("alice", 1)  # idempotent
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("SELECT * FROM schema_versions").fetchall() == [
+            ("memory", 3)
+        ]
+
+
 async def test_a_fresh_database_migrates_once_and_a_second_store_reuses_it(
     db: Path, clock: FakeClock
 ):
@@ -621,3 +651,371 @@ async def test_a_store_with_600_entries_still_works(store: MemoryStore, db: Path
     extra = await store.save("alice", "one more", ["more"])
     assert extra.id == 601
     assert len(await store.search("alice", "bulk", k=99)) == 10
+
+
+# --- shared notes (memory-shared-scope) ----------------------------------------------
+
+
+async def markers(relational: RelationalStore) -> list[tuple]:
+    return await relational.query("SELECT collection, memory_id FROM memory_vectors")
+
+
+async def test_a_new_note_is_private(store: MemoryStore):
+    assert (await store.save("alice", "a fact", ["x"])).shared is False
+
+
+async def test_save_with_shared_makes_a_note_every_user_reads(store: MemoryStore):
+    note = await store.save("alice", "Team rule: tea is free", ["tea"], shared=True)
+    assert note.shared is True and note.user_id == "alice"
+    assert await store.get("bob", note.id) == note
+    assert await store.list("bob") == [note]
+    assert [m.id for m in await store.search("bob", "tea")] == [note.id]
+    # the creator still cannot change it through the tools' paths
+    assert await store.update("alice", note.id, text="changed") is None
+    plain = await store.save("alice", "Alice private", ["x"], shared=False)
+    assert plain.shared is False and await store.get("bob", plain.id) is None
+
+
+async def test_has_text_sees_own_and_shared_notes_but_not_private_ones_of_others(
+    store: MemoryStore,
+):
+    await store.save("alice", "Alice private fact", ["x"])
+    await store.save("bob", "Bob private fact", ["x"])
+    await store.save("bob", "Team rule", ["x"], shared=True)
+    assert await store.has_text("alice", "Alice private fact") is True
+    assert await store.has_text("alice", "Team rule") is True  # shared, by bob
+    assert await store.has_text("alice", "Bob private fact") is False
+    assert await store.has_text("alice", "team rule") is False  # exact text only
+    assert await store.has_text("alice", "Alice private") is False
+    with pytest.raises(MemoryValidationError):
+        await store.has_text("", "x")
+
+
+def test_validate_note_returns_the_trimmed_text_and_distinct_keywords():
+    assert validate_note("  A fact.  ", ["a", "b", "a"]) == ("A fact.", ("a", "b"))
+
+
+@pytest.mark.parametrize(
+    ("text", "keywords"),
+    [
+        ("", ["a"]),
+        ("two\nlines", ["a"]),
+        ("x" * 1501, ["a"]),
+        ("key sk-abcdefgh12345678", ["a"]),
+        ("fine", []),
+        ("fine", ["Bad"]),
+        ("fine", "a,b"),
+        (5, ["a"]),
+    ],
+)
+def test_validate_note_refuses_what_save_refuses(text: object, keywords: object):
+    with pytest.raises(MemoryValidationError):
+        validate_note(text, keywords)
+
+
+async def test_a_shared_note_is_readable_by_another_user_in_every_read(
+    store: MemoryStore, clock: FakeClock
+):
+    mine = await store.save("bob", "Bob drinks tea", ["tea"])
+    clock.advance(seconds=10)
+    note = await store.save("alice", "Team rule: tea is free", ["tea", "rule"])
+    clock.advance(seconds=10)
+    private = await store.save("alice", "Alice private tea habit", ["tea"])
+    published = await store.set_shared("alice", note.id, True)
+    assert published is not None and published.shared is True
+
+    assert await store.get("bob", note.id) == published
+    assert await store.get("bob", private.id) is None
+    assert {m.id for m in await store.search("bob", "tea")} == {mine.id, note.id}
+    # newest-updated first; `updated_at` was not changed by the flip
+    assert await store.list("bob") == [published, mine]
+    assert published.updated_at == note.updated_at
+    assert [(m.id, m.shared) for m in await store.list("alice")] == [
+        (private.id, False),
+        (note.id, True),
+    ]
+
+
+async def test_update_and_forget_refuse_a_shared_note_for_everyone(store: MemoryStore):
+    note = await store.save("alice", "Team rule", ["rule"])
+    published = await store.set_shared("alice", note.id, True)
+    assert published is not None
+    for user in ("alice", "bob"):  # the owner too: a model runs as the owner
+        assert await store.update(user, note.id, text="changed") is None
+        assert await store.update(user, note.id, keywords=["other"]) is None
+        assert await store.forget(user, note.id) is False
+    assert await store.get("bob", note.id) == published  # row unchanged
+
+
+async def test_update_and_forget_of_a_private_note_of_another_user_still_fail(
+    store: MemoryStore,
+):
+    theirs = await store.save("bob", "Bob private", ["x"])
+    assert await store.update("alice", theirs.id, text="hijacked") is None
+    assert await store.forget("alice", theirs.id) is False
+    assert await store.get("bob", theirs.id) == theirs
+
+
+async def test_an_unpublished_note_can_be_changed_and_forgotten_again(
+    store: MemoryStore,
+):
+    note = await store.save("alice", "Team rule", ["rule"])
+    await store.set_shared("alice", note.id, True)
+    back = await store.set_shared("alice", note.id, False)
+    assert back is not None and back.shared is False
+    assert await store.get("bob", note.id) is None
+    changed = await store.update("alice", note.id, text="Team rule v2")
+    assert changed is not None and changed.text == "Team rule v2"
+    assert await store.forget("alice", note.id) is True
+
+
+async def test_set_shared_is_owner_only_and_changes_nothing_otherwise(
+    store: MemoryStore,
+):
+    note = await store.save("alice", "Team rule", ["rule"])
+    assert await store.set_shared("bob", note.id, True) is None
+    assert await store.set_shared("alice", 999, True) is None
+    assert await store.get("alice", note.id) == note
+    assert await store.get("bob", note.id) is None
+    # a second user cannot unpublish someone else's shared note either
+    await store.set_shared("alice", note.id, True)
+    assert await store.set_shared("bob", note.id, False) is None
+    shared = await store.get("bob", note.id)
+    assert shared is not None and shared.shared is True
+
+
+async def test_a_flip_keeps_updated_at_and_deletes_the_markers_of_that_note_only(
+    store: MemoryStore, relational: RelationalStore, clock: FakeClock
+):
+    note = await store.save("alice", "Team rule", ["rule"])
+    other = await store.save("alice", "Other note", ["other"])
+    await store.get("alice", note.id)  # migrates, so the marker table exists
+    for collection in ("c1", "c2"):
+        for memory_id in (note.id, other.id):
+            await relational.execute(
+                "INSERT INTO memory_vectors (collection, memory_id) VALUES (?, ?)",
+                (collection, memory_id),
+            )
+    clock.advance(days=1)
+    flipped = await store.set_shared("alice", note.id, True)
+    assert flipped is not None and flipped.updated_at == note.updated_at
+    assert sorted(await markers(relational)) == [("c1", other.id), ("c2", other.id)]
+    # a miss deletes nothing
+    assert await store.set_shared("bob", other.id, True) is None
+    assert len(await markers(relational)) == 2
+    # the way back clears them again
+    await relational.execute(
+        "INSERT INTO memory_vectors (collection, memory_id) VALUES (?, ?)",
+        ("c1", note.id),
+    )
+    await store.set_shared("alice", note.id, False)
+    assert sorted(await markers(relational)) == [("c1", other.id), ("c2", other.id)]
+
+
+# --- an admin forgets a shared note (memory-shared-admin) ------------------------------
+
+
+async def test_forget_shared_deletes_a_note_of_another_user_and_returns_it(
+    store: MemoryStore,
+):
+    note = await store.save("alice", "Team rule", ["rule"])
+    published = await store.set_shared("alice", note.id, True)
+    assert await store.forget_shared(note.id) == published
+    assert await store.get("alice", note.id) is None
+    assert await store.get("bob", note.id) is None
+    assert await store.search("bob", "rule") == []
+
+
+async def test_forget_shared_cannot_touch_a_private_note(store: MemoryStore):
+    private = await store.save("alice", "Alice private", ["x"])
+    assert await store.forget_shared(private.id) is None
+    assert await store.forget_shared(999) is None
+    assert await store.get("alice", private.id) == private
+
+
+async def test_forget_shared_clears_the_markers_of_that_note_only(
+    store: MemoryStore, relational: RelationalStore
+):
+    note = await store.save("alice", "Team rule", ["rule"])
+    other = await store.save("alice", "Tea note", ["tea"])
+    await store.set_shared("alice", note.id, True)
+    for memory_id in (note.id, other.id):
+        await relational.execute(
+            "INSERT INTO memory_vectors (collection, memory_id) VALUES (?, ?)",
+            ("c1", memory_id),
+        )
+    assert await store.forget_shared(note.id) is not None
+    assert await markers(relational) == [("c1", other.id)]
+    assert await store.search("alice", "rule") == []
+    assert [m.id for m in await store.search("alice", "tea")] == [other.id]
+
+
+async def test_forget_shared_does_not_weaken_the_owner_guards(store: MemoryStore):
+    note = await store.save("alice", "Team rule", ["rule"])
+    await store.set_shared("alice", note.id, True)
+    assert await store.forget("alice", note.id) is False
+    assert await store.forget("bob", note.id) is False
+    assert await store.get("bob", note.id) is not None
+
+
+# --- a caller-chosen timestamp pair (memory-yaml-transfer) -------------------------------
+
+PAST = "2026-10-01T08:00:00Z"
+EARLIER = "2026-09-01T08:00:00Z"
+
+
+async def test_explicit_timestamps_are_stored_exactly(store: MemoryStore):
+    saved = await store.save(
+        "alice", "Likes tea", ["tea"], created_at=EARLIER, updated_at=PAST
+    )
+    assert (saved.created_at, saved.updated_at) == (EARLIER, PAST)
+    assert await store.get("alice", saved.id) == saved
+
+
+async def test_without_timestamps_the_clock_decides_both(store: MemoryStore):
+    saved = await store.save("alice", "Likes tea", ["tea"])
+    assert saved.created_at == saved.updated_at == START_TEXT
+
+
+async def test_both_timestamps_missing_take_the_clock(store: MemoryStore):
+    saved = await store.save(
+        "alice", "Likes tea", ["tea"], created_at=None, updated_at=None
+    )
+    assert (saved.created_at, saved.updated_at) == (START_TEXT, START_TEXT)
+
+
+async def test_only_updated_missing_copies_created(store: MemoryStore):
+    # a missing member never makes the pair invalid: it copies the other one
+    saved = await store.save("alice", "Likes tea", ["tea"], created_at=PAST)
+    assert (saved.created_at, saved.updated_at) == (PAST, PAST)
+
+
+async def test_only_created_missing_copies_updated(store: MemoryStore):
+    saved = await store.save("alice", "Likes tea", ["tea"], updated_at=PAST)
+    assert (saved.created_at, saved.updated_at) == (PAST, PAST)
+
+
+async def test_the_one_given_timestamp_is_still_validated(store: MemoryStore):
+    with pytest.raises(MemoryValidationError, match="later than the current"):
+        await store.save(
+            "alice", "Likes tea", ["tea"], updated_at="2999-01-01T00:00:00Z"
+        )
+
+
+async def test_updated_earlier_than_created_is_refused(store: MemoryStore):
+    with pytest.raises(MemoryValidationError, match="earlier than the created"):
+        await store.save(
+            "alice", "Likes tea", ["tea"], created_at=PAST, updated_at=EARLIER
+        )
+    assert await store.list("alice") == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026-10-01t08:00:00Z",
+        "2026-10-01T08:00:00+00:00",
+        "2026-10-01",
+        "2026-10-01T08:00:00.5Z",
+        "2026-10-01T08:00:00Z ",
+        "2026-10-01T08:00:00Z\n",
+        "2026-02-30T08:00:00Z",
+        "2026-10-01T25:00:00Z",
+        "\u0662026-10-01T08:00:00Z",
+        "",
+        20261001,
+        b"2026-10-01T08:00:00Z",
+    ],
+)
+async def test_a_malformed_timestamp_is_refused_without_echo(
+    store: MemoryStore, value: object
+):
+    for name in ("created_at", "updated_at"):
+        with pytest.raises(MemoryValidationError) as raised:
+            await store.save("alice", "Likes tea", ["tea"], **{name: value})  # type: ignore[arg-type]
+        assert str(value) not in str(raised.value) or str(value) == ""
+    assert await store.list("alice") == []
+
+
+async def test_a_future_timestamp_is_refused_and_now_is_accepted(store: MemoryStore):
+    for name in ("created_at", "updated_at"):
+        with pytest.raises(MemoryValidationError, match="later than the current"):
+            await store.save(
+                "alice", "Likes tea", ["tea"], **{name: "2026-11-02T09:30:16Z"}
+            )
+    saved = await store.save(
+        "alice", "Likes tea", ["tea"], created_at=START_TEXT, updated_at=START_TEXT
+    )
+    assert saved.updated_at == START_TEXT
+
+
+async def test_the_future_check_uses_the_clock_at_save_time(
+    store: MemoryStore, clock: FakeClock
+):
+    later = "2026-11-02T10:30:15Z"
+    with pytest.raises(MemoryValidationError):
+        await store.save("alice", "Likes tea", ["tea"], created_at=later)
+    clock.advance(hours=1)
+    saved = await store.save("alice", "Likes tea", ["tea"], created_at=later)
+    assert saved.created_at == later
+
+
+async def test_list_follows_the_preserved_updated_at(store: MemoryStore):
+    old = await store.save(
+        "alice", "Old note", ["old"], created_at=EARLIER, updated_at=EARLIER
+    )
+    new = await store.save("alice", "New note", ["new"])
+    older = await store.save(
+        "alice", "Oldest note", ["old"], created_at=EARLIER, updated_at=EARLIER
+    )
+    # a far-future value cannot pin a note to the top: it is refused
+    with pytest.raises(MemoryValidationError):
+        await store.save("alice", "Pinned", ["pin"], updated_at="2099-01-01T00:00:00Z")
+    assert [m.id for m in await store.list("alice")] == [new.id, older.id, old.id]
+
+
+def test_check_timestamp_returns_a_good_value_and_never_echoes_a_bad_one():
+    assert check_timestamp(PAST, START_TEXT) == PAST
+    secret = "sk-abcdefgh12345678"
+    with pytest.raises(MemoryValidationError) as raised:
+        check_timestamp(secret, START_TEXT)
+    assert secret not in str(raised.value)
+
+
+def test_current_timestamp_is_the_injected_clock_in_the_store_format(
+    relational: RelationalStore, clock: FakeClock
+):
+    assert MemoryStore(relational, clock).current_timestamp() == START_TEXT
+    clock.advance(days=1)
+    assert MemoryStore(relational, clock).current_timestamp() == "2026-11-03T09:30:15Z"
+
+
+async def test_explicit_timestamps_keep_fts_and_vector_markers_consistent(
+    store: MemoryStore, db: Path, relational: RelationalStore
+):
+    saved = await store.save(
+        "alice", "Likes oolong", ["tea"], created_at=EARLIER, updated_at=PAST
+    )
+    assert [m.id for m in await store.search("alice", "oolong")] == [saved.id]
+    assert fts_hits(db, "oolong") == [(saved.id,)]
+    assert await markers(relational) == []  # no INSERT trigger on the marker table
+    await relational.execute(
+        "INSERT INTO memory_vectors (collection, memory_id) VALUES (?, ?)",
+        ("c1", saved.id),
+    )
+    await store.update("alice", saved.id, text="Likes green tea")
+    assert await markers(relational) == []  # an UPDATE of text still clears it
+    assert fts_hits(db, "oolong") == []
+
+
+async def test_a_shared_note_with_explicit_timestamps_stores_shared(
+    store: MemoryStore, db: Path
+):
+    saved = await store.save(
+        "alice", "Team rule", ["rule"], True, created_at=EARLIER, updated_at=PAST
+    )
+    assert saved.shared is True
+    assert (saved.created_at, saved.updated_at) == (EARLIER, PAST)
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("SELECT shared FROM memories").fetchall() == [(1,)]
+    assert [m.id for m in await store.list("bob")] == [saved.id]

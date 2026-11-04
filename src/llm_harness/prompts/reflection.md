@@ -22,6 +22,7 @@ does not apply to you.
 - Read `## Existing memories` first. If a note already says it, answer `none`.
 - If a note is outdated or the user contradicted it, `update` it (same `id`) or
   `forget` it. Prefer `update` to a near-duplicate `save`.
+- A note marked `[shared]` cannot be changed or forgotten; leave it alone.
 - Choose exactly one action per turn.
 
 ## How to write a note

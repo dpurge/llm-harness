@@ -1,5 +1,6 @@
 """Terminal UI tests: Textual's Pilot drives the app with a scripted provider."""
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,8 +12,21 @@ from textual.pilot import Pilot
 from textual.widgets import Input, Markdown, Select, Static
 from textual.widgets.markdown import MarkdownBlock, MarkdownFence
 
-from llm_harness.config import AgentConfig, ConfigError, HarnessConfig, ProviderConfig
+from llm_harness.builtin_tools import build_tool_registry
+from llm_harness.commands import help_overview
+from llm_harness.config import (
+    AgentConfig,
+    ConfigError,
+    HarnessConfig,
+    ProviderConfig,
+    StorageConfig,
+    ToolsConfig,
+    VectorConfig,
+)
+from llm_harness.memory import MemoryStore
+from llm_harness.memory_command import USAGE
 from llm_harness.redact import REDACTED
+from llm_harness.storage import open_storage
 from llm_harness.store import Store
 from llm_harness.subagents import make_subagent_factory_maker
 from llm_harness.tui.app import ChatApp
@@ -27,6 +41,7 @@ from llm_harness.types import (
 )
 from tests.fake_steps import ScriptedSteps, as_step_reply, reply_events
 from tests.fakes import ScriptedProvider, router_factory_for
+from tests.test_gui import AddFactory
 
 CONFIG = HarnessConfig.model_validate(
     {
@@ -1178,3 +1193,377 @@ async def test_the_orchestrator_gets_the_storage_and_exit_closes_it_once() -> No
         assert app._orchestrator._storage is storage
         assert storage.close_calls == 0
     assert storage.close_calls == 1
+
+
+# /help
+
+
+async def test_help_shows_the_overview_as_a_note_without_a_model_call() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "/help")
+        assert texts(app, "note") == [help_overview("tui")]
+        assert texts(app, "user") == []
+        assert prompt_of(app).value == ""
+        assert not any(p.requests for p in factory.providers)
+
+
+async def test_help_memory_shows_the_memory_usage_in_the_tui() -> None:
+    app = make_app(Factory(REPLY))
+    async with app.run_test() as pilot:
+        await send(pilot, app, "/Help memory")
+        assert texts(app, "note") == [USAGE]
+
+
+async def memory_front_end(
+    tmp_path: Path, user_id: str, admins: list[str]
+) -> tuple[HarnessConfig, Any, Any]:
+    """A config naming `user_id` and `admins`, a memory registry and a storage holding note #1."""
+    storage = open_storage(
+        StorageConfig(vector=VectorConfig(backend="none")),
+        tmp_path,
+        relational_path=tmp_path / "memory.db",
+    )
+    await MemoryStore(storage.relational).save("alice", "likes tea", ["drink"])
+    config = CONFIG.model_copy(
+        update={"user_id": user_id, "tools": ToolsConfig(memory_admins=admins)}
+    )
+    return config, build_tool_registry([], memory=True, user_id=user_id), storage
+
+
+NOT_ADMIN = "only memory admins may publish or unpublish shared memories"
+
+
+@pytest.mark.parametrize(
+    ("user_id", "admins", "expected"),
+    [
+        ("alice", ["alice"], "published memory #1"),
+        ("alice", ["bob"], NOT_ADMIN),
+        ("alice", [], NOT_ADMIN),
+    ],
+)
+async def test_memory_publish_in_the_tui_needs_an_admin(
+    tmp_path: Path, user_id: str, admins: list[str], expected: str
+) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, user_id, admins)
+    try:
+        factory = Factory(REPLY)
+        app = ChatApp(
+            config,
+            MODEL_1,
+            router_factory_for(config, factory, None),
+            False,
+            storage,
+            tools,
+        )
+        async with app.run_test() as pilot:
+            await send(pilot, app, "/memory publish 1")
+            assert texts(app, "note") == [expected]
+            await send(pilot, app, "/memory")
+            listing = texts(app, "note")[-1]
+            assert ("[shared]" in listing) is (expected == "published memory #1")
+            assert texts(app, "user") == []
+            assert not any(p.requests for p in factory.providers)
+    finally:
+        await storage.close()
+
+
+# `/memory add`: the model call runs in the turn worker group, so Escape cancels it
+
+NOT_ADMIN_ADD = "only memory admins may add shared memories"
+SAVED_TWO = "saved 2 of 2 memories (#2, #3); skipped 0 already known"
+
+
+def make_add_app(
+    config: HarnessConfig, tools: Any, storage: Any, factory: Any, model=MODEL_1
+) -> ChatApp:
+    return ChatApp(
+        config, model, router_factory_for(config, factory, None), False, storage, tools
+    )
+
+
+async def test_memory_add_in_the_tui_previews_then_confirm_saves(
+    tmp_path: Path,
+) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, "alice", [])
+    try:
+        factory = AddFactory()
+        app = make_add_app(config, tools, storage, factory)
+        async with app.run_test() as pilot:
+            await send(pilot, app, "/memory add Alice likes tea in the morning")
+            preview = texts(app, "note")[-1]
+            assert preview.splitlines()[:2] == [
+                "1. [tea, drink] Alice prefers green tea",
+                "2. [morning] Alice drinks tea in the morning",
+            ]
+            assert "/memory add confirm to save 2 notes" in preview
+            assert "[memory: proposing...]" in texts(app, "note")
+            assert prompt_of(app).value == "" and not prompt_of(app).disabled
+            assert len(await MemoryStore(storage.relational).list("alice")) == 1
+            await send(pilot, app, "/memory add confirm")
+            assert texts(app, "note")[-1] == SAVED_TWO
+            assert len(await MemoryStore(storage.relational).list("alice")) == 3
+            await send(pilot, app, "/memory add confirm")
+            assert texts(app, "note")[-1] == "nothing to confirm"
+            assert texts(app, "user") == []
+            assert len(factory.requests) == 1
+    finally:
+        await storage.close()
+
+
+async def test_memory_add_in_the_tui_reads_a_file_and_cancel_discards(
+    tmp_path: Path,
+) -> None:
+    notes = tmp_path / "my notes.md"
+    notes.write_bytes("\ufeffAlice likes tea\r\nand jam\r\n".encode())
+    config, tools, storage = await memory_front_end(tmp_path, "alice", [])
+    try:
+        factory = AddFactory()
+        app = make_add_app(config, tools, storage, factory)
+        async with app.run_test() as pilot:
+            await send(pilot, app, f"/memory add @{notes}")
+            assert texts(app, "note")[-1].startswith("1. [tea, drink] Alice prefers")
+            (request,) = factory.requests
+            content = request.messages[1].content
+            assert "Alice likes tea\nand jam" in content and str(notes) not in content
+            await send(pilot, app, "/memory add cancel")
+            assert texts(app, "note")[-1] == "discarded 2 proposed memories"
+            await send(pilot, app, "/memory add confirm")
+            assert texts(app, "note")[-1] == "nothing to confirm"
+            assert len(await MemoryStore(storage.relational).list("alice")) == 1
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize("admins", [[], ["bob"]])
+async def test_memory_add_shared_in_the_tui_needs_an_admin(
+    tmp_path: Path, admins: list[str]
+) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, "alice", admins)
+    try:
+        factory = AddFactory()
+        app = make_add_app(config, tools, storage, factory)
+        async with app.run_test() as pilot:
+            await send(pilot, app, "/memory add --shared @/nonexistent/x.md")
+            assert texts(app, "note")[-1] == NOT_ADMIN_ADD
+            assert factory.requests == []
+    finally:
+        await storage.close()
+
+
+async def test_escape_cancels_a_memory_add_and_leaves_nothing_pending(
+    tmp_path: Path,
+) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, "alice", [])
+    try:
+        factory = AddFactory(hang_after=0)
+        app = make_add_app(config, tools, storage, factory)
+        async with app.run_test() as pilot:
+            prompt_of(app).value = "/memory add Alice likes tea"
+            await pilot.press("enter")
+            await wait_for(
+                pilot, lambda: "[memory: proposing...]" in texts(app, "note")
+            )
+            assert prompt_of(app).disabled
+            await pilot.press("escape")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert "cancelled" in texts(app, "note")
+            assert not prompt_of(app).disabled
+            assert prompt_of(app).value == "/memory add Alice likes tea"
+            assert factory.providers[0].closed
+            await send(pilot, app, "/memory add confirm")
+            assert texts(app, "note")[-1] == "nothing to confirm"
+            assert len(await MemoryStore(storage.relational).list("alice")) == 1
+    finally:
+        await storage.close()
+
+
+async def test_a_new_chat_clears_the_pending_memory_preview_in_the_tui(
+    tmp_path: Path,
+) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, "alice", [])
+    try:
+        app = make_add_app(config, tools, storage, AddFactory())
+        async with app.run_test() as pilot:
+            await send(pilot, app, "/memory add Alice likes tea")
+            await pilot.press("ctrl+n")
+            await pilot.pause()
+            await send(pilot, app, "/memory add confirm")
+            assert texts(app, "note")[-1] == "nothing to confirm"
+    finally:
+        await storage.close()
+
+
+async def test_memory_add_without_a_working_model_in_the_tui(tmp_path: Path) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, "alice", [])
+    try:
+        app = make_add_app(config, tools, storage, AddFactory(), model=MODEL_3)
+        async with app.run_test() as pilot:
+            await send(pilot, app, "/memory add Alice likes tea")
+            assert texts(app, "note")[-1] == (
+                "no working model: pick another and press Ctrl+N"
+            )
+            await send(pilot, app, "/memory add cancel")
+            assert texts(app, "note")[-1] == "nothing to cancel"
+    finally:
+        await storage.close()
+
+
+NOT_ADMIN_FORGET = "only memory admins may forget shared memories"
+
+
+@pytest.mark.parametrize(
+    ("user_id", "admins", "expected"),
+    [
+        ("bob", ["bob"], "forgot shared memory #1: likes tea"),
+        ("bob", ["alice"], NOT_ADMIN_FORGET),
+        ("bob", [], NOT_ADMIN_FORGET),
+    ],
+)
+async def test_memory_forget_in_the_tui_needs_an_admin(
+    tmp_path: Path, user_id: str, admins: list[str], expected: str
+) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, user_id, admins)
+    try:
+        assert await MemoryStore(storage.relational).set_shared("alice", 1, True)
+        factory = Factory(REPLY)
+        app = ChatApp(
+            config,
+            MODEL_1,
+            router_factory_for(config, factory, None),
+            False,
+            storage,
+            tools,
+        )
+        async with app.run_test() as pilot:
+            await send(pilot, app, "/memory forget 1")
+            assert texts(app, "note") == [expected]
+            await send(pilot, app, "/memory")
+            listing = texts(app, "note")[-1]
+            assert ("[shared]" in listing) is (expected == NOT_ADMIN_FORGET)
+            assert texts(app, "user") == []
+            assert not any(p.requests for p in factory.providers)
+    finally:
+        await storage.close()
+
+
+async def test_help_for_an_unknown_name_is_reported_in_the_tui() -> None:
+    app = make_app(Factory(REPLY))
+    async with app.run_test() as pilot:
+        await send(pilot, app, "/help nope")
+        assert texts(app, "note") == ['no help for "nope"; type /help']
+
+
+async def test_helpx_is_an_ordinary_message_in_the_tui() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "/helpx")
+        assert texts(app, "user") == ["you: /helpx"]
+        assert help_overview("tui") not in texts(app, "note")
+        assert len(factory.providers[0].requests) == 1
+
+
+async def test_a_pasted_multi_line_text_keeps_only_its_first_line_in_the_tui() -> None:
+    """Why `/memory add` documents the file form: a terminal paste is cut to line 1."""
+    from textual.events import Paste
+
+    app = make_app(Factory(REPLY))
+    async with app.run_test() as pilot:
+        prompt_of(app).focus()
+        prompt_of(app).post_message(Paste("/memory add first line\nsecond line"))
+        await pilot.pause()
+        assert prompt_of(app).value == "/memory add first line"
+
+
+# `/memory export` and `/memory import`: files, no model, in the turn worker group
+
+
+async def test_memory_export_and_import_in_the_tui(tmp_path: Path) -> None:
+    (tmp_path / "alice").mkdir()
+    (tmp_path / "bob").mkdir()
+    target = tmp_path / "out.yaml"
+    config, tools, storage = await memory_front_end(tmp_path / "alice", "alice", [])
+    try:
+        factory = Factory(REPLY)
+        app = make_add_app(config, tools, storage, factory)
+        async with app.run_test() as pilot:
+            await send(pilot, app, f"/memory export {target}")
+            assert texts(app, "note") == [f"exported 1 memories to {target}"]
+            assert target.stat().st_mode & 0o777 == 0o600
+            await send(pilot, app, f"/memory import {target}")
+            assert texts(app, "note")[-1].startswith(
+                "imported 0 of 1 memories; skipped 1 already known"
+            )
+            await send(pilot, app, f"/memory export --shared {target}")
+            assert (
+                texts(app, "note")[-1]
+                == "only memory admins may export shared memories"
+            )
+            await send(pilot, app, f"/memory import {tmp_path / 'missing.yaml'}")
+            assert texts(app, "note")[-1].startswith("FileNotFoundError")
+            assert texts(app, "user") == []
+            assert not any(p.requests for p in factory.providers)
+    finally:
+        await storage.close()
+    config, tools, storage = await memory_front_end(tmp_path / "bob", "bob", [])
+    try:
+        app = make_add_app(config, tools, storage, Factory(REPLY))
+        async with app.run_test() as pilot:
+            await send(pilot, app, f"/memory import --shared {target}")
+            assert (
+                texts(app, "note")[-1]
+                == "only memory admins may import shared memories"
+            )
+            await send(pilot, app, f"/memory import {target}")
+            assert texts(app, "note")[-1].startswith(
+                "imported 1 of 1 memories; skipped 0 already known"
+            )
+            assert [
+                n.user_id for n in await MemoryStore(storage.relational).list("bob")
+            ] == ["bob"]
+    finally:
+        await storage.close()
+
+
+async def test_escape_cancels_a_memory_import_and_keeps_the_saved_notes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, "alice", [])
+    try:
+        source = tmp_path / "in.yaml"
+        source.write_bytes(
+            b"version: 1\nmemories:\n"
+            b"- {text: first note, keywords: [one]}\n"
+            b"- {text: second note, keywords: [two]}\n"
+        )
+        original = MemoryStore.save
+        calls: list[str] = []
+
+        async def blocking_save(self, user_id, text, keywords, *args, **kwargs):
+            calls.append(text)
+            if len(calls) > 1:
+                await asyncio.Event().wait()
+            return await original(self, user_id, text, keywords, *args, **kwargs)
+
+        monkeypatch.setattr(MemoryStore, "save", blocking_save)
+        app = make_add_app(config, tools, storage, Factory(REPLY))
+        async with app.run_test() as pilot:
+            command = f"/memory import {source}"
+            prompt_of(app).value = command
+            await pilot.press("enter")
+            await wait_for(pilot, lambda: len(calls) == 2)
+            assert prompt_of(app).disabled  # running in the turn slot, not inline
+            await pilot.press("escape")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert "cancelled" in texts(app, "note")
+            assert not prompt_of(app).disabled
+            assert prompt_of(app).value == command
+        monkeypatch.undo()
+        notes = await MemoryStore(storage.relational).list("alice")
+        assert sorted(note.text for note in notes) == ["first note", "likes tea"]
+    finally:
+        await storage.close()

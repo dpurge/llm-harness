@@ -657,3 +657,31 @@ def test_the_system_message_is_the_packaged_prompt_plus_the_schema():
 def test_key_prompt_rules_are_present(rule):
     system = build_reflection_request(model_cfg(), turn(), []).messages[0].content
     assert rule.lower() in system.lower()
+
+
+def test_a_shared_note_is_marked_in_the_existing_memories_and_a_private_one_is_not():
+    shared = Memory(8, "bob", "Team rule.", ("rule",), START_TEXT, START_TEXT, True)
+    notes = user_message(turn(), [shared, memory(3)]).split("## Existing memories", 1)[
+        1
+    ]
+    assert f"#8 [shared] [rule] (updated {START_TEXT}) Team rule." in notes
+    assert "#3 [tea, drink]" in notes
+    assert notes.count("[shared]") == 1
+
+
+def test_the_prompt_says_a_shared_note_cannot_be_changed_or_forgotten():
+    system = build_reflection_request(model_cfg(), turn(), []).messages[0].content
+    assert "`[shared]` cannot be changed or forgotten" in system
+
+
+async def test_the_reflection_step_cannot_change_or_forget_a_shared_note(
+    store: MemoryStore,
+):
+    saved = await store.save(ALICE, "Team rule.", ["rule"])
+    await store.set_shared(ALICE, saved.id, True)
+    update = ReflectionAction("update", saved.id, "Changed.", None, None)
+    forget = ReflectionAction("forget", saved.id, None, None, None)
+    assert await apply_reflection(store, ALICE, update) == f"no memory #{saved.id}"
+    assert await apply_reflection(store, ALICE, forget) == f"no memory #{saved.id}"
+    kept = await store.get("bob", saved.id)
+    assert kept is not None and kept.text == "Team rule."

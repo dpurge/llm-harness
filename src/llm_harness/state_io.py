@@ -73,20 +73,32 @@ def check_size(size: int) -> None:
         raise StateImportError(f"file is larger than {MAX_IMPORT_BYTES} bytes")
 
 
-def import_yaml(data: bytes) -> RunState:
-    """Parse and validate an uploaded file; raise `StateImportError` on any problem."""
+def load_untrusted_yaml(data: bytes) -> object:
+    """The parsed value of an uploaded YAML file; `StateImportError` on any problem.
+
+    Size check, strict UTF-8, no-alias `SafeLoader`. Shared by every file the human
+    gives the harness (`import_yaml` and the memories file), so the rules stay one.
+    """
     check_size(len(data))
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         raise StateImportError("file is not UTF-8 text") from None
     try:
-        loaded = yaml.load(text, Loader=_NoAliasLoader)  # a SafeLoader subclass
-    except yaml.YAMLError:
-        # The parser's message quotes the file, so it is not passed on.
+        return yaml.load(text, Loader=_NoAliasLoader)  # a SafeLoader subclass
+    except StateImportError:
+        raise  # the alias refusal, a ValueError subclass: keep its own message
+    except (yaml.YAMLError, ValueError):
+        # The parser's message quotes the file, so it is not passed on. A constructor
+        # raises a plain ValueError for a 5000-digit int or a date like 2026-13-45.
         raise StateImportError("not valid YAML (or uses an unsupported tag)") from None
     except RecursionError:
         raise StateImportError("YAML is nested too deeply") from None
+
+
+def import_yaml(data: bytes) -> RunState:
+    """Parse and validate an uploaded file; raise `StateImportError` on any problem."""
+    loaded = load_untrusted_yaml(data)
     if not isinstance(loaded, dict):
         raise StateImportError("top level must be a mapping")
     try:

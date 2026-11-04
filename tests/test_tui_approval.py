@@ -8,6 +8,7 @@ from textual.pilot import Pilot
 from textual.worker import WorkerCancelled
 
 from llm_harness.builtin_tools import build_tool_registry
+from llm_harness.commands import help_overview
 from llm_harness.config import AgentConfig
 from llm_harness.tui.app import ChatApp
 from tests.fake_steps import reply_events
@@ -265,3 +266,14 @@ async def test_the_orchestrator_built_on_a_model_switch_has_the_approver() -> No
         await waiting(pilot, app)
         await answer(pilot, app, "yes")
         assert last_observation(factory).startswith("tool dev_echo result")
+
+
+async def test_help_typed_during_an_approval_prompt_denies_the_call() -> None:
+    app, factory = make_approval_app(text="hello")
+    async with app.run_test() as pilot:
+        await start_turn(pilot, app)
+        await waiting(pilot, app)
+        await answer(pilot, app, "/help")
+        assert last_observation(factory) == DENIED
+        # The line answered the prompt; it was not shown as a help answer.
+        assert help_overview("tui") not in texts(app, "note")

@@ -252,10 +252,35 @@ def test_reindex_parses_and_takes_no_argument() -> None:
     assert parse_memory_command("/memory REINDEX") == MemoryCommand("usage")
 
 
+def test_reindex_all_parses_and_takes_nothing_after_it() -> None:
+    assert parse_memory_command("/memory reindex --all") == MemoryCommand("reindex-all")
+    assert parse_memory_command("  /memory  reindex   --all ") == MemoryCommand(
+        "reindex-all"
+    )
+    for line in (
+        "/memory reindex --all x",
+        "/memory reindex foo",
+        "/memory reindex -all",
+    ):
+        assert parse_memory_command(line) == MemoryCommand("usage")
+
+
 def test_usage_mentions_reindex() -> None:
     first = "usage: /memory [list [PAGE]] | /memory show ID | /memory delete ID"
-    assert USAGE.splitlines()[0] == first + " | /memory reindex"
+    assert (
+        USAGE.splitlines()[0]
+        == (
+            first
+            + " | /memory publish ID | /memory unpublish ID | /memory forget ID"  # memory-shared-admin
+            + " | /memory search WORDS | /memory reindex [--all]"
+            + " | /memory add [--shared] TEXT"  # memory-add-command
+            + " | /memory export [--shared] [PATH] | /memory import [--shared] PATH"  # memory-yaml-transfer
+        )
+    )
     assert "  reindex rebuild the vector index of your memories" in USAGE.splitlines()
+    assert "          --all re-embeds every memory into the current vector store" in (
+        USAGE.splitlines()
+    )
 
 
 async def test_the_answer_counts_indexed_of_unindexed(db: Path) -> None:
@@ -373,7 +398,8 @@ async def assert_back_on(wired: Wired) -> None:
     assert await wired.markers() == before + 1
     searches = wired.vector_calls("search")
     await wired.store.search("alice", "tea")
-    assert wired.vector_calls("search") == searches + 1
+    # Two vector searches per store search: the user's notes and the shared ones.
+    assert wired.vector_calls("search") == searches + 2
 
 
 async def test_reindex_after_a_transient_embed_failure_switches_the_index_on(
@@ -534,3 +560,140 @@ async def test_the_retry_rebuilds_the_embedder_and_ensures_the_collection_again(
     assert answer == "reindexed 1 of 1 memories"
     assert rig.factory_calls == 2
     assert len(rig.calls("ensure_collection")) == 2
+
+
+# --- /memory reindex --all ----------------------------------------------------------
+
+
+REINDEX_ALL = MemoryCommand("reindex-all")
+
+
+async def test_rebuild_processes_every_note_of_the_user_ignoring_markers(
+    db: Path,
+) -> None:
+    await seed_unindexed(db, 3)
+    rig = Rig(db)
+    assert await rig.store.reindex("u1") == (3, 3)
+    assert await rig.store.reindex("u1", rebuild=True) == (3, 3)
+    assert await rig.store.reindex("u1") == (0, 0)
+
+
+async def test_all_fills_a_new_empty_vector_store_that_plain_reindex_leaves_empty(
+    db: Path,
+) -> None:
+    await seed_unindexed(db, 3)
+    old = Rig(db)
+    assert await old.store.reindex("u1") == (3, 3)
+    marked = old.markers()
+    new = Rig(db)  # same SQLite and model, so the markers are stale; empty vectors
+    assert new.points() == {}
+    assert await run_memory_command(new.store, "u1", MemoryCommand("reindex")) == (
+        "reindexed 0 of 0 memories"
+    )
+    assert new.points() == {}
+    assert await run_memory_command(new.store, "u1", REINDEX_ALL) == (
+        "reindexed 3 of 3 memories"
+    )
+    assert sorted(new.points()) == ["1", "2", "3"]
+    assert new.markers() == marked
+
+
+async def test_all_twice_is_idempotent(db: Path) -> None:
+    await seed_unindexed(db, 3)
+    rig = Rig(db)
+    assert await run_memory_command(rig.store, "u1", REINDEX_ALL) == (
+        "reindexed 3 of 3 memories"
+    )
+    points, markers = len(rig.points()), sorted(rig.markers())
+    assert await run_memory_command(rig.store, "u1", REINDEX_ALL) == (
+        "reindexed 3 of 3 memories"
+    )
+    assert len(rig.points()) == points == 3
+    assert sorted(rig.markers()) == markers
+
+
+async def test_all_leaves_other_users_untouched(db: Path) -> None:
+    await seed_unindexed(db, 2, "u1")
+    await seed_unindexed(db, 2, "u2")
+    rig = Rig(db)
+    assert await run_memory_command(rig.store, "u1", REINDEX_ALL) == (
+        "reindexed 2 of 2 memories"
+    )
+    assert sorted(rig.points()) == ["1", "2"]
+    assert all(p.payload == {"user_id": "u1"} for p in rig.points().values())
+    assert indexed_ids(rig) == [1, 2]
+
+
+async def test_all_with_a_failing_embedder_answers_off_and_keeps_markers(
+    db: Path,
+) -> None:
+    await seed_unindexed(db, 2)
+    rig = Rig(db)
+    assert await rig.store.reindex("u1") == (2, 2)
+    marked = sorted(rig.markers())
+    rig.provider.raises = EmbeddingError("connection", "ollama down")
+    answer = await run_memory_command(rig.store, "u1", REINDEX_ALL)
+    assert answer.startswith("vector search is off: ")
+    assert "ollama down" in answer
+    assert sorted(rig.markers()) == marked
+
+
+async def test_all_lets_cancellation_pass_through(db: Path) -> None:
+    await seed_unindexed(db, 1)
+    rig = Rig(db)
+
+    async def cancelled(collection, points):
+        raise asyncio.CancelledError
+
+    rig.vectors.upsert = cancelled  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await run_memory_command(rig.store, "u1", REINDEX_ALL)
+    assert rig.store.index_off_reason is None
+
+
+async def test_all_on_a_plain_store_says_vector_search_is_off(db: Path) -> None:
+    plain = MemoryStore(Rig(db).store._relational)
+    assert await run_memory_command(plain, "u1", REINDEX_ALL) == VECTORS_OFF
+
+
+async def test_all_through_the_tools_drops_the_duplicate_notice(
+    storage: Storage,  # noqa: F811
+) -> None:
+    await MemoryStore(storage.relational).save("alice", "Likes tea", ["tea"])
+    tools = vector_registry(failing_factory())
+    answer = await handle_memory_text("/memory reindex --all", tools, storage, "alice")
+    assert answer is not None
+    assert answer.startswith("vector search is off: ConfigError: ")
+    assert "\n" not in answer
+
+
+# /memory search through an index
+
+
+async def test_search_with_the_index_off_answers_keyword_hits_and_the_notice(
+    db: Path,
+) -> None:
+    await seed_unindexed(db, 2)
+    rig = Rig(db, ensure_collection=VectorStoreError("down"))
+    answer = await run_memory_command(
+        rig.store,
+        "u1",
+        parse_memory_command("/memory search note"),  # type: ignore[arg-type]
+    )
+    lines = answer.splitlines()
+    assert len(lines) == 2
+    assert all(line.startswith("#") and "note" in line for line in lines)
+    assert VECTORS_OFF not in answer
+    assert rig.store.index_off_reason is not None
+    assert rig.store.take_notice()  # the one-time notice handle_memory_text appends
+
+
+async def test_search_on_a_plain_store_gives_keyword_hits_not_vectors_off(
+    db: Path,
+) -> None:
+    await seed_unindexed(db, 1)
+    plain = MemoryStore(Rig(db).store._relational)
+    command = parse_memory_command("/memory search note")
+    assert command is not None
+    answer = await run_memory_command(plain, "u1", command)
+    assert answer.startswith("#1 [kw0]") and VECTORS_OFF not in answer

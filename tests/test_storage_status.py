@@ -163,7 +163,7 @@ async def test_a_recorded_memory_namespace_is_known(tmp_path: Path) -> None:
     Store(db).backoff_entries()
     await SqliteRelationalStore(db).migrate("memory", MEMORY_MIGRATIONS)
     assert (await status(tmp_path))[3] == (
-        "  schema: memory version 2 (the code expects 2)"
+        "  schema: memory version 3 (the code expects 3)"
     )
 
 

@@ -25,6 +25,20 @@ def sanitize_text(text: str) -> str:
     )
 
 
+def escape_text(text: str, *, keep_newlines: bool = False) -> str:
+    """Show control, bidi and separator characters as `\\uXXXX`; never pass them on."""
+    shown = []
+    for ch in text:
+        is_kept_whitespace = (keep_newlines and ch in "\n\t") or ch == " "
+        if is_kept_whitespace or (ch.isprintable() and sanitize_text(ch) == ch):
+            shown.append(ch)
+        else:
+            shown.append(
+                f"\\u{ord(ch):04x}" if ord(ch) <= 0xFFFF else f"\\U{ord(ch):08x}"
+            )
+    return "".join(shown)
+
+
 def _format_cost(cost: float) -> str:
     if cost == 0 or cost >= 0.01:
         return f"${cost:.2f}"

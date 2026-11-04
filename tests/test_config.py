@@ -1656,6 +1656,55 @@ def test_command_lists_accept_names_patterns_and_absolute_paths(key: str):
     assert getattr(ToolsConfig.model_validate({key: entries}), key) == entries
 
 
+# --- [tools] memory_admins ---------------------------------------------------
+
+
+def test_memory_admins_default_is_nobody():
+    assert ToolsConfig().memory_admins == []
+
+
+def test_memory_admins_keeps_a_valid_list_as_written():
+    names = ["alice", " bob ", "Zoë 42", "x" * 128]
+    assert ToolsConfig.model_validate({"memory_admins": names}).memory_admins == names
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "alice",
+        42,
+        {"alice": 1},
+        [1],
+        [None],
+        [True],
+        [""],
+        ["   "],
+        ["x" * 129],
+        ["bad\nname"],
+        ["bad\x1bname"],
+        ["alice", "alice"],
+    ],
+)
+def test_memory_admins_rejects_bad_values_and_names_the_key(value: object):
+    with pytest.raises(ValueError, match="memory_admins"):
+        ToolsConfig.model_validate({"memory_admins": value})
+
+
+def test_memory_admins_error_is_clear_in_a_loaded_config(tmp_path: Path):
+    write_config(tmp_path, PROVIDER_TOML + '[tools]\nmemory_admins = ["a", "a"]\n')
+    with pytest.raises(ConfigError, match="memory_admins has duplicate entries: a"):
+        load_config(tmp_path)
+    write_config(tmp_path, PROVIDER_TOML + '[tools]\nmemory_admins = [""]\n')
+    with pytest.raises(ConfigError, match="memory_admins entry must not be empty"):
+        load_config(tmp_path)
+
+
+def test_memory_admins_loads_from_toml_and_the_example_mentions_it(tmp_path: Path):
+    write_config(tmp_path, PROVIDER_TOML + '[tools]\nmemory_admins = ["alice"]\n')
+    assert load_config(tmp_path).tools.memory_admins == ["alice"]
+    assert '# memory_admins = ["alice"]' in EXAMPLE_CONFIG_TOML
+
+
 def test_command_list_errors_name_the_key_and_entry(tmp_path: Path):
     write_config(tmp_path, PROVIDER_TOML + '[tools]\ncommand_allow = ["x y"]\n')
     message = str(load_error(tmp_path))

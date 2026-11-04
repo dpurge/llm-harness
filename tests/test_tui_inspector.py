@@ -1162,7 +1162,7 @@ async def test_the_placeholder_lists_the_state_commands() -> None:
     app = make_app(Factory(REPLY))
     async with app.run_test():
         placeholder = prompt_of(app).placeholder
-        for command in ("/export", "/import", "/quit"):
+        for command in ("/help", "/export", "/import", "/quit"):
             assert command in placeholder
 
 

@@ -465,3 +465,35 @@ async def test_the_request_preview_shows_the_last_recall_block(storage, clock) -
     await run(orchestrator, "metric units")
     preview = build_preview(orchestrator, model_cfg(), "")
     assert "## Memory\n\n<memory-entries>\n#1 [metric]" in preview.user_text
+
+
+# --- shared notes ---------------------------------------------------------------
+
+
+def test_a_shared_note_is_marked_and_a_private_one_never_is() -> None:
+    shared = Memory(7, "alice", "Team rule.", ("rule",), UPDATED, UPDATED, True)
+    block = format_recall_block([shared, memory(3, "Private.", ("d",))])
+    assert f"#7 [shared] [rule] (updated {UPDATED}) Team rule.\n" in block
+    assert f"#3 [d] (updated {UPDATED}) Private.\n" in block
+    assert block.count("[shared]") == 1
+
+
+async def test_shared_notes_compete_by_rank_inside_the_five_recall_slots(
+    storage, clock
+) -> None:
+    store = MemoryStore(storage.relational, clock)
+    for number in range(4):
+        await store.save("bob", f"Bob drinks tea {number}", ["tea"])
+    for number in range(2):
+        note = await store.save("alice", f"Team rule: tea is free {number}", ["tea"])
+        await store.set_shared("alice", note.id, True)
+    orchestrator, provider = recall_make(
+        storage, clock, [answer(), reflection_none()], user_id="bob"
+    )
+    await run(orchestrator, "tea")
+    section = memory_section(provider.requests[0]) or ""
+    lines = [line for line in section.splitlines() if line.startswith("#")]
+    assert RECALL_K == 5 and len(lines) == 5  # 6 notes match, no reserved slots
+    shared_lines = [line for line in lines if "[shared]" in line]
+    assert shared_lines and all("Team rule" in line for line in shared_lines)
+    assert all("Bob drinks" in line for line in lines if "[shared]" not in line)

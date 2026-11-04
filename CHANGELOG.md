@@ -6,6 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ### Added
 
+- `/help` in the chat input (GUI, terminal UI, `--plain`): lists the commands of the front end in use; `/help COMMAND` shows the detail of one, with no model call.
+- `/memory export [--shared] [PATH]` and `/memory import [--shared] PATH`: write your memories to a YAML file (default `llm-harness-memories.yaml`, created with mode 0600, never overwritten) and read them back as your own notes, with no model call and no preview; known texts and invalid or secret-looking entries are skipped and counted, valid timestamps that are not in the future are kept, at most 200 entries and 1,000,000 bytes per file, and `--shared` is for memory admins only. They are separate from the terminal UI's `/export` and `/import` of orchestrator state.
+- `/memory search WORDS`: shows the memories a search finds, best first, at most 10, in the list format, with no model call.
+- Shared memory notes: one global set that every user sees read-only, marked `[shared]`, in `/memory list`, `show`, `search`, automatic recall and `memory_search`. A user named in the new `[tools] memory_admins` list publishes or unpublishes one of their own notes with `/memory publish ID` and `/memory unpublish ID`; no model tool writes a shared note.
+- `/memory forget ID`: a memory admin deletes any shared note for every user at once, with no confirmation and no audit log; the answer echoes the removed text. No model tool can do it.
+- `/memory add TEXT` and `/memory add @FILE` (a `.txt`, `.md` or `.markdown` file of at most 64 KB): one model call proposes only the new facts of the text as up to 5 short notes, shown as a numbered preview that `/memory add confirm` saves and `/memory add cancel` discards; the text goes to the model provider, is limited to 4000 characters, and `--shared` is for memory admins only.
 - Streaming chat over Ollama, OpenAI-compatible APIs (including OpenRouter) and Vertex AI through shared stream events.
 - `llm-harness --plain`: line-based chat that works over pipes.
 - Terminal UI (`llm-harness`) with a model selector, collapsible thinking and Escape to cancel.
@@ -46,7 +52,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - `/memory` command (`/memory list [PAGE]`, `/memory show ID`, `/memory delete ID`) to list, read and delete your saved memories in `--plain`, the terminal UI and the GUI, with no model call.
 - `memory_update` now shows the stored record in a notice after it runs.
 - Optional meaning-based (vector) memory search, switched on with `[tools] memory_vectors = true` (needs `memory`, a `user_id` and an `embedding` model): recall, `memory_search` and reflection merge keyword and vector hits, and fall back to keyword search with one notice on any problem.
-- `/memory reindex` indexes the memories that have no vector yet and answers `reindexed N of M memories`; it also switches vector search back on after a failure (it retries the embedding model and the vector store, and answers `vector search is off: <reason>` if the problem remains).
+- `/memory reindex` indexes the memories that have no vector yet and answers `reindexed N of M memories`; it also switches vector search back on after a failure (it retries the embedding model and the vector store, and answers `vector search is off: <reason>` if the problem remains); `/memory reindex --all` embeds every one of your memories again into the current vector store, ignoring which ones already have a vector, for use after changing `[storage.vector]` backend or server, and answers `reindexed N of N memories`.
 - Remote qdrant vector backend: `[storage.vector] backend = "qdrant"` with a `url`, the optional extra `remote`, an optional API key in `~/.config/llm-harness/secrets.toml` (mode 0600), one warning line for a key sent over plain http, and `--storage-status` showing the remote store without contacting it; see the README section "Remote qdrant".
 - Postgres relational backend: `[storage.relational] backend = "postgres"` with a `url`, the optional extra `postgres` and an optional password in `~/.config/llm-harness/secrets.toml` under `[postgres]` keep the usage ledger and schema versions on a Postgres server; `--storage-status` reports it read-only; agent memory works with it too (next entry); see the README section "Postgres".
 - pgvector vector backend: `[storage.vector] backend = "pgvector"` with a `url` keeps the vectors in a PostgreSQL database with the pgvector extension, which an administrator creates with `CREATE EXTENSION vector;`; it uses the same optional extra `postgres` and the optional `[postgres] password` in `~/.config/llm-harness/secrets.toml`; `--storage-status` reports the extension and the collections read-only; it works with SQLite as the relational store, so agent memory keeps working; see the README section "pgvector".
@@ -64,6 +70,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - The starting model is now chosen by the `orchestrator` tag instead of `default`; `default` only marks the last-resort fallback.
 - The ledger path can now be set with `[storage.relational] path`, and the ledger file gets a `schema_versions` table on first start (existing rows are not touched).
 - Embedding models are hidden from the model selectors and rejected by `--model`; an entry tagged `embedding` together with `chat`, `default` or `orchestrator` is a config error; the example config files the program offers to write now explain every key in comments, and `models.yaml` includes a commented-out embedding example.
+- The memory schema is now version 3 (a `shared` column on `memories`, added automatically on first use); an older build refuses a database upgraded this way with `SchemaTooNewError`, so upgrade every machine that shares a Postgres database together.
+- `/memory delete` of a shared note answers `memory #<id> is shared; unpublish it first` (its owner) or `memory #<id> is shared and read-only` (anyone else). With `memory_vectors = true` a memory search now makes two vector queries, and `/memory reindex` also embeds shared notes.
 - The unknown-backend error for `[storage.relational]` now lists `sqlite, postgres` (postgres was recognised but rejected before).
 - The error for a `url` with the `qdrant-edge` or `none` vector backend now reads `url is only used with backend = "qdrant" or "pgvector"`, and the unknown-backend error for `[storage.vector]` now lists `qdrant-edge, qdrant, pgvector, none`.
 
@@ -74,4 +82,5 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ### Fixed
 
+- A YAML file with a huge integer or an impossible date (such as `2026-13-45`) made the state `/import` and the memory import fail with an unhandled error; both now answer `not valid YAML (or uses an unsupported tag)`.
 - An embedding call that gets no answer now fails after 60 seconds instead of waiting forever; it shows as a connection error, and memory vector search switches off with one notice.

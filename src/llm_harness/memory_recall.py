@@ -22,12 +22,15 @@ RECALL_SENTENCE = (
 )
 
 _BLOCK_TAG = re.compile(re.escape(BLOCK_TAG), re.IGNORECASE)
+# Built by the harness and placed before the keywords, so a note's text cannot fake it.
+SHARED_MARKER = "[shared]"
 
 
 def _entry_line(memory: Memory) -> str:
     keywords = ", ".join(scrub_block_text(word, _BLOCK_TAG) for word in memory.keywords)
     text = scrub_block_text(memory.text, _BLOCK_TAG)
-    return f"#{memory.id} [{keywords}] (updated {memory.updated_at}) {text}"
+    marker = f"{SHARED_MARKER} " if memory.shared else ""
+    return f"#{memory.id} {marker}[{keywords}] (updated {memory.updated_at}) {text}"
 
 
 def format_recall_block(memories: Sequence[Memory]) -> str:

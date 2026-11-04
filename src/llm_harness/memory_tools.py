@@ -23,6 +23,7 @@ from llm_harness.memory import (
     MemoryStore,
 )
 from llm_harness.memory_index import IndexedMemoryStore
+from llm_harness.memory_recall import SHARED_MARKER
 from llm_harness.storage import Storage
 from llm_harness.tools import Tool, ToolContext, ToolRegistry
 
@@ -64,7 +65,8 @@ def _stamps(memory: Memory) -> str:
 
 def _block(memory: Memory) -> str:
     keywords = ", ".join(memory.keywords)
-    return f"#{memory.id} [{keywords}] ({memory.updated_at}) {memory.text}"
+    marker = f"{SHARED_MARKER} " if memory.shared else ""
+    return f"#{memory.id} {marker}[{keywords}] ({memory.updated_at}) {memory.text}"
 
 
 class MemoryTools:

@@ -36,7 +36,7 @@ HOST = "db-secret-host.example"
 USER = "db-secret-user"
 PASSWORD = "sk-test-SECRET-123"
 ROW_TEXT = "Likes tea with oat milk"
-ARBITRARY_ROW = (7, "alice", ROW_TEXT, "tea", STAMP, STAMP)
+ARBITRARY_ROW = (7, "alice", ROW_TEXT, "tea", STAMP, STAMP, 0)
 
 # The SQLite text as it was before the PostgreSQL work: the proof that SQLite did not
 # change. `git show HEAD:src/llm_harness/memory.py` already carries the same steps (the
@@ -93,16 +93,19 @@ OLD_SQLITE_MIGRATIONS = (
         END""",
     ),
 )
-OLD_SQLITE_SEARCH = (
-    "SELECT m.id, m.user_id, m.text, m.keywords, m.created_at, m.updated_at "
+# Shared notes (memory-shared-scope): the search statements select `shared` and read
+# `(user_id = ? OR shared = 1)`, so the old search text is no longer asserted.
+SQLITE_SEARCH = (
+    "SELECT m.id, m.user_id, m.text, m.keywords, m.created_at, m.updated_at, m.shared "
     "FROM memories_fts JOIN memories AS m ON m.id = memories_fts.rowid "
-    "WHERE memories_fts MATCH ? AND m.user_id = ? "
+    "WHERE memories_fts MATCH ? AND (m.user_id = ? OR m.shared = 1) "
     "ORDER BY bm25(memories_fts), m.id DESC LIMIT ?"
 )
+SHARED_STEP = ("ALTER TABLE memories ADD COLUMN shared INTEGER NOT NULL DEFAULT 0",)
 POSTGRES_SEARCH = (
-    "SELECT m.id, m.user_id, m.text, m.keywords, m.created_at, m.updated_at "
+    "SELECT m.id, m.user_id, m.text, m.keywords, m.created_at, m.updated_at, m.shared "
     "FROM memories AS m, websearch_to_tsquery('english', ?) AS q "
-    "WHERE m.search @@ q AND m.user_id = ? "
+    "WHERE m.search @@ q AND (m.user_id = ? OR m.shared = 1) "
     "ORDER BY ts_rank(m.search, q) DESC, m.id DESC LIMIT ?"
 )
 UPSERT = (
@@ -155,12 +158,13 @@ def placeholders(sql: str) -> int:
 # --- SQLite is unchanged -------------------------------------------------------------
 
 
-def test_the_sqlite_migrations_are_byte_identical_to_the_old_text():
-    assert MEMORY_MIGRATIONS == OLD_SQLITE_MIGRATIONS
+def test_the_first_two_sqlite_migration_steps_are_byte_identical_to_the_old_text():
+    assert MEMORY_MIGRATIONS[:2] == OLD_SQLITE_MIGRATIONS
+    assert MEMORY_MIGRATIONS[2] == SHARED_STEP
 
 
-def test_the_sqlite_search_statement_is_byte_identical_to_the_old_text():
-    assert memory_module._SEARCH_SQLITE == OLD_SQLITE_SEARCH
+def test_the_sqlite_search_statement_is_the_planned_text():
+    assert memory_module._SEARCH_SQLITE == SQLITE_SEARCH
 
 
 @pytest.mark.parametrize(
@@ -176,10 +180,10 @@ def test_the_sqlite_match_expression_is_unchanged(query: str, expected: str | No
     assert memory_module._match_expression(query) == expected
 
 
-async def test_a_sqlite_store_searches_with_the_old_statement_and_expression():
+async def test_a_sqlite_store_searches_with_its_statement_and_expression():
     fake = FakeMemoryRelational("sqlite")
     await store_on(fake).search("alice", "tea or coffee", 3)
-    assert fake.calls == [(OLD_SQLITE_SEARCH, ('"tea" OR "coffee"', "alice", 3))]
+    assert fake.calls == [(SQLITE_SEARCH, ('"tea" OR "coffee"', "alice", 3))]
     assert fake.migrations[0][1] is MEMORY_MIGRATIONS
 
 
@@ -211,22 +215,23 @@ def test_a_relational_store_without_a_dialect_is_refused():
 
 
 def test_every_dialect_has_the_same_number_of_steps_so_versions_stay_aligned():
-    assert len(MEMORY_MIGRATIONS) == len(MEMORY_MIGRATIONS_POSTGRES) == 2
+    assert len(MEMORY_MIGRATIONS) == len(MEMORY_MIGRATIONS_POSTGRES) == 3
     assert {d: len(m) for d, m in memory_module._MIGRATIONS_BY_DIALECT.items()} == {
-        "sqlite": 2,
-        "postgres": 2,
+        "sqlite": 3,
+        "postgres": 3,
     }
 
 
-def test_the_schema_status_still_reports_memory_at_version_2():
-    assert optional_schema_versions()[MEMORY_NAMESPACE] == 2
+def test_the_schema_status_reports_memory_at_version_3():
+    assert optional_schema_versions()[MEMORY_NAMESPACE] == 3
 
 
 # --- the PostgreSQL DDL --------------------------------------------------------------
 
 
-def test_the_postgres_migrations_are_exactly_the_two_planned_steps():
-    first, second = MEMORY_MIGRATIONS_POSTGRES
+def test_the_postgres_migrations_are_exactly_the_three_planned_steps():
+    first, second, third = MEMORY_MIGRATIONS_POSTGRES
+    assert third == SHARED_STEP
     assert first[1:] == (
         "CREATE INDEX memories_user_id ON memories (user_id)",
         "CREATE INDEX memories_search ON memories USING gin (search)",
@@ -382,22 +387,24 @@ async def test_save_update_forget_get_list_issue_the_same_statements_as_before(
     await store.forget("alice", 7)
     await store.get("alice", 7)
     await store.list("alice", 5, 10)
-    columns = "id, user_id, text, keywords, created_at, updated_at"
+    columns = "id, user_id, text, keywords, created_at, updated_at, shared"
+    # `shared` joined the INSERT with `/memory add --shared`; the other statements stand.
     insert = (
-        "INSERT INTO memories (user_id, text, keywords, created_at, updated_at) "
-        f"VALUES (?, ?, ?, ?, ?) RETURNING {columns}"
+        "INSERT INTO memories "
+        "(user_id, text, keywords, created_at, updated_at, shared) "
+        f"VALUES (?, ?, ?, ?, ?, ?) RETURNING {columns}"
     )
     listing = (
-        f"SELECT {columns} FROM memories WHERE user_id = ? "
+        f"SELECT {columns} FROM memories WHERE (user_id = ? OR shared = 1) "
         "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?"
     )
-    returning = f"WHERE id = ? AND user_id = ? RETURNING {columns}"
+    returning = f"WHERE id = ? AND user_id = ? AND shared = 0 RETURNING {columns}"
     assert [sql for sql, _ in fake.calls] == [
         insert,
         f"UPDATE memories SET text = ?, updated_at = ? {returning}",
         f"UPDATE memories SET keywords = ?, updated_at = ? {returning}",
-        "DELETE FROM memories WHERE id = ? AND user_id = ? RETURNING id",
-        f"SELECT {columns} FROM memories WHERE id = ? AND user_id = ?",
+        "DELETE FROM memories WHERE id = ? AND user_id = ? AND shared = 0 RETURNING id",
+        f"SELECT {columns} FROM memories WHERE id = ? AND (user_id = ? OR shared = 1)",
         listing,
     ]
     assert len(fake.migrations) == 1  # once per store, before the first statement
@@ -413,11 +420,12 @@ async def test_every_postgres_memory_statement_translates_with_matching_placehol
     await store.get("alice", 7)
     await store.list("alice")
     await store.search("alice", "tea coffee")
+    await store.set_shared("alice", 7, True)
     # The statement texts of memory_index.py that run on the same adapter.
     statements = [
         (sql, params) for sql, params in fake.calls if placeholders(sql) == len(params)
     ]
-    assert len(statements) == len(fake.calls) == 6
+    assert len(statements) == len(fake.calls) == 8  # set_shared runs two
     for sql, params in fake.calls:
         translated, bound = translate_sql(sql, params)
         assert translated.count("%s") == placeholders(sql) == len(params)
@@ -443,6 +451,51 @@ def test_the_index_statements_translate_with_matching_placeholders(
     translated, _ = translate_sql(sql, tuple(range(count)))
     assert translated.count("%s") == count
     assert "ON CONFLICT (collection, memory_id) DO NOTHING" in translated or count != 2
+
+
+async def test_set_shared_flips_the_flag_with_an_int_and_clears_the_markers(
+    fake: FakeMemoryRelational,
+):
+    columns = "id, user_id, text, keywords, created_at, updated_at, shared"
+    fake.answer = lambda sql: [(7, "alice", ROW_TEXT, "tea", STAMP, STAMP, 1)]
+    memory = await store_on(fake).set_shared("alice", 7, True)
+    assert memory is not None
+    assert memory.shared is True
+    assert fake.calls == [
+        (
+            f"UPDATE memories SET shared = ? WHERE id = ? AND user_id = ? RETURNING {columns}",
+            (1, 7, "alice"),
+        ),
+        ("DELETE FROM memory_vectors WHERE memory_id = ?", (7,)),
+    ]
+
+
+async def test_set_shared_of_a_note_that_is_not_the_users_clears_nothing(
+    fake: FakeMemoryRelational,
+):
+    fake.answer = lambda sql: []
+    assert await store_on(fake).set_shared("bob", 7, False) is None
+    assert [params for _, params in fake.calls] == [(0, 7, "bob")]
+
+
+async def test_forget_shared_deletes_by_id_and_shared_flag_only(
+    fake: FakeMemoryRelational,
+):
+    columns = "id, user_id, text, keywords, created_at, updated_at, shared"
+    fake.answer = lambda sql: [(7, "bob", ROW_TEXT, "tea", STAMP, STAMP, 1)]
+    memory = await store_on(fake).forget_shared(7)
+    assert memory is not None and memory.user_id == "bob" and memory.shared is True
+    assert fake.calls == [
+        (f"DELETE FROM memories WHERE id = ? AND shared = 1 RETURNING {columns}", (7,)),
+    ]
+
+
+async def test_forget_shared_without_a_returned_row_is_none(
+    fake: FakeMemoryRelational,
+):
+    fake.answer = lambda sql: []
+    assert await store_on(fake).forget_shared(7) is None
+    assert [params for _, params in fake.calls] == [(7,)]
 
 
 # --- the marker upserts --------------------------------------------------------------
@@ -551,3 +604,70 @@ async def test_a_non_driver_index_error_keeps_its_redacted_text(
     assert store.take_notice() == (
         "memory vector search is off: ValueError: plain failure; keyword search only"
     )
+
+
+# --- save(shared=) and has_text (memory-add-command) ----------------------------------
+
+
+@pytest.mark.parametrize("dialect", ["postgres", "sqlite"])
+@pytest.mark.parametrize(("shared", "flag"), [(True, 1), (False, 0)])
+async def test_save_binds_the_shared_flag_as_the_last_parameter(
+    dialect: str, shared: bool, flag: int
+):
+    fake = FakeMemoryRelational(dialect)
+    await store_on(fake).save("alice", ROW_TEXT, ["tea"], shared=shared)
+    ((sql, params),) = fake.calls
+    assert sql.startswith("INSERT INTO memories (user_id, text, keywords, ")
+    assert sql.count("?") == len(params) == 6
+    assert params == ("alice", ROW_TEXT, "tea", STAMP, STAMP, flag)
+    assert type(params[-1]) is int
+    translated, bound = translate_sql(sql, params)
+    assert translated.count("%s") == 6 and bound == tuple(params)
+
+
+async def test_save_without_the_argument_binds_a_private_note(
+    fake: FakeMemoryRelational,
+):
+    await store_on(fake).save("alice", ROW_TEXT, ["tea"])
+    assert fake.calls[0][1][-1] == 0
+
+
+@pytest.mark.parametrize("dialect", ["postgres", "sqlite"])
+async def test_save_with_explicit_timestamps_binds_them_in_the_same_statement(
+    dialect: str,
+):
+    created, updated = "2026-10-01T08:00:00Z", "2026-10-02T08:00:00Z"
+    explicit = FakeMemoryRelational(dialect)
+    await store_on(explicit).save(
+        "alice", ROW_TEXT, ["tea"], created_at=created, updated_at=updated
+    )
+    default = FakeMemoryRelational(dialect)
+    await store_on(default).save("alice", ROW_TEXT, ["tea"])
+    ((sql, params),) = explicit.calls
+    ((default_sql, default_params),) = default.calls
+    assert sql == default_sql  # one INSERT ... RETURNING, no new statement
+    assert sql.startswith(
+        "INSERT INTO memories (user_id, text, keywords, created_at, updated_at, shared) "
+    )
+    assert sql.endswith(
+        "RETURNING id, user_id, text, keywords, created_at, updated_at, shared"
+    )
+    assert params == ("alice", ROW_TEXT, "tea", created, updated, 0)
+    assert default_params == ("alice", ROW_TEXT, "tea", STAMP, STAMP, 0)
+    translated, bound = translate_sql(sql, params)
+    assert translated.count("%s") == 6 and bound == tuple(params)
+
+
+async def test_has_text_is_one_exact_lookup_over_own_and_shared_notes(
+    fake: FakeMemoryRelational,
+):
+    fake.answer = lambda sql: [(1,)]
+    assert await store_on(fake).has_text("alice", ROW_TEXT) is True
+    fake.answer = lambda sql: []
+    assert await store_on(fake).has_text("alice", ROW_TEXT) is False
+    statement = (
+        "SELECT 1 FROM memories WHERE text = ? AND (user_id = ? OR shared = 1) LIMIT 1"
+    )
+    assert fake.calls == [(statement, (ROW_TEXT, "alice"))] * 2
+    translated, _ = translate_sql(statement, (ROW_TEXT, "alice"))
+    assert translated.count("%s") == 2
