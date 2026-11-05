@@ -50,6 +50,7 @@ from tests.test_cli import (
     scripted,
 )
 from tests.test_memory_index_store import Rig
+from tests.platform_marks import posix_only
 
 LIST = MemoryCommand("list")
 USAGE_COMMAND = MemoryCommand("usage")
@@ -1071,6 +1072,7 @@ def test_plain_text_that_merely_contains_memory_goes_to_the_model(
     assert provider.requests  # type: ignore[attr-defined]
 
 
+@posix_only
 def test_plain_memory_export_and_import(config_dir: Path, tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     data_dir.mkdir()

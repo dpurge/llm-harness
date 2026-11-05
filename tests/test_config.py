@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from pathlib import Path
@@ -39,6 +40,7 @@ from llm_harness.config import (
 )
 from llm_harness.redact import REDACTED, Secret
 from llm_harness.store import default_db_path
+from tests.platform_marks import posix_only
 
 CANARY = "sk-CANARY-123456789"
 
@@ -430,6 +432,7 @@ def test_missing_lists_only_absent_file(tmp_path: Path, absent: str):
 # --- examples ----------------------------------------------------------------
 
 
+@posix_only
 def test_write_examples_round_trip(tmp_path: Path):
     config_dir = tmp_path / "new" / "dir"
     missing = [
@@ -458,6 +461,7 @@ def test_write_examples_only_writes_missing_and_never_overwrites(tmp_path: Path)
     assert existing.read_text() == "keep me"
 
 
+@posix_only
 def test_write_examples_sets_mode_at_creation(tmp_path: Path):
     old = os.umask(0)
     try:
@@ -469,6 +473,7 @@ def test_write_examples_sets_mode_at_creation(tmp_path: Path):
     assert config_dir.stat().st_mode & 0o777 == 0o700
 
 
+@posix_only
 def test_write_examples_does_not_rely_on_chmod(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -500,14 +505,17 @@ def make_config_dir(tmp_path: Path, file_mode: int | None, dir_mode: int) -> Pat
     return config_dir
 
 
+@posix_only
 def test_no_warnings_for_private_file_and_dir(tmp_path: Path):
     assert permission_warnings(make_config_dir(tmp_path, 0o600, 0o700)) == []
 
 
+@posix_only
 def test_no_warning_for_missing_file(tmp_path: Path):
     assert permission_warnings(make_config_dir(tmp_path, None, 0o700)) == []
 
 
+@posix_only
 @pytest.mark.parametrize("mode", [0o644, 0o640, 0o604, 0o660, 0o606])
 def test_file_with_other_read_bits_includes_read_warning(tmp_path: Path, mode: int):
     config_dir = make_config_dir(tmp_path, mode, 0o700)
@@ -516,6 +524,7 @@ def test_file_with_other_read_bits_includes_read_warning(tmp_path: Path, mode: i
     assert expected in permission_warnings(config_dir)
 
 
+@posix_only
 @pytest.mark.parametrize("mode", [0o620, 0o602])
 def test_file_writable_by_others_warns(tmp_path: Path, mode: int):
     config_dir = make_config_dir(tmp_path, mode, 0o700)
@@ -525,6 +534,7 @@ def test_file_writable_by_others_warns(tmp_path: Path, mode: int):
     ]
 
 
+@posix_only
 @pytest.mark.parametrize("mode", [0o644, 0o640, 0o604])
 def test_read_only_exposure_gives_exactly_the_read_warning(tmp_path: Path, mode: int):
     config_dir = make_config_dir(tmp_path, mode, 0o700)
@@ -534,6 +544,7 @@ def test_read_only_exposure_gives_exactly_the_read_warning(tmp_path: Path, mode:
     ]
 
 
+@posix_only
 @pytest.mark.parametrize("mode", [0o775, 0o757, 0o777, 0o720, 0o702])
 def test_dir_writable_by_others_warns(tmp_path: Path, mode: int):
     config_dir = make_config_dir(tmp_path, 0o600, mode)
@@ -542,11 +553,13 @@ def test_dir_writable_by_others_warns(tmp_path: Path, mode: int):
     ]
 
 
+@posix_only
 @pytest.mark.parametrize("mode", [0o755, 0o750, 0o705, 0o700])
 def test_dir_readable_by_others_is_fine(tmp_path: Path, mode: int):
     assert permission_warnings(make_config_dir(tmp_path, 0o600, mode)) == []
 
 
+@posix_only
 def test_file_and_dir_problems_give_two_lines(tmp_path: Path):
     config_dir = make_config_dir(tmp_path, 0o644, 0o775)
     warnings = permission_warnings(config_dir)
@@ -554,6 +567,7 @@ def test_file_and_dir_problems_give_two_lines(tmp_path: Path):
     assert "readable" in warnings[0] and "writable" in warnings[1]
 
 
+@posix_only
 def test_world_writable_file_gives_read_and_write_warnings(tmp_path: Path):
     config_dir = make_config_dir(tmp_path, 0o666, 0o700)
     assert len(permission_warnings(config_dir)) == 2
@@ -997,7 +1011,10 @@ def test_invalid_utf8_yaml_is_a_config_error(tmp_path: Path):
     assert isinstance(load_error(tmp_path), ConfigError)
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root can read mode 000 files")
+@posix_only
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: 1)() == 0, reason="root can read mode 000 files"
+)
 @pytest.mark.parametrize("name", ["config.toml", "models.yaml"])
 def test_unreadable_file_is_a_config_error_with_type_name_only(
     tmp_path: Path, name: str
@@ -1620,6 +1637,72 @@ def test_command_timeout_accepts_the_range(seconds: int):
     )
 
 
+def test_command_backend_defaults_to_permissions_without_an_image():
+    tools = ToolsConfig()
+    assert (tools.command_backend, tools.command_image) == ("permissions", None)
+
+
+def test_a_valid_docker_config_loads(tmp_path: Path):
+    write_config(
+        tmp_path,
+        PROVIDER_TOML
+        + '[tools]\ncommand_backend = "docker"\ncommand_image = "python:3.12-slim"\n',
+    )
+    tools = load_config(tmp_path).tools
+    assert (tools.command_backend, tools.command_image) == (
+        "docker",
+        "python:3.12-slim",
+    )
+
+
+def test_an_image_is_accepted_but_unused_with_the_permissions_backend():
+    tools = ToolsConfig(command_image="anything")
+    assert (tools.command_backend, tools.command_image) == ("permissions", "anything")
+
+
+@pytest.mark.parametrize("image", [None, ""])
+def test_the_docker_backend_needs_an_image(image: object):
+    with pytest.raises(ValueError, match="needs command_image"):
+        ToolsConfig.model_validate(
+            {"command_backend": "docker", "command_image": image}
+        )
+
+
+def test_the_docker_backend_without_the_image_key_is_rejected_on_load(tmp_path: Path):
+    write_config(tmp_path, PROVIDER_TOML + '[tools]\ncommand_backend = "docker"\n')
+    assert 'command_backend = "docker" needs command_image' in str(load_error(tmp_path))
+
+
+@pytest.mark.parametrize("image", ["-v", "--privileged", "my image", "img\tx", "a\nb"])
+def test_the_docker_backend_rejects_unsafe_image_names(image: str):
+    with pytest.raises(ValueError, match="command_image"):
+        ToolsConfig.model_validate(
+            {"command_backend": "docker", "command_image": image}
+        )
+
+
+@pytest.mark.parametrize("backend", ["podman", "Docker", "", True, None])
+def test_command_backend_rejects_other_values(backend: object):
+    with pytest.raises(ValueError, match="command_backend"):
+        ToolsConfig.model_validate({"command_backend": backend})
+
+
+@pytest.mark.parametrize("key", ["command_backend", "command_image"])
+def test_the_example_config_documents_the_docker_keys(key: str):
+    assert _documented(EXAMPLE_CONFIG_TOML, key, separator="="), key
+
+
+def test_an_unknown_key_next_to_the_docker_keys_is_still_rejected(tmp_path: Path):
+    write_config(
+        tmp_path,
+        PROVIDER_TOML
+        + '[tools]\ncommand_backend = "docker"\ncommand_image = "x"\ncommand_imag = "y"\n',
+    )
+    assert "tools.command_imag: Extra inputs are not permitted" in str(
+        load_error(tmp_path)
+    )
+
+
 @pytest.mark.parametrize("seconds", [0, 121, -1, True, "30", 30.0])
 def test_command_timeout_rejects_out_of_range_and_non_integers(seconds: object):
     with pytest.raises(ValueError, match="command_timeout_seconds"):
@@ -1640,8 +1723,14 @@ def test_run_command_rejects_non_booleans(value: object):
         (["x y"], "{key} entry 'x y' must not contain whitespace"),
         (["a\tb"], "{key} entry 'a\\tb' must not contain whitespace"),
         (["git", "git"], "{key} has duplicate entries: git"),
-        (["bin/git"], "{key} entry 'bin/git' contains '/' so it must be an absolute"),
-        (["./git"], "{key} entry './git' contains '/' so it must be an absolute"),
+        (
+            ["bin/git"],
+            "{key} entry 'bin/git' contains a path separator so it must be an absolute",
+        ),
+        (
+            ["./git"],
+            "{key} entry './git' contains a path separator so it must be an absolute",
+        ),
     ],
 )
 def test_command_lists_reject_bad_entries(key: str, entries: list[str], message: str):
@@ -1652,7 +1741,7 @@ def test_command_lists_reject_bad_entries(key: str, entries: list[str], message:
 
 @pytest.mark.parametrize("key", ["command_allow", "command_deny"])
 def test_command_lists_accept_names_patterns_and_absolute_paths(key: str):
-    entries = ["git", "py*", "/usr/bin/git"]
+    entries = ["git", "py*", os.path.abspath("/usr/bin/git")]
     assert getattr(ToolsConfig.model_validate({key: entries}), key) == entries
 
 
@@ -1721,18 +1810,21 @@ def test_an_unknown_tools_key_is_still_rejected_next_to_command_keys(tmp_path: P
     )
 
 
+ABS_LS = os.path.abspath("/bin/ls")
+
+
 def test_command_keys_parse_from_toml(tmp_path: Path):
     write_config(
         tmp_path,
         PROVIDER_TOML
         + "[tools]\nrun_command = true\ncommand_timeout_seconds = 60\n"
-        + 'command_allow = ["git"]\ncommand_deny = ["rm*", "/bin/ls"]\n',
+        + f'command_allow = ["git"]\ncommand_deny = ["rm*", {json.dumps(ABS_LS)}]\n',
     )
     tools = load_config(tmp_path).tools
     assert tools.run_command is True
     assert tools.command_timeout_seconds == 60
     assert tools.command_allow == ["git"]
-    assert tools.command_deny == ["rm*", "/bin/ls"]
+    assert tools.command_deny == ["rm*", ABS_LS]
 
 
 @pytest.mark.parametrize("value", ["0", "121", "true", '"30"'])
@@ -1748,6 +1840,7 @@ def test_the_example_config_documents_the_command_keys(key: str):
     assert _documented(EXAMPLE_CONFIG_TOML, key, separator="="), key
 
 
+@posix_only  # the shipped example names a POSIX path
 def test_the_example_config_with_command_lines_switched_on_loads(tmp_path: Path):
     lines = [
         line.removeprefix("# ")

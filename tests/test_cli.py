@@ -55,6 +55,7 @@ from llm_harness.types import (
 )
 from tests.fake_steps import as_step_reply
 from tests.fakes import ScriptedProvider as RawScriptedProvider
+from tests.platform_marks import posix_only
 
 
 class ScriptedProvider(RawScriptedProvider):
@@ -391,6 +392,7 @@ def test_model_flag_naming_a_chat_model_still_works_with_an_embedding_entry(
     assert [model.id for _, model, _, _ in runner.calls] == ["m1"]
 
 
+@posix_only
 def test_tui_path_warns_about_loose_config_permissions(config_dir: Path) -> None:
     (config_dir / CONFIG_FILE).chmod(0o644)
     runner = FakeTuiRunner()
@@ -626,6 +628,7 @@ def test_gui_path_reports_an_unknown_model_without_starting(config_dir: Path) ->
     assert runner.calls == []
 
 
+@posix_only
 def test_gui_path_warns_about_loose_config_permissions(config_dir: Path) -> None:
     (config_dir / CONFIG_FILE).chmod(0o644)
     runner = FakeTuiRunner()
@@ -816,6 +819,7 @@ def test_first_run_interactive_declined_writes_nothing(
     assert not target.exists()
 
 
+@posix_only
 def test_first_run_interactive_yes_writes_loadable_examples(tmp_path: Path) -> None:
     target = tmp_path / "new"
     result = run_cli(["--plain"], target, stdin="y\n", stdin_tty=True)
@@ -854,6 +858,7 @@ def test_model_flag_overrides_default(config_dir: Path) -> None:
     assert provider.requests[0].model == "other-model-id"
 
 
+@posix_only
 def test_permission_warning_for_loose_config(config_dir: Path) -> None:
     (config_dir / CONFIG_FILE).chmod(0o644)
     _, factory = scripted(*reply_events())
@@ -862,6 +867,7 @@ def test_permission_warning_for_loose_config(config_dir: Path) -> None:
     assert str(config_dir / CONFIG_FILE) in result.err
 
 
+@posix_only
 def test_permission_warning_for_writable_config_dir(config_dir: Path) -> None:
     config_dir.chmod(0o775)
     _, factory = scripted(*reply_events())
@@ -870,6 +876,7 @@ def test_permission_warning_for_writable_config_dir(config_dir: Path) -> None:
     assert f"chmod 700 {config_dir}" in result.err
 
 
+@posix_only
 def test_each_permission_problem_gets_its_own_stderr_line(config_dir: Path) -> None:
     (config_dir / CONFIG_FILE).chmod(0o666)
     config_dir.chmod(0o777)

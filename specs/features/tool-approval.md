@@ -9,7 +9,7 @@ branch: main
 
 ## Problem / Motivation
 
-Feature 1 of 4 that split the roadmap item `tools-first-set` (order: `tool-approval`, `web-tools`, `command-execution`, `memory`; a Docker backend comes later). `tool-registry` (done) made tools typed and discoverable.
+Feature 1 of 4 that split the roadmap item `tools-first-set` (order: `tool-approval`, `web-tools`, `command-execution`, `memory`; a Docker backend comes later). `tool-registry` (done) made tools typed and discoverable. (Superseded by command-execution-docker (2026-11-05): the Docker backend is built; see `specs/features/command-execution-docker.md`.)
 
 `Orchestrator._call_tool` (`src/llm_harness/orchestrator.py`, about lines 451-480) runs a tool as soon as the allowed-set check and pydantic validation pass. There is no approval hook. The only access control is static agent config (`AgentConfig.tools` and `deny`). The upcoming tools (`web_fetch`, `run_command`, memory writes) need a human gate before they run.
 
@@ -31,7 +31,7 @@ All tests run offline and deterministically, with `ScriptedProvider`, a stub wri
 3. In `_call_tool` the order is: allowed-set check, argument validation, approval (only when risk is not `read`), run. Invalid arguments are never sent for approval.
 4. A `read` tool never asks. A `write` or `exec` tool that is approved runs. A denied call does not run and returns `tool X was not run: the user denied it`. With no approver the result is `tool X was not run: it needs the user's approval and none is available here`. An approver that raises counts as a deny (the error text is redacted). `CancelledError` propagates.
 5. The `tool_call` span records the attribute `approval` with one of `not_required`, `approved`, `denied`, `unavailable`. A deny sets span status `rejected` (already used at `orchestrator.py:305`). Spans are masked with `redact` on close.
-6. Subagents built by `SubagentRun` (`subagents.py`, about lines 99-114) get no approver, so their write and exec calls are denied. Passing the parent's approver is out of scope.
+6. Subagents built by `SubagentRun` (`subagents.py`, about lines 99-114) get no approver, so their write and exec calls are denied. Passing the parent's approver is out of scope. (Superseded by command-execution-docker (2026-11-05): `SubagentRun` now takes the parent's approver and passes it to the child, so a subagent's write and exec calls ask the human with `agent: <id>`; with no approver (piped `--plain`) they are still denied.)
 7. CLI: the prompt goes to stderr, `y` or `yes` (case and surrounding spaces ignored) allows, anything else denies, and the answer is read with the existing `_read_line` inside the turn. When stdin is not a terminal the CLI passes NO approver (calls needing approval are denied with the "none is available here" text), because a buffered or piped line must not answer an approval. On a terminal, input typed ahead is flushed before the prompt is written.
 8. TUI: a `Future` plus an approval mode in `on_input_submitted`, checked before the turn-running early return (`tui/app.py`, about line 281); the prompt is rendered with `Static(markup=False)`. The same y/yes rule as the CLI applies. Stop is the Escape key (`Binding("escape", "cancel_turn")` in `tui/app.py`), not Ctrl-C. An empty Enter keeps waiting; any other non-empty text denies, including a typed `/export`.
 9. GUI: Approve and Deny buttons and a plain `ui.label` (never `ui.html` or markdown) in a full-width log. Project rule: full browser width and viewport height, base text at least 18px, secondary text at least 15px, no narrow centred columns, no fixed-height boxes; pinned by tests on the code and classes, no screenshots. The approver is bound to the page that owns the orchestrator (`gui/app.py`, about lines 170-172).
@@ -101,11 +101,11 @@ Unknowns to verify at implementation (print from the installed packages, do not 
 ## Out of Scope
 
 - `web_fetch` and `web_search`.
-- `run_command`, an executor and the Docker backend.
+- `run_command`, an executor and the Docker backend. (Superseded by command-execution-docker (2026-11-05): `run_command`, an executor and the Docker backend are built, see `specs/features/command-execution.md` and `specs/features/command-execution-docker.md`.)
 - Memory tools.
 - Session or persistent allow lists.
 - Per-command allowlists.
-- Propagating the parent's approver to subagents.
+- Propagating the parent's approver to subagents. (Superseded by command-execution-docker (2026-11-05): done; `orchestrator.py` `_delegate` passes `approver=self._approver` into `SubagentRun`.)
 - Remote or multi-user approval.
 - Parking a call across turns.
 - Model status text imitating the prompt (follow-up).

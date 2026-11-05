@@ -15,6 +15,7 @@ from llm_harness.memory_command import escape_text
 from llm_harness.state_files import EXPORT_COMMAND, IMPORT_COMMAND
 
 HELP_COMMAND = "/help"
+UI_DEMO_COMMAND = "/ui-demo"
 PLAIN = "plain"
 TUI = "tui"
 GUI = "gui"
@@ -60,6 +61,15 @@ COMMANDS: tuple[Command, ...] = (
         "  /help          one line per command of this front end\n"
         "  /help COMMAND  the detail of one command, with or without the slash",
         "help",
+    ),
+    Command(
+        UI_DEMO_COMMAND,
+        "",
+        "draw a demo A2UI surface (no model call)",
+        _ONLY_GUI,
+        f"usage: {UI_DEMO_COMMAND}\n"
+        "  draw a fixed A2UI surface in the chat; clicking its button shows the action",
+        "ui-demo",
     ),
     Command(
         "/quit",

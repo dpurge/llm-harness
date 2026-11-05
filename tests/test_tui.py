@@ -42,6 +42,7 @@ from llm_harness.types import (
 from tests.fake_steps import ScriptedSteps, as_step_reply, reply_events
 from tests.fakes import ScriptedProvider, router_factory_for
 from tests.test_gui import AddFactory
+from tests.platform_marks import posix_only
 
 CONFIG = HarnessConfig.model_validate(
     {
@@ -1481,6 +1482,7 @@ async def test_a_pasted_multi_line_text_keeps_only_its_first_line_in_the_tui() -
 # `/memory export` and `/memory import`: files, no model, in the turn worker group
 
 
+@posix_only
 async def test_memory_export_and_import_in_the_tui(tmp_path: Path) -> None:
     (tmp_path / "alice").mkdir()
     (tmp_path / "bob").mkdir()

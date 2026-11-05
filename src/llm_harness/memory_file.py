@@ -11,6 +11,7 @@ import os
 import stat
 from pathlib import Path
 
+from llm_harness import pathing
 from llm_harness.display import escape_text
 from llm_harness.state_files import resolve_path
 
@@ -47,7 +48,9 @@ def _open_regular(path: Path, shown: str) -> bytes:
     _check_size(info.st_size)
     try:
         # O_NONBLOCK: opening a FIFO that replaced the file must not wait for a writer.
-        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        descriptor = os.open(
+            path, os.O_RDONLY | pathing.nonblock_flag() | pathing.binary_flag()
+        )
         with os.fdopen(descriptor, "rb") as handle:
             if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
                 raise TextFileError(f"not a regular file: {shown}")

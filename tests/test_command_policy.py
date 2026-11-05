@@ -3,18 +3,24 @@
 The fake programs are empty files with the executable bit; nothing is ever run.
 """
 
+import ntpath
 import os
+import posixpath
 from pathlib import Path
 
 import pytest
 
+from llm_harness import pathing
+from llm_harness.pathing import has_separator
 from llm_harness.command_policy import (
     DEFAULT_COMMAND_DENY,
     CommandDenied,
+    _names,
     check_policy,
     child_path,
     resolve_program,
 )
+from tests.platform_marks import posix_only
 
 # One concrete name per built-in pattern (`mkfs*` is covered by `mkfs.ext4`).
 _DENIED_NAMES = [
@@ -48,10 +54,11 @@ def _check(
 
 
 def test_the_built_in_list_has_every_documented_name() -> None:
-    assert len(DEFAULT_COMMAND_DENY) == len(set(DEFAULT_COMMAND_DENY)) == 45
-    assert len(_DENIED_NAMES) == 45
+    assert len(DEFAULT_COMMAND_DENY) == len(set(DEFAULT_COMMAND_DENY)) == 51
+    assert len(_DENIED_NAMES) == 51
 
 
+@posix_only
 @pytest.mark.parametrize("name", _DENIED_NAMES)
 def test_every_built_in_name_is_denied(name: str, bindir: Path, tmp_path: Path) -> None:
     _make_exe(bindir, name)
@@ -59,6 +66,7 @@ def test_every_built_in_name_is_denied(name: str, bindir: Path, tmp_path: Path) 
         _check(name, bindir, tmp_path)
 
 
+@posix_only
 @pytest.mark.parametrize("name", _ACCEPTED_NAMES)
 def test_interpreters_git_and_rm_are_accepted_by_default(
     name: str, bindir: Path, tmp_path: Path
@@ -67,6 +75,7 @@ def test_interpreters_git_and_rm_are_accepted_by_default(
     assert _check(name, bindir, tmp_path) == program
 
 
+@posix_only
 def test_a_symlink_to_a_denied_program_is_denied_and_names_the_real_path(
     bindir: Path, tmp_path: Path
 ) -> None:
@@ -81,6 +90,7 @@ def test_a_symlink_to_a_denied_program_is_denied_and_names_the_real_path(
     assert "built-in deny list" in message
 
 
+@posix_only
 @pytest.mark.parametrize("name", ["BASH", "Bash", "Curl", "MKFS.ext4"])
 def test_case_variants_of_a_denied_name_are_denied(
     name: str, bindir: Path, tmp_path: Path
@@ -91,6 +101,7 @@ def test_case_variants_of_a_denied_name_are_denied(
         _check(name, bindir, tmp_path)
 
 
+@posix_only
 def test_a_deny_entry_is_case_folded_against_the_given_name(
     bindir: Path, tmp_path: Path
 ) -> None:
@@ -101,6 +112,7 @@ def test_a_deny_entry_is_case_folded_against_the_given_name(
         _check("Tool", bindir, tmp_path, deny=("t?ol",))
 
 
+@posix_only
 def test_the_real_name_is_matched_even_when_the_given_name_is_harmless(
     bindir: Path, tmp_path: Path
 ) -> None:
@@ -111,6 +123,7 @@ def test_the_real_name_is_matched_even_when_the_given_name_is_harmless(
         _check("harmless", bindir, tmp_path, deny=("secret",))
 
 
+@posix_only
 def test_deny_beats_allow(bindir: Path, tmp_path: Path) -> None:
     _make_exe(bindir, "tool")
     with pytest.raises(CommandDenied, match="command_deny"):
@@ -123,6 +136,7 @@ def test_the_built_in_list_beats_allow(bindir: Path, tmp_path: Path) -> None:
         _check("bash", bindir, tmp_path, allow=("bash",))
 
 
+@posix_only
 def test_an_empty_allow_list_accepts_anything_not_denied(
     bindir: Path, tmp_path: Path
 ) -> None:
@@ -130,6 +144,7 @@ def test_an_empty_allow_list_accepts_anything_not_denied(
     assert _check("tool", bindir, tmp_path, deny=("other",)) == program
 
 
+@posix_only
 def test_a_non_empty_allow_list_accepts_a_match_and_refuses_the_rest(
     bindir: Path, tmp_path: Path
 ) -> None:
@@ -140,6 +155,7 @@ def test_a_non_empty_allow_list_accepts_a_match_and_refuses_the_rest(
         _check("bad", bindir, tmp_path, allow=("good",))
 
 
+@posix_only
 def test_an_allow_entry_is_an_fnmatch_basename_pattern(
     bindir: Path, tmp_path: Path
 ) -> None:
@@ -150,6 +166,7 @@ def test_an_allow_entry_is_an_fnmatch_basename_pattern(
         _check("ruby", bindir, tmp_path, allow=("py*",))
 
 
+@posix_only
 def test_an_allow_pattern_cannot_match_across_directories(
     bindir: Path, tmp_path: Path
 ) -> None:
@@ -158,6 +175,7 @@ def test_an_allow_pattern_cannot_match_across_directories(
         _check("tool", bindir, tmp_path, allow=("bin*tool",))
 
 
+@posix_only
 def test_an_absolute_allow_entry_matches_the_resolved_path(
     bindir: Path, tmp_path: Path
 ) -> None:
@@ -167,6 +185,7 @@ def test_an_absolute_allow_entry_matches_the_resolved_path(
         _check("tool", bindir, tmp_path, allow=(str(program) + "x",))
 
 
+@posix_only
 def test_an_absolute_allow_entry_matches_the_real_path_of_a_symlink(
     bindir: Path, tmp_path: Path
 ) -> None:
@@ -179,6 +198,7 @@ def test_an_absolute_allow_entry_matches_the_real_path_of_a_symlink(
     assert _check("alias", bindir, tmp_path, allow=(str(link),)) == link
 
 
+@posix_only
 def test_an_absolute_path_entry_is_not_a_pattern_and_not_case_folded(
     bindir: Path, tmp_path: Path
 ) -> None:
@@ -189,6 +209,7 @@ def test_an_absolute_path_entry_is_not_a_pattern_and_not_case_folded(
         _check("tool", bindir, tmp_path, allow=(str(program).upper(),))
 
 
+@posix_only
 def test_absolute_deny_entries_match_resolved_and_real_path(
     bindir: Path, tmp_path: Path
 ) -> None:
@@ -202,6 +223,7 @@ def test_absolute_deny_entries_match_resolved_and_real_path(
         _check("alias", bindir, tmp_path, deny=(os.path.realpath(real),))
 
 
+@posix_only
 def test_only_argv0_is_examined(bindir: Path, tmp_path: Path) -> None:
     program = _make_exe(bindir, "tool")
     assert check_policy(["tool", "bash", "-c", "x"], tmp_path, str(bindir), (), ()) == (
@@ -209,6 +231,7 @@ def test_only_argv0_is_examined(bindir: Path, tmp_path: Path) -> None:
     )
 
 
+@posix_only
 def test_a_relative_name_with_a_slash_resolves_against_cwd(
     bindir: Path, tmp_path: Path
 ) -> None:
@@ -218,6 +241,7 @@ def test_a_relative_name_with_a_slash_resolves_against_cwd(
     assert check_policy(["./sub/tool"], work, str(bindir), (), ()).samefile(program)
 
 
+@posix_only
 def test_dot_dot_cannot_hide_a_denied_name(bindir: Path, tmp_path: Path) -> None:
     _make_exe(tmp_path / "work", "bash")
     (tmp_path / "work" / "sub").mkdir()
@@ -225,11 +249,13 @@ def test_dot_dot_cannot_hide_a_denied_name(bindir: Path, tmp_path: Path) -> None
         check_policy(["sub/../bash"], tmp_path / "work", str(bindir), (), ())
 
 
+@posix_only
 def test_an_absolute_name_is_used_as_it_is(bindir: Path, tmp_path: Path) -> None:
     program = _make_exe(tmp_path / "elsewhere", "tool")
     assert check_policy([str(program)], tmp_path, str(bindir), (), ()) == program
 
 
+@posix_only
 def test_a_relative_path_entry_is_never_searched(
     bindir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -242,16 +268,19 @@ def test_a_relative_path_entry_is_never_searched(
             check_policy(["zz-cwd-only-tool"], tmp_path, path, (), ())
 
 
+@posix_only
 def test_child_path_keeps_absolute_entries_in_order_without_repeats() -> None:
     raw = os.pathsep.join(["/b", "", ".", "rel/dir", "/a", "/b", "/c"])
     assert child_path(raw) == os.pathsep.join(["/b", "/a", "/c"])
 
 
+@posix_only
 @pytest.mark.parametrize("raw", [None, "", ":", ".:rel", "rel"])
 def test_child_path_falls_back_to_a_fixed_default(raw: str | None) -> None:
     assert child_path(raw) == "/usr/local/bin:/usr/bin:/bin"
 
 
+@posix_only
 def test_a_missing_program_is_refused(bindir: Path, tmp_path: Path) -> None:
     bindir.mkdir()
     with pytest.raises(CommandDenied, match="'nothing' not found"):
@@ -260,6 +289,7 @@ def test_a_missing_program_is_refused(bindir: Path, tmp_path: Path) -> None:
         check_policy(["./nothing"], tmp_path, str(bindir), (), ())
 
 
+@posix_only
 def test_a_directory_is_refused(bindir: Path, tmp_path: Path) -> None:
     (bindir / "adir").mkdir(parents=True)
     with pytest.raises(CommandDenied, match="not a file|not found"):
@@ -268,6 +298,7 @@ def test_a_directory_is_refused(bindir: Path, tmp_path: Path) -> None:
         check_policy([str(bindir / "adir")], tmp_path, str(bindir), (), ())
 
 
+@posix_only
 def test_a_non_executable_file_is_refused(bindir: Path, tmp_path: Path) -> None:
     bindir.mkdir()
     (bindir / "plain").write_text("")
@@ -278,6 +309,7 @@ def test_a_non_executable_file_is_refused(bindir: Path, tmp_path: Path) -> None:
         check_policy([str(bindir / "plain")], tmp_path, str(bindir), (), ())
 
 
+@posix_only
 def test_a_dangling_symlink_is_refused(bindir: Path, tmp_path: Path) -> None:
     bindir.mkdir()
     (bindir / "dead").symlink_to(tmp_path / "missing")
@@ -285,11 +317,13 @@ def test_a_dangling_symlink_is_refused(bindir: Path, tmp_path: Path) -> None:
         check_policy([str(bindir / "dead")], tmp_path, str(bindir), (), ())
 
 
+@posix_only
 def test_an_empty_argv_is_refused(bindir: Path, tmp_path: Path) -> None:
     with pytest.raises(CommandDenied, match="argv is empty"):
         check_policy([], tmp_path, str(bindir), (), ())
 
 
+@posix_only
 @pytest.mark.parametrize("name", ["", "a\0b"])
 def test_an_empty_name_or_one_with_nul_is_refused(
     name: str, bindir: Path, tmp_path: Path
@@ -298,6 +332,7 @@ def test_an_empty_name_or_one_with_nul_is_refused(
         check_policy([name], tmp_path, str(bindir), (), ())
 
 
+@posix_only
 def test_the_message_escapes_control_characters_and_cuts_a_long_name(
     bindir: Path, tmp_path: Path
 ) -> None:
@@ -309,6 +344,7 @@ def test_the_message_escapes_control_characters_and_cuts_a_long_name(
     assert len(message) < 300
 
 
+@posix_only
 def test_the_result_is_absolute_and_is_the_symlink_not_its_target(
     bindir: Path, tmp_path: Path
 ) -> None:
@@ -322,9 +358,78 @@ def test_the_result_is_absolute_and_is_the_symlink_not_its_target(
     assert result != Path(os.path.realpath(real))
 
 
+@posix_only
 def test_resolve_program_returns_an_absolute_path_for_a_relative_search_path(
     bindir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _make_exe(bindir, "tool")
     monkeypatch.chdir(tmp_path)
     assert resolve_program("tool", tmp_path, "bin").is_absolute()
+
+
+@pytest.mark.parametrize(
+    ("text", "module", "expected"),
+    [
+        ("git", posixpath, False),
+        ("/usr/bin/git", posixpath, True),
+        ("bin/git", posixpath, True),
+        ("a\\b", posixpath, False),
+        ("git", ntpath, False),
+        ("C:\\tools\\git.exe", ntpath, True),
+        ("bin\\git.exe", ntpath, True),
+        ("bin/git.exe", ntpath, True),
+        ("C:git.exe", ntpath, False),
+    ],
+)
+def test_has_separator_follows_the_platform_separators(text, module, expected):
+    assert has_separator(text, module) is expected
+
+
+def test_windows_drive_paths_are_absolute_and_relative_ones_are_not():
+    assert ntpath.isabs("C:\\tools\\git.exe")
+    assert not ntpath.isabs("bin\\git.exe")
+
+
+# --- Windows behaviour, simulated: the platform helpers are patched ------------
+
+
+@pytest.fixture
+def windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(pathing, "has_posix_modes", lambda: False)
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    monkeypatch.setenv("SystemRoot", "C:\\Windows")
+
+
+def test_windows_extension_is_ignored_when_matching_entries(
+    windows: None, bindir: Path, tmp_path: Path
+) -> None:
+    _make_exe(bindir, "git.exe")
+    assert _check("git.exe", bindir, tmp_path, allow=("git",)).name == "git.exe"
+    with pytest.raises(CommandDenied, match="command_deny"):
+        _check("git.exe", bindir, tmp_path, deny=("git",))
+
+
+@pytest.mark.parametrize("name", ["cmd.exe", "CMD.EXE", "powershell.exe", "pwsh.exe"])
+def test_windows_shells_are_denied_by_the_built_in_list(
+    windows: None, bindir: Path, tmp_path: Path, name: str
+) -> None:
+    _make_exe(bindir, name)
+    with pytest.raises(CommandDenied, match="built-in deny list"):
+        _check(name, bindir, tmp_path)
+
+
+def test_a_bare_extension_is_not_stripped_to_an_empty_name(windows: None) -> None:
+    assert _names(Path(".exe")) == {".exe"}
+
+
+@posix_only
+@posix_only
+def test_extension_is_kept_on_posix(bindir: Path) -> None:
+    assert _names(Path("git.exe")) == {"git.exe"}
+
+
+def test_windows_fallback_path_is_system32(
+    windows: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(os, "pathsep", ";")
+    assert child_path("") == os.path.join("C:\\Windows", "System32") + ";C:\\Windows"

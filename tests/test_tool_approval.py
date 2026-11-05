@@ -14,11 +14,14 @@ from llm_harness.types import Done
 from tests import test_subagents
 from tests.fake_steps import reply_events
 from tests.test_orchestrator import (
+    RESEARCHER,
     RESPOND,
     SET_GOAL,
     StubTool,
     call,
+    delegate,
     make,
+    make_delegating,
     observation,
     registry,
     run,
@@ -181,20 +184,94 @@ async def test_arguments_text_is_sorted_unmasked_and_not_truncated() -> None:
     )
 
 
-async def test_a_child_subagents_write_tool_is_denied() -> None:
+def child_with_write_tool(
+    approver: object | None,
+) -> tuple[test_subagents.SubagentRun, object, test_subagents.StubTool]:
     stub = test_subagents.StubTool("search")
     stub.risk = "write"
     tools = test_subagents.ToolRegistry()
     tools.register(stub)
-    child_call = {"type": "call_tool", "tool": "search", "arguments": {}}
+    child_call = {"type": "call_tool", "tool": "search", "arguments": {"q": "x"}}
     child, provider = test_subagents.make(
-        [reply_events(child_call), reply_events(test_subagents.RESPOND)], tools=tools
+        [reply_events(child_call), reply_events(test_subagents.RESPOND)],
+        tools=tools,
+        approver=approver,
     )
+    return child, provider, stub
+
+
+async def test_an_approved_child_write_tool_runs_and_the_request_names_the_child() -> (
+    None
+):
+    approver = FakeApprover(True)
+    child, provider, stub = child_with_write_tool(approver)
+    await test_subagents.drain(child)
+    assert stub.calls == 1
+    assert approver.requests == [
+        ApprovalRequest(
+            tool="search",
+            risk="write",
+            agent_id=test_subagents.CHILD.id,
+            arguments_text='{"q": "x"}',
+        )
+    ]
+    assert test_subagents.observation(provider.requests[1]) == (
+        "tool search result: found it"
+    )
+
+
+async def test_a_child_write_tool_the_human_denies_is_not_run() -> None:
+    approver = FakeApprover(False)
+    child, provider, stub = child_with_write_tool(approver)
+    await test_subagents.drain(child)
+    assert stub.calls == 0 and len(approver.requests) == 1
+    assert test_subagents.observation(provider.requests[1]) == (
+        "tool search was not run: the user denied it"
+    )
+
+
+async def test_a_child_write_tool_without_an_approver_is_still_denied() -> None:
+    child, provider, stub = child_with_write_tool(None)
     await test_subagents.drain(child)
     assert stub.calls == 0
     assert test_subagents.observation(provider.requests[1]) == (
         "tool search was not run: it needs the user's approval and none is available here"
     )
+
+
+async def test_the_parents_approver_gets_the_delegated_childs_tool_call() -> None:
+    stub = tool_with_risk("write")
+    stub.name = "act"
+    researcher = RESEARCHER.model_copy(update={"tools": ["act"]})
+    parent_approver = FakeApprover(True)
+    orchestrator, parent, children, _ = make_delegating(
+        [reply_events(delegate(), SET_GOAL), reply_events(RESPOND)],
+        [
+            [
+                reply_events(call("act", path="a")),
+                reply_events(delegate()),
+                reply_events({"type": "respond", "text": "done"}),
+            ]
+        ],
+        agents=(researcher,),
+        tools=registry(stub),
+        approver=parent_approver,
+    )
+    await run(orchestrator, "go")
+    assert parent_approver.requests == [
+        ApprovalRequest(
+            tool="act",
+            risk="write",
+            agent_id="researcher",
+            arguments_text='{"path": "a"}',
+        )
+    ]
+    assert stub.calls == [{"path": "a"}]
+    # the child cannot delegate further, and still finishes
+    assert observation(children[0].requests[2]) == (
+        "delegate is not available to subagents"
+    )
+    assert observation(parent.requests[1]) == "done"
 
 
 # --- hardening (security review 2026-10-30) ----------------------------------

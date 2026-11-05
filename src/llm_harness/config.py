@@ -3,6 +3,7 @@
 import importlib.util
 import math
 import os
+import re
 import tomllib
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
@@ -25,6 +26,8 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
+from llm_harness import pathing
+from llm_harness.pathing import has_separator
 from llm_harness.redact import Secret
 
 CONFIG_FILE = "config.toml"
@@ -522,9 +525,21 @@ class ToolsConfig(_Frozen):
     # Longest a command may run, in seconds (1 to 120).
     command_timeout_seconds: Annotated[StrictInt, Field(ge=1, le=120)] = 30
     # Program names or absolute paths that may run; empty allows any command not denied.
+    # Under `command_backend = "docker"` only the program NAME is matched, so use plain
+    # names (a path entry matches only that exact text); inside the container the list
+    # guards against mistakes and is not a sandbox.
     command_allow: list[str] = []
     # Program names or absolute paths that never run; wins over command_allow.
+    # Under the docker backend, the same name-only matching applies.
     command_deny: list[str] = []
+    # Where `run_command` runs: "permissions" on this machine, "docker" in a fresh
+    # container of `command_image` (outbound network; the working directory is
+    # mounted read-write at /work; the image is never pulled). Under docker the
+    # `cwd` may be any host directory and the container runs as the image's user
+    # (often root), so read the `cwd` shown in the approval prompt.
+    command_backend: Literal["permissions", "docker"] = "permissions"
+    # Local Docker image for `command_backend = "docker"`; unused otherwise.
+    command_image: str | None = None
     # `user_id` values that may run `/memory publish` and `/memory unpublish`; empty
     # means nobody can publish a shared memory.
     memory_admins: list[str] = []
@@ -551,17 +566,35 @@ class ToolsConfig(_Frozen):
     def _command_entry_rules(cls, values: list[str], info: ValidationInfo) -> list[str]:
         return _check_command_list(str(info.field_name), values)
 
+    @model_validator(mode="after")
+    def _command_image_rules(self) -> Self:
+        if self.command_backend != "docker":
+            return self
+        image = self.command_image
+        if image is None or not image:
+            raise ValueError(
+                'command_backend = "docker" needs command_image, a local image '
+                'name such as command_image = "python:3.12-slim"'
+            )
+        if any(c.isspace() for c in image):
+            raise ValueError(f"command_image {image!r} must not contain whitespace")
+        if image.startswith("-"):
+            raise ValueError(f"command_image {image!r} must not start with '-'")
+        return self
+
 
 def _check_command_list(key: str, values: list[str]) -> list[str]:
     for value in values:
         if not value:
             raise ValueError(f"{key} entry must not be empty")
-        if any(c.isspace() for c in value):
+        # A path may hold spaces (`C:\\Program Files\\...`); a bare name may not.
+        allowed_space = " " if has_separator(value) else ""
+        if any(c.isspace() and c != allowed_space for c in value):
             raise ValueError(f"{key} entry {value!r} must not contain whitespace")
-        if "/" in value and not value.startswith("/"):
+        if has_separator(value) and not os.path.isabs(value):
             raise ValueError(
-                f"{key} entry {value!r} contains '/' so it must be an absolute path "
-                "starting with '/'; use a bare program name to match any directory"
+                f"{key} entry {value!r} contains a path separator so it must be an "
+                "absolute path; use a bare program name to match any directory"
             )
     duplicates = sorted({v for v in values if values.count(v) > 1})
     if duplicates:
@@ -579,6 +612,36 @@ def _check_tag_list(values: list[str]) -> list[str]:
     if duplicates:
         raise ValueError(f"duplicate entries: {', '.join(duplicates)}")
     return values
+
+
+_HOST_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def _check_media_hosts(values: list[str]) -> list[str]:
+    for value in values:
+        labels = value.split(".")
+        if len(value) > 253 or not all(
+            _HOST_LABEL.fullmatch(label) for label in labels
+        ):
+            raise ValueError(
+                f"a2ui_media_hosts entry {value!r} must be a lowercase host name "
+                "(letters, digits, dots, hyphens; no scheme, path, port or wildcard), "
+                'for example "images.example.com"'
+            )
+    duplicates = sorted({v for v in values if values.count(v) > 1})
+    if duplicates:
+        raise ValueError(
+            f"a2ui_media_hosts has duplicate entries: {', '.join(duplicates)}"
+        )
+    return values
+
+
+class GuiConfig(_Frozen):
+    # Hosts the web GUI may load A2UI images, video and audio from, besides this
+    # server and data: images. Exact host names only; empty (the default) allows none.
+    a2ui_media_hosts: list[str] = []
+
+    _media_host_rules = field_validator("a2ui_media_hosts")(_check_media_hosts)
 
 
 class AgentConfig(_Frozen):
@@ -633,6 +696,7 @@ class HarnessConfig(_Frozen):
     user_id: str | None = None
     storage: StorageConfig = StorageConfig()
     tools: ToolsConfig = ToolsConfig()
+    gui: GuiConfig = GuiConfig()
     agents: list[AgentConfig] = []
     # From secrets.toml; each is read only when its backend is selected.
     qdrant_api_key: Secret | None = None
@@ -725,6 +789,19 @@ def _load_tools(raw: object) -> ToolsConfig:
         raise _format_validation_error(CONFIG_FILE, exc) from None
 
 
+def _load_gui(raw: object) -> GuiConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"invalid {CONFIG_FILE}: gui must be a table, not "
+            f"{type(raw).__name__}; write it as [gui]"
+        )
+    try:
+        # Wrapped so error locations start with "gui".
+        return TypeAdapter(dict[str, GuiConfig]).validate_python({"gui": raw})["gui"]
+    except ValidationError as exc:
+        raise _format_validation_error(CONFIG_FILE, exc) from None
+
+
 def load_config(config_dir: Path) -> HarnessConfig:
     config_path = config_dir / CONFIG_FILE
     models_path = config_dir / MODELS_FILE
@@ -736,7 +813,9 @@ def load_config(config_dir: Path) -> HarnessConfig:
         raise MissingConfigError(missing)
 
     toml_data = _read_toml(config_path)
-    unknown = sorted(set(toml_data) - {"providers", "user_id", "storage", "tools"})
+    unknown = sorted(
+        set(toml_data) - {"providers", "user_id", "storage", "tools", "gui"}
+    )
     if unknown:
         raise ConfigError(
             f"invalid {CONFIG_FILE}: unknown top-level keys: {', '.join(unknown)}"
@@ -759,6 +838,7 @@ def load_config(config_dir: Path) -> HarnessConfig:
         raise ConfigError(f"invalid {CONFIG_FILE}: {exc}") from None
     storage = _load_storage(toml_data.get("storage", {}))
     tools = _load_tools(toml_data.get("tools", {}))
+    gui = _load_gui(toml_data.get("gui", {}))
 
     models = _load_models(models_path)
     agents = _load_agents(agents_path, models)
@@ -777,6 +857,7 @@ def load_config(config_dir: Path) -> HarnessConfig:
             user_id=user_id,
             storage=storage,
             tools=tools,
+            gui=gui,
             agents=agents,
             qdrant_api_key=secrets.qdrant_api_key if secrets and uses_qdrant else None,
             postgres_password=(
@@ -836,6 +917,8 @@ def resolve_api_key(provider: ProviderConfig) -> Secret | None:
 
 def permission_warnings(config_dir: Path) -> list[str]:
     """One line per permission problem that could expose or redirect the API key."""
+    if not pathing.has_posix_modes():
+        return []  # mode bits carry no access information on Windows
     warnings = []
     config_path = config_dir / CONFIG_FILE
     try:
@@ -1048,6 +1131,16 @@ base_url = "http://localhost:11434"
 # command_timeout_seconds = 30         # longest a command may run, 1 to 120
 # command_allow = ["git", "/usr/bin/make"]   # match the program (argv[0]) only; empty allows any command not denied
 # command_deny = ["rm*"]               # deny wins over allow; a built-in deny list (shells, sudo, curl, ...) always applies
+#                                      # docker backend: both lists match the program NAME only (use plain names; a path entry matches only that exact text); inside the container they guard against mistakes and are not a sandbox
+# command_backend = "docker"           # run_command: "permissions" (default, on this machine) or "docker" (each call in a fresh container with outbound network; the working directory is mounted read-write at /work)
+#                                      # docker: cwd may be any host directory, mounted read-write into a container that runs as the image's user (often root); read the cwd shown in the approval prompt
+# command_image = "python:3.12-slim"   # docker backend: a local image, required for it; never pulled, so `docker pull` it first
+
+# The web GUI shows pictures, video and audio from a model only from this server
+# and (pictures) from data: URLs. List extra host names here to allow more; exact
+# names only (no scheme, path, port or wildcard); the browser loads them over https.
+# [gui]
+# a2ui_media_hosts = ["images.example.com"]   # default: none
 """
 
 EXAMPLE_MODELS_YAML = """\

@@ -31,6 +31,7 @@ from llm_harness.storage.vectors import (
 from tests.fake_pgvector import FakePgVectorServer
 from tests.fake_qdrant_client import FakeQdrantClient, FakeQdrantServer
 from tests.live_postgres import pgvector_target, reset_vector_schema
+from tests.platform_marks import posix_only
 
 LOCK_MESSAGE = "vector store is in use by another llm-harness process"
 CHILD_TIMEOUT_SECONDS = 20
@@ -341,6 +342,7 @@ def test_construction_creates_nothing(root: Path) -> None:
     assert not root.exists()
 
 
+@posix_only
 async def test_ensure_creates_private_directories_and_metadata(root: Path) -> None:
     previous = os.umask(0)  # a permissive umask would show a missing explicit chmod
     store = QdrantEdgeVectorStore(root)

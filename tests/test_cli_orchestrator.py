@@ -31,6 +31,7 @@ from llm_harness.types import (
 )
 from tests.fake_steps import ScriptedSteps, reply_events
 from tests.test_cli import CONFIG_TOML, FakeTuiRunner, Run, run_cli
+from tests.platform_marks import posix_only
 
 MODELS_YAML = """\
 models:
@@ -810,6 +811,7 @@ class FdTty(io.StringIO):
         return True
 
 
+@posix_only
 def test_the_flush_helper_calls_tcflush_on_a_terminal_and_is_a_noop_otherwise(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -831,6 +833,7 @@ def test_the_flush_helper_calls_tcflush_on_a_terminal_and_is_a_noop_otherwise(
     assert calls == []
 
 
+@posix_only
 def test_the_flush_helper_ignores_a_tcflush_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

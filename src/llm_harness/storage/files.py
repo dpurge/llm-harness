@@ -14,8 +14,10 @@ import os
 import re
 import secrets
 import stat
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Protocol
+
+from llm_harness import pathing
 
 MAX_SEGMENT_CHARS = 255
 MAX_PATH_CHARS = 1024
@@ -57,9 +59,9 @@ def split_path(path: str) -> list[str]:
         raise FileStoreError(f"the path is longer than {MAX_PATH_CHARS} characters")
     if "\0" in path or "\\" in path:
         raise FileStoreError("the path contains a NUL or backslash character")
-    if path.startswith("/"):
+    if path.startswith("/") or PureWindowsPath(path).drive:
         raise FileStoreError(
-            f"the path must be relative, without a leading '/': {path}"
+            f"the path must be relative, without a leading '/' or a drive: {path}"
         )
     segments = path.split("/")
     for segment in segments:
@@ -159,12 +161,17 @@ class LocalFileStore:
                 raise FileStoreError(
                     "the store's temporary directory is not a directory"
                 )
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | pathing.nofollow_flag()
+                | pathing.binary_flag()
+            )
             descriptor = os.open(tmp_path, flags, 0o600)
             with os.fdopen(descriptor, "wb") as handle:
-                os.fchmod(
-                    handle.fileno(), 0o600
-                )  # the umask masks the mode given to open
+                # the umask masks the mode given to open
+                pathing.fchmod_private(handle.fileno())
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -179,11 +186,18 @@ class LocalFileStore:
 
     def _get(self, path: str, segments: list[str]) -> bytes:
         parent = self._checked_dir(path, segments[:-1])
+        full_path = os.path.join(parent, segments[-1])
         try:
+            # Without O_NOFOLLOW (Windows) a final symlink is refused by this lstat.
+            if not pathing.nofollow_flag() and stat.S_ISLNK(os.lstat(full_path).st_mode):
+                raise FileStoreError(f"not a regular file: {path}")
             # O_NOFOLLOW refuses a final symlink; O_NONBLOCK keeps a FIFO from hanging the open.
             descriptor = os.open(
-                os.path.join(parent, segments[-1]),
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                full_path,
+                os.O_RDONLY
+                | pathing.nofollow_flag()
+                | pathing.nonblock_flag()
+                | pathing.binary_flag(),
             )
         except (FileNotFoundError, NotADirectoryError):
             raise FileStoreError(f"no such file: {path}") from None

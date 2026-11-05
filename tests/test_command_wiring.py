@@ -28,6 +28,7 @@ from llm_harness.config import (
     ConfigError,
     load_config,
 )
+from llm_harness.docker_executor import DockerExecutor
 from llm_harness.tools import ToolContext, ToolRegistry
 from tests import test_subagents
 from tests.fake_steps import reply_events
@@ -129,6 +130,61 @@ def test_an_injected_executor_replaces_the_real_one() -> None:
         tool.input_model(argv=["x"])
 
 
+def executor_of(tools: ToolRegistry) -> Any:
+    tool = tools.get("run_command")
+    assert isinstance(tool, RunCommandTool)
+    return tool._executor
+
+
+def test_the_default_backend_is_the_permissions_executor() -> None:
+    tools = build_tool_registry([], run_command=True, command_image="ignored")
+    assert isinstance(executor_of(tools), PermissionsExecutor)
+
+
+def test_the_docker_backend_registers_a_docker_executor_with_the_image_and_lists() -> (
+    None
+):
+    tools = build_tool_registry(
+        [],
+        run_command=True,
+        command_backend="docker",
+        command_image="python:3.12-slim",
+        command_allow=["python*"],
+        command_deny=["python3"],
+    )
+    executor = executor_of(tools)
+    assert isinstance(executor, DockerExecutor)
+    assert executor._image == "python:3.12-slim"
+    assert (executor._allow, executor._deny) == (("python*",), ("python3",))
+
+
+def test_an_injected_executor_wins_over_the_docker_backend() -> None:
+    injected = object()
+    tools = build_tool_registry(
+        [],
+        run_command=True,
+        command_backend="docker",
+        command_image="img",
+        command_executor=injected,  # type: ignore[arg-type]
+    )
+    assert executor_of(tools) is injected
+
+
+@pytest.mark.parametrize("image", [None, ""])
+def test_the_docker_backend_without_an_image_is_a_config_error(
+    image: str | None,
+) -> None:
+    with pytest.raises(ConfigError, match="needs command_image"):
+        build_tool_registry(
+            [], run_command=True, command_backend="docker", command_image=image
+        )
+
+
+def test_the_docker_backend_is_ignored_while_run_command_is_off() -> None:
+    tools = build_tool_registry([], command_backend="docker")
+    assert tools.get("run_command") is None
+
+
 def test_naming_run_command_while_disabled_gives_the_enable_hint() -> None:
     agent = orchestrator_agent(tools=["run_command"])
     with pytest.raises(ConfigError) as caught:
@@ -201,6 +257,24 @@ def test_a_config_toml_reaches_the_registry_through_the_cli(tmp_path: Path) -> N
         model(argv=["git", "status"])  # deny beats allow
     with pytest.raises(ValidationError, match="not in `\\[tools\\] command_allow`"):
         model(argv=["ls"])
+
+
+def test_the_docker_backend_in_config_toml_reaches_the_registry_through_the_cli(
+    tmp_path: Path,
+) -> None:
+    config_text = (
+        CONFIG_WITH_COMMANDS
+        + 'command_backend = "docker"\ncommand_image = "python:3.12-slim"\n'
+    )
+    executor = executor_of(tools_given_to_the_gui(tmp_path, config_text))
+    assert isinstance(executor, DockerExecutor)
+    assert executor._image == "python:3.12-slim"
+    assert executor._deny == ("git",)
+
+
+def test_the_cli_default_backend_is_the_permissions_executor(tmp_path: Path) -> None:
+    tools = tools_given_to_the_gui(tmp_path, CONFIG_WITH_COMMANDS)
+    assert isinstance(executor_of(tools), PermissionsExecutor)
 
 
 def test_without_the_key_the_cli_registers_no_run_command(tmp_path: Path) -> None:
@@ -288,20 +362,56 @@ async def test_the_marker_command_does_create_the_file_when_approved(
 # --- (d) a subagent can never run it -------------------------------------------
 
 
-async def test_a_subagent_that_names_run_command_gets_no_approval_and_nothing_runs(
-    tmp_path: Path,
-) -> None:
-    marker = tmp_path / "ran"
+def child_naming_run_command(marker: Path, approver: object | None) -> tuple[Any, Any]:
     tools = build_tool_registry([], run_command=True)
     script = [
         reply_events(call("run_command", argv=creates(marker)), SET_GOAL),
         reply_events(test_subagents.RESPOND),
     ]
-    child, provider = test_subagents.make(script, tools=tools)
+    child, provider = test_subagents.make(script, tools=tools, approver=approver)
     # CHILD lists only "search"; the tool is reachable only when named, so name it.
     child._orchestrator._agent = test_subagents.CHILD.model_copy(
         update={"tools": ["run_command"]}
     )
+    return child, provider
+
+
+async def test_a_subagent_command_the_approver_allows_runs_and_names_the_subagent(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "ran"
+    approver = FakeApprover(True)
+    child, _ = child_naming_run_command(marker, approver)
+    await asyncio.wait_for(test_subagents.drain(child), BOUND)
+    (request,) = approver.requests
+    assert request.agent_id == test_subagents.CHILD.id
+    assert request.risk == "exec" and request.tool == "run_command"
+    assert request.arguments_text == json.dumps(
+        {"argv": creates(marker), "cwd": None, "timeout_seconds": 30},
+        sort_keys=True,
+    )
+    assert marker.read_text() == "x"
+
+
+async def test_a_subagent_command_the_approver_denies_is_not_run(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "ran"
+    approver = FakeApprover(False)
+    child, provider = child_naming_run_command(marker, approver)
+    await asyncio.wait_for(test_subagents.drain(child), BOUND)
+    assert len(approver.requests) == 1
+    assert test_subagents.observation(provider.requests[1]) == (
+        "tool run_command was not run: the user denied it"
+    )
+    assert not marker.exists()
+
+
+async def test_a_subagent_command_without_an_approver_is_not_run(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "ran"
+    child, provider = child_naming_run_command(marker, None)
     await asyncio.wait_for(test_subagents.drain(child), BOUND)
     assert test_subagents.observation(provider.requests[1]) == (
         "tool run_command was not run: it needs the user's approval "

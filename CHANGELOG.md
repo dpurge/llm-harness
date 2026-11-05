@@ -4,8 +4,16 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows: absolute-path checks (`[tools] command_allow`/`command_deny`, the file store) no longer assume a leading `/`; file-open flags and `fchmod` that Windows lacks are skipped; the file-mode checks and warnings are skipped where mode bits carry no meaning; `command_allow`/`command_deny` paths may contain spaces; `git.exe` matches an entry `git`; the built-in deny list adds `cmd powershell pwsh wscript cscript mshta`; the fallback `PATH` is `System32`. Simulated in tests only; not run on a real Windows machine.
+
 ### Added
 
+- `/ui-demo` in the web GUI: draws a demo A2UI surface (a heading, a text and a button) with no model call.
+- Model-drawn A2UI v1.0 surfaces in the web GUI: `respond` and `ask_user` replies may carry an optional `ui` list, validated against the v1.0 basic catalog before it is drawn (all 18 components, 14 functions, `@path`/`@call` data binding, two-way inputs); a rejected list is retried like any rejected reply. A button click starts a new turn whose text is `ui_action: surface=<id> action=<name> context=<json>` (plus ` data=<json>` for a surface created with `sendDataModel: true`); a click for a surface the conversation did not draw is dropped.
+- Custom catalog `llm-harness/custom/v1` with `HtmlBlock` and `SvgImage`: the HTML and the SVG go through allowlist sanitizers (no scripts, styles, forms, event handlers or external loading).
+- `[gui] a2ui_media_hosts` in `config.toml` (list of lowercase host names, default `[]`): pictures, video and audio in model-drawn surfaces load only from this server, `data:image/` URLs and these hosts; the GUI now sends a `Content-Security-Policy` header limited to `img-src` and `media-src` (an `http://` URL for a listed host passes the check but the header lists `https://` only).
 - `/help` in the chat input (GUI, terminal UI, `--plain`): lists the commands of the front end in use; `/help COMMAND` shows the detail of one, with no model call.
 - `/memory export [--shared] [PATH]` and `/memory import [--shared] PATH`: write your memories to a YAML file (default `llm-harness-memories.yaml`, created with mode 0600, never overwritten) and read them back as your own notes, with no model call and no preview; known texts and invalid or secret-looking entries are skipped and counted, valid timestamps that are not in the future are kept, at most 200 entries and 1,000,000 bytes per file, and `--shared` is for memory admins only. They are separate from the terminal UI's `/export` and `/import` of orchestrator state.
 - `/memory search WORDS`: shows the memories a search finds, best first, at most 10, in the list format, with no model call.
@@ -46,6 +54,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - `[tools] web_search`, `[tools] web_fetch` and `[tools] web_relax_tls_strict` keys in `config.toml` (all default: off); behind a corporate TLS-inspection proxy, put the proxy's root CA in a bundle and set `SSL_CERT_FILE`, and set `web_relax_tls_strict = true` only if Python's strict certificate check still rejects it.
 - Tool calls that run without a prompt (all `read` tools except `tool_search`) now show one line, `tool <name> <arguments>`, in `--plain`, the terminal UI and the GUI when the call starts.
 - Tool `run_command` (off by default; switch on with `[tools] run_command = true`) runs one local program from an `argv` list, with no shell; every call needs your approval and shows the exact arguments. `[tools] command_allow` and `command_deny` lists plus a built-in deny list (shells, `sudo`, `env`, `curl`, ...) refuse programs before you are asked; they guard against mistakes and are not a sandbox. `command_timeout_seconds` (default 30, 1 to 120) limits the run time; a timeout kills the whole process group. The child gets a scrubbed environment and no stdin, and its output is capped.
+- Docker backend for `run_command`: `[tools] command_backend = "docker"` with `command_image` (a local image, never pulled) runs each command in its own container with the working directory mounted read-write at `/work`; the default `command_backend = "permissions"` is unchanged.
 - Optional agent memory tools `memory_search`, `memory_save`, `memory_update` and `memory_forget` (off by default; switch on with `[tools] memory = true` and a `user_id`): short English notes kept per user with 1 to 8 keywords and created/updated times, searched by keyword; the saves run without an approval prompt and show one `tool <name> <arguments>` line.
 - Automatic memory recall: when memory is on, the orchestrator searches memory with your message at the start of each turn and puts the top 5 matching notes (at most 6000 characters, in a `<memory-entries>` data block under `## Memory`) into every model request of that turn; a failed or empty recall changes nothing, and the Trace tab shows a `recall` span. Common English words are ignored in memory searches, for recall and for `memory_search`.
 - Memory reflection: after an answer to a turn that used a tool or changed the goal, one short model call may save, update or forget a note without asking you; it shows a one-line notice, refuses secrets, and a failed reflection never fails the turn.
@@ -60,6 +69,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ### Changed
 
+- A `createSurface` that reuses a surface id is renamed to `<id>_2` (then `_3`, ...) and the model is told the new id in its next observation. `--plain` and the terminal UI print `[ui surface omitted]` for a reply with `ui` and draw nothing.
 - `examples` in `agents.yaml` is now used: an agent other than the orchestrator with at least one example is offered to the orchestrator as a subagent, and one without examples is not.
 - `delegate` no longer answers `delegate is not available yet` when subagents are configured; the model is told to use the `## Subagents` list.
 - The session total in the usage line now includes the calls of subagents, and it never decreases within a session.
@@ -74,6 +84,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - `/memory delete` of a shared note answers `memory #<id> is shared; unpublish it first` (its owner) or `memory #<id> is shared and read-only` (anyone else). With `memory_vectors = true` a memory search now makes two vector queries, and `/memory reindex` also embeds shared notes.
 - The unknown-backend error for `[storage.relational]` now lists `sqlite, postgres` (postgres was recognised but rejected before).
 - The error for a `url` with the `qdrant-edge` or `none` vector backend now reads `url is only used with backend = "qdrant" or "pgvector"`, and the unknown-backend error for `[storage.vector]` now lists `qdrant-edge, qdrant, pgvector, none`.
+- Subagents can now run tools that need approval: each request asks you, with the subagent's id (`agent: <id>`), through the same prompt as the orchestrator's; before, such calls were always denied. Piped `--plain` still denies them.
 
 ### Removed
 

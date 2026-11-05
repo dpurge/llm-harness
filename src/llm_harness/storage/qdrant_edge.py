@@ -22,6 +22,7 @@ from typing import Any
 
 import qdrant_edge as q
 
+from llm_harness import pathing
 from llm_harness.storage.files import make_private_dirs
 from llm_harness.storage.vector_common import (
     NAME_PATTERN,
@@ -52,9 +53,11 @@ _ENGINE_DISTANCES = {
 def _write_private(path: Path, text: str) -> None:
     """Write `path` atomically with mode 0600 (the umask would mask a mode given to open)."""
     tmp_path = path.with_name(path.name + ".tmp")
-    descriptor = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    descriptor = os.open(
+        tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | pathing.binary_flag(), 0o600
+    )
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        os.fchmod(handle.fileno(), 0o600)
+        pathing.fchmod_private(handle.fileno())
         handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())

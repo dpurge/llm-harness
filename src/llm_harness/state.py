@@ -174,11 +174,14 @@ def apply_patch(
 class RespondAction(_Frozen):
     type: Literal["respond"]
     text: str
+    # A2UI v1.0 messages; validated by the orchestrator, not by this model.
+    ui: list[dict[str, object]] | None = None
 
 
 class AskUserAction(_Frozen):
     type: Literal["ask_user"]
     question: str
+    ui: list[dict[str, object]] | None = None
 
 
 class CallToolAction(_Frozen):

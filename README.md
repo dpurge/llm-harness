@@ -1225,6 +1225,8 @@ tools. Write it after `user_id`, like `[storage...]`:
 # command_timeout_seconds = 30 # default: 30; 1 to 120
 # command_allow = ["git"]      # default: []
 # command_deny = ["rm*"]       # default: []
+# command_backend = "docker"   # default: "permissions"; or "docker", see Docker backend below
+# command_image = "my-image"   # required when command_backend = "docker"; a local image
 # memory = true                # default: false; needs user_id; see Agent memory below
 # memory_vectors = true        # default: false; needs memory; see Vector search below
 # memory_admins = ["alice"]    # default: []; user_ids that may publish or forget shared notes; see Shared notes below
@@ -1346,8 +1348,8 @@ command_deny = ["rm*"]
 
   Read `argv` there. The terminal UI and the web GUI ask. `--plain` asks only
   on a terminal; with piped input it has no approver and the call is denied. A
-  subagent has no approver either, so a `run_command` call from a subagent is
-  never run.
+  subagent's call asks you too, through the same approver, with `agent: <id>`
+  in the prompt; with piped input it is denied there as well.
 
 The allow/deny list looks only at the program, `argv[0]`:
 
@@ -1391,8 +1393,72 @@ sandbox:
 - The child can still read your files and use the network.
 - A process that leaves its process group (`setsid`, a double fork) survives
   the kill.
-- The real boundary is you, reading the arguments in the approval prompt. A
-  Docker backend is a later roadmap item (`command-execution-docker`).
+- The real boundary is you, reading the arguments in the approval prompt. For a
+  container instead of your own computer, see the Docker backend below.
+
+#### Docker backend
+
+`command_backend` is `"permissions"` (the default: everything above) or
+`"docker"`. With `"docker"`, `command_image` is required (config load fails
+without it):
+
+```toml
+[tools]
+run_command = true
+command_backend = "docker"
+command_image = "my-image"
+```
+
+- The image must already exist on this computer. It is never pulled (`--pull
+  never`), so run `docker pull my-image` yourself first; a missing image comes
+  back to the model as an error.
+- Each call is one `docker run --rm --pull never --entrypoint=` container, named
+  `llm-harness-cmd-<random>`. The container is removed with `docker rm -f` on
+  timeout and on cancel. `argv[0]` is the program that runs, whatever
+  `ENTRYPOINT` the image has.
+- The `cwd` (when given) is mounted read-write at `/work` and is the working
+  directory there; with no `cwd`, nothing is mounted. By convention an agent
+  keeps scratch files in a `.scratch/` folder inside it.
+- The container has outbound network access and no CPU or memory limits.
+- `command_allow` and `command_deny` match the program name only, and the
+  built-in deny list still applies. Every call still needs your approval.
+
+Limits of the Docker backend:
+
+- Inside the container the lists guard against mistakes only. The built-in list
+  does not cover container shells (`ash`, `busybox sh -c`) and `python -c` is
+  allowed; you reading `argv` is the boundary.
+- `cwd` can be any host directory, and the container runs as the image's user,
+  often root. On rootful Linux Docker a call with `cwd` `/etc` can write there
+  as root, and files written to `/work` are owned by root on the host. Read the
+  `cwd` in the prompt.
+- A path entry in `command_allow` or `command_deny` matches only that exact
+  text: a deny of `/usr/bin/python3` does not stop `python3`. Use plain names.
+- A container survives when the harness is killed hard (SIGTERM, closed
+  terminal); only a cancel or timeout removes it.
+- The `run_command` description and the approval prompt still say "on this
+  machine" and do not show the backend or image. Docker's own error text can
+  echo `DOCKER_HOST`.
+- Run by hand only on macOS (Rancher Desktop). Linux and Windows are untested;
+  SELinux hosts may need `:z` on the mount, and `--pull never` needs Docker 20.10
+  or later.
+
+### Web GUI (`[gui]`)
+
+An optional `[gui]` table in `config.toml`, written after `user_id` like the
+other tables, with one key:
+
+```toml
+# [gui]
+# a2ui_media_hosts = ["images.example.com"]   # default: []
+```
+
+- `a2ui_media_hosts` is a list of host names that model-drawn surfaces may load
+  pictures, video and audio from (see Model-drawn surfaces (A2UI)). Each entry
+  must be a lowercase host name: no scheme, path, port or wildcard, no
+  duplicates. The browser loads these hosts over `https`.
+- Without the key, media loads only from this server and (pictures only) from
+  `data:image/...` URLs.
 
 ### Agent memory
 
@@ -2155,6 +2221,10 @@ The model answers with one JSON object with exactly two keys: `state_patch` and
 `delegate`. `delegate` hands a brief to a subagent (see Subagents); when no
 subagent factory is configured it answers that it is not available yet.
 
+`respond` and `ask_user` may also carry an optional `ui` key: a list of A2UI
+v1.0 messages that the web GUI draws as a form-like surface in the chat (see
+Model-drawn surfaces (A2UI)). Without `ui` the reply is unchanged.
+
 Tools: every request lists the tools the orchestrator may use under `## Tools`,
 one `name: description` line each. To learn a tool's arguments the model calls
 `tool_search` (`query`, optional `k` from 1 to 10), which ranks the tools it may
@@ -2179,6 +2249,47 @@ Tools) are listed only when switched on.
   there the contract rests on the instructions and the retries.
 - The state is capped at 8000 characters; a patch that would exceed it is
   rejected.
+
+## Model-drawn surfaces (A2UI)
+
+The orchestrator can answer with more than text. A `respond` or `ask_user`
+reply may carry `ui`, a list of A2UI v1.0 messages, and the web GUI draws the
+surface in the chat log. Type `/ui-demo` in the GUI to draw a fixed demo surface
+without a model call.
+
+- Validation: every `ui` list is checked against the A2UI v1.0 schemas and the
+  catalog named in `createSurface` before anything is drawn. A rejected list is
+  retried like any rejected reply (see Orchestrator) with the error text as the
+  observation; nothing is drawn from it.
+- Catalogs: the basic catalog
+  `https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json` (all 18
+  components: Text, Image, Icon, Video, AudioPlayer, Row, Column, List, Card,
+  Tabs, Modal, Divider, Button, TextField, CheckBox, ChoicePicker, Slider,
+  DateTimeInput; 14 functions) and the custom catalog `llm-harness/custom/v1`,
+  which adds `HtmlBlock` and `SvgImage`. Their HTML and SVG are sanitized
+  against an allowlist: no scripts, styles, forms, event handlers or external
+  loading.
+- Data binding: a value may be `{"@path": "/x"}` or `{"@call": "<function>",
+  "args": {...}}`; the input components write the user's edits back to their
+  bound path.
+- Media: an `Image`, `Video` or `AudioPlayer` URL is drawn only if it is a path
+  on this server, a `data:image/` URL (pictures only) or on a host listed in
+  `[gui] a2ui_media_hosts`; anything else shows a `[A2UI media refused: ...]` line.
+  The GUI also sends a `Content-Security-Policy` header limited to `img-src`
+  and `media-src`; it lists `https://<host>` only, so an `http://` URL for a
+  listed host passes the check but a browser blocks it.
+- Clicks: a button click starts a new turn whose text is
+  `ui_action: surface=<id> action=<name> context=<json>`, plus ` data=<json>`
+  when the surface was created with `sendDataModel: true`. A click for a surface
+  this conversation did not draw is dropped.
+- Reused ids: a `createSurface` whose `surfaceId` already exists is renamed to
+  `<id>_2` (then `_3`, ...) and the model is told the new id in its next
+  observation.
+- Other front ends: `--plain` and the terminal UI print `[ui surface omitted]`
+  and draw nothing.
+- Limits: the `checks` rules of input components are not evaluated; an example
+  that streams one surface in several incomplete steps is rejected, so a model
+  must send a whole surface in one reply.
 
 ## Subagents
 
@@ -2324,6 +2435,7 @@ Which command exists where:
 | `/help [COMMAND]` | yes | yes | yes |
 | `/quit` | yes | yes | yes |
 | `/exit` | yes | yes | no |
+| `/ui-demo` | no | no | yes (draws a demo A2UI surface, no model call) |
 | `/export [path]`, `/import <path>` | no | yes (slash commands) | no slash commands; use the `Export state` and `Import state` buttons in the State tab |
 
 ## Markdown
@@ -2388,6 +2500,11 @@ known whether it accepts the `thinking` settings as sent.
 - Model output is sanitized (escape and control characters removed). Replies are
   rendered as markdown, never as raw HTML: in the GUI the rendered HTML also goes
   through an allowlist sanitizer (no scripts, no images, restricted links).
+- Model-drawn A2UI surfaces (see Model-drawn surfaces (A2UI)) are validated
+  before they are drawn, text values are sanitized, `HtmlBlock` and `SvgImage`
+  go through their own allowlist sanitizers, and media URLs are limited to this
+  server, `data:image/` and `[gui] a2ui_media_hosts`. The GUI's
+  `Content-Security-Policy` header covers `img-src` and `media-src` only.
 - Ambient SDK environment variables such as `OPENAI_*`, `OLLAMA_*` and
   `GOOGLE_*` are ignored; connection settings come only from the config.
 - `run_command` runs programs on this computer. It is off by default and every
@@ -2576,7 +2693,7 @@ reachable.
 - The only real tools are the two optional web tools, `run_command` and the four
   memory tools; there are no RAG tools yet. The memory tools, the reflection
   step and `/memory add` have not been seen working with a real model (see Agent memory). `run_command` is not sandboxed
-  (see Command execution) and there is no Docker backend yet.
+  (see Command execution); the optional Docker backend was run by hand only on macOS.
 - Usage and backoff are only saved if the ledger database (the SQLite file, or
   the Postgres server) can be used; the new note and usage lines were not looked
   at in a real browser or terminal.
@@ -2661,5 +2778,11 @@ reachable.
   the GUI passes `memory_admins`, but the terminal UI and `--plain` wiring has no
   such test; and SQLite row-id reuse after a delete.
 - Nothing was verified in a real browser except by the author's own manual run.
+- Model-drawn A2UI surfaces (see Model-drawn surfaces (A2UI)) were tested offline
+  only: no real browser, no real model (whether a model produces valid `ui`, and
+  whether Ollama's constrained decoding accepts the larger reply schema, is
+  unknown) and no Windows run. 41 of the 43 v1.0 basic-catalog examples vendored in
+  `tests/data/a2ui_examples/` are accepted and drawn; the two streamed ones are
+  rejected by design.
 - Markdown was not looked at in a real browser or terminal (layout, CSS and
   code colours are unchecked); table column alignment is dropped in the GUI.

@@ -14,6 +14,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from llm_harness import pathing
 from llm_harness.display import sanitize_text
 from llm_harness.redact import redact
 from llm_harness.state_io import EXPORT_FILENAME, MAX_IMPORT_BYTES, check_size
@@ -78,7 +79,13 @@ def write_export(path: Path, data: bytes) -> None:
         raise StateFileError("the path is a directory")
     # O_EXCL fails on any existing entry, a dangling symlink included, and
     # O_NOFOLLOW is a second guard against following a link at the last component.
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | pathing.nofollow_flag()
+        | pathing.binary_flag()
+    )
     try:
         descriptor = os.open(path, flags, 0o600)
     except FileExistsError:
@@ -104,7 +111,9 @@ def read_import(path: Path) -> bytes:
         if not stat.S_ISREG(os.stat(path).st_mode):
             raise StateFileError("not a regular file")
         # O_NONBLOCK: opening a FIFO that lost the race must not wait for a writer.
-        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        descriptor = os.open(
+            path, os.O_RDONLY | pathing.nonblock_flag() | pathing.binary_flag()
+        )
         with os.fdopen(descriptor, "rb") as handle:
             info = os.fstat(handle.fileno())
             if not stat.S_ISREG(info.st_mode):

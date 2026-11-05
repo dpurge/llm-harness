@@ -93,6 +93,19 @@ class StatusEvent(_Frozen):
     text: str
 
 
+class UiSurface(_Frozen):
+    """The orchestrator accepted A2UI messages that touch surfaces.
+
+    `surface_ids` are the distinct `surfaceId` values of the createSurface,
+    updateComponents and updateDataModel messages of one reply, in order;
+    `deleted_surface_ids` those of its deleteSurface messages. A consumer reads
+    the current state of each surface from the orchestrator's validator.
+    """
+
+    surface_ids: tuple[str, ...]
+    deleted_surface_ids: tuple[str, ...] = ()
+
+
 StreamEvent = (
     ThinkingDelta
     | TextDelta
@@ -103,4 +116,5 @@ StreamEvent = (
     | UsageReport
     | Notice
     | StatusEvent
+    | UiSurface
 )

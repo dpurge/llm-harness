@@ -57,6 +57,7 @@ from llm_harness.types import (
     StreamEvent,
     TextDelta,
     ThinkingDelta,
+    UiSurface,
     UsageReport,
 )
 
@@ -351,6 +352,8 @@ async def _run_turn(
             if stderr.isatty():
                 status = f"{_DIM}{status}{_RESET}"
             print_note(status)
+        elif isinstance(event, UiSurface):
+            print_note("[ui surface omitted]")
         elif isinstance(event, UsageReport):
             # Printed at Done, after the reply's final newline.
             report = event
@@ -533,6 +536,8 @@ def main(
             command_allow=config.tools.command_allow,
             command_deny=config.tools.command_deny,
             command_timeout_seconds=config.tools.command_timeout_seconds,
+            command_backend=config.tools.command_backend,
+            command_image=config.tools.command_image,
         )
     except ConfigError as exc:
         print(f"error: {exc}", file=stderr)

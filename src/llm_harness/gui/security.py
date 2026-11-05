@@ -1,6 +1,9 @@
-"""Host and Origin checks for the unauthenticated, loopback-only web GUI."""
+"""Host and Origin checks and a media-only Content-Security-Policy for the web GUI."""
 
-from starlette.types import ASGIApp, Receive, Scope, Send
+from collections.abc import Sequence
+
+from starlette.applications import Starlette
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 _FORBIDDEN_BODY = b"forbidden\n"
 
@@ -60,3 +63,46 @@ def _header_values(scope: Scope, name: bytes) -> list[str]:
         for key, value in scope.get("headers", [])
         if key.lower() == name
     ]
+
+
+class MediaCspMiddleware:
+    """Add a Content-Security-Policy that limits only where images and media load from.
+
+    The header is `img-src 'self' data: <hosts>; media-src 'self' data: <hosts>`
+    with each configured host as `https://<host>`. No other directive is set:
+    `script-src` or `default-src` would break NiceGUI's own inline scripts. Only
+    `https` is listed, so a browser blocks an `http://` media URL even though
+    `a2ui.media` accepts one for an allowed host. Existing response headers are
+    kept; websocket and lifespan scopes pass through untouched.
+    """
+
+    def __init__(self, app: ASGIApp, media_hosts: Sequence[str] = ()) -> None:
+        self._app = app
+        sources = " ".join(["'self'", "data:", *(f"https://{h}" for h in media_hosts)])
+        policy = f"img-src {sources}; media-src {sources}"
+        self._header = (b"content-security-policy", policy.encode("ascii"))
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        async def send_with_policy(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                message = {
+                    **message,
+                    "headers": [*message.get("headers", []), self._header],
+                }
+            await send(message)
+
+        await self._app(scope, receive, send_with_policy)
+
+
+def add_gui_middleware(app: Starlette, port: int, media_hosts: Sequence[str]) -> None:
+    """Register the GUI's middleware; call it before the app starts.
+
+    Starlette makes the LAST one added the outermost, so the policy header is also
+    on the 403 answers of the Host/Origin check.
+    """
+    app.add_middleware(LoopbackOnlyMiddleware, port=port)
+    app.add_middleware(MediaCspMiddleware, media_hosts=tuple(media_hosts))

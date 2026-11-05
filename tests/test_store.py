@@ -10,6 +10,7 @@ import pytest
 
 from llm_harness.routing import BackoffEntry
 from llm_harness.store import CallRecord, Store, default_db_path
+from tests.platform_marks import posix_only
 
 T0 = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)
 LEDGER_TABLES = {"llm_calls", "model_backoff", "schema_versions"}
@@ -82,12 +83,14 @@ def test_first_use_creates_directory_file_and_schema(db: Path):
     ]
 
 
+@posix_only
 def test_modes_are_0700_and_0600(db: Path):
     Store(db).backoff_entries()
     assert stat.S_IMODE(db.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(db.stat().st_mode) == 0o600
 
 
+@posix_only
 def test_modes_hold_under_umask_zero(db: Path):
     old = os.umask(0)
     try:
@@ -98,6 +101,7 @@ def test_modes_hold_under_umask_zero(db: Path):
     assert stat.S_IMODE(db.stat().st_mode) == 0o600
 
 
+@posix_only
 def test_existing_loose_modes_are_tightened(db: Path):
     db.parent.mkdir(mode=0o755)
     db.touch(mode=0o644)

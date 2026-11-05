@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from llm_harness.storage.files import FileStoreError, LocalFileStore
+from tests.platform_marks import posix_only
 
 
 @pytest.fixture
@@ -44,6 +45,7 @@ async def test_overwrite_replaces_content(store: LocalFileStore) -> None:
     assert await store.get("f") == b"second"
 
 
+@posix_only
 @pytest.mark.parametrize("umask", [0, 0o277])
 async def test_modes_do_not_depend_on_the_umask(
     store: LocalFileStore, root: Path, umask: int
@@ -103,6 +105,9 @@ async def test_failed_replace_keeps_the_original_and_leaves_no_temp_file(
         ".tmp/x",
         "a\0b",
         "a\\b",
+        "C:foo",
+        "C:/foo",
+        "c:",
         "x" * 256,
         "a/" * 513,
     ],
@@ -150,6 +155,7 @@ async def test_put_of_text_is_rejected_with_the_fix(
     assert not root.exists()
 
 
+@posix_only
 async def test_symlinked_directory_pointing_outside_is_refused(
     store: LocalFileStore, root: Path, outside: Path
 ) -> None:
@@ -169,6 +175,7 @@ async def test_symlinked_directory_pointing_outside_is_refused(
     assert not await store.exists("link/secret.txt")
 
 
+@posix_only
 async def test_symlinked_directory_inside_the_root_is_followed(
     store: LocalFileStore, root: Path
 ) -> None:
@@ -177,6 +184,7 @@ async def test_symlinked_directory_inside_the_root_is_followed(
     assert await store.get("alias/f") == b"x"
 
 
+@posix_only
 async def test_get_refuses_a_final_symlink(
     store: LocalFileStore, root: Path, outside: Path
 ) -> None:
@@ -189,6 +197,7 @@ async def test_get_refuses_a_final_symlink(
     assert (root / "link").is_symlink()
 
 
+@posix_only
 async def test_put_replaces_a_final_symlink_and_leaves_the_target_alone(
     store: LocalFileStore, root: Path, outside: Path
 ) -> None:
@@ -200,6 +209,7 @@ async def test_put_replaces_a_final_symlink_and_leaves_the_target_alone(
     assert await store.get("link") == b"new"
 
 
+@posix_only
 async def test_get_of_a_fifo_does_not_hang(store: LocalFileStore, root: Path) -> None:
     await store.put("seed", b"x")
     os.mkfifo(root / "pipe")
@@ -208,6 +218,7 @@ async def test_get_of_a_fifo_does_not_hang(store: LocalFileStore, root: Path) ->
     assert not await store.exists("pipe")
 
 
+@posix_only
 async def test_tmp_directory_that_is_a_symlink_is_refused(
     store: LocalFileStore, root: Path, outside: Path
 ) -> None:
@@ -230,6 +241,7 @@ async def test_list_is_sorted_recursive_and_filters_by_prefix(
     assert await store.list("a.txt") == []
 
 
+@posix_only
 async def test_list_excludes_tmp_symlinks_and_other_non_regular_files(
     store: LocalFileStore, root: Path, outside: Path
 ) -> None:

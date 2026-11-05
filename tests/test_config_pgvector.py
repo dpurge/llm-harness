@@ -43,6 +43,7 @@ from tests.test_config_postgres import (
     pg_toml,
 )
 from tests.test_secrets_file import KEY, VALID, write_secrets
+from tests.platform_marks import posix_only
 
 PREFIX = "invalid config.toml: storage.vector: "
 PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
@@ -248,6 +249,7 @@ def test_qdrant_with_sqlite_loads_only_the_qdrant_key(
     assert config.postgres_password is None
 
 
+@posix_only
 @pytest.mark.parametrize("vector", ["qdrant-edge", "none"])
 def test_sqlite_with_local_vectors_never_opens_a_garbage_file(
     tmp_path: Path, vector: str
@@ -262,6 +264,7 @@ def test_sqlite_with_local_vectors_never_opens_a_garbage_file(
     assert (config.qdrant_api_key, config.postgres_password) == (None, None)
 
 
+@posix_only
 def test_pgvector_with_a_shared_secrets_file_fails_load_config(
     tmp_path: Path, driver_installed: None
 ):

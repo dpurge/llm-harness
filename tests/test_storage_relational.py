@@ -37,6 +37,7 @@ from llm_harness.storage.relational import (
     SqliteRelationalStore,
 )
 from tests.live_postgres import scratch_target
+from tests.platform_marks import posix_only
 
 # SQLite-shaped migrations, for the SQLite-only tests below; the rig builds the
 # per-dialect equivalent for the tests that run on both backends.
@@ -438,6 +439,7 @@ def test_two_threads_migrating_one_fresh_file_both_succeed(rig: _Rig):
     assert rig.versions() == [(notes, 2)]
 
 
+@posix_only
 def test_modes_are_0700_and_0600_even_under_umask_zero(db: Path):
     old = os.umask(0)
     try:

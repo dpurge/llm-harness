@@ -8,6 +8,8 @@ earlier valid steps committed and nothing else.
 
 import asyncio
 import getpass
+import json
+import logging
 import socket
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import aclosing
@@ -16,6 +18,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ValidationError
 
+from llm_harness.a2ui.validation import SurfaceValidator
 from llm_harness.approval import (
     MAX_ARGUMENT_CHARS,
     ApprovalRequest,
@@ -29,6 +32,7 @@ from llm_harness.context import (
     delegation_targets,
     retry_observation,
 )
+from llm_harness.display import sanitize_text
 from llm_harness.memory import MemoryValidationError
 from llm_harness.memory_add import (
     ProposalError,
@@ -81,6 +85,7 @@ from llm_harness.types import (
     StreamEvent,
     TextDelta,
     ThinkingDelta,
+    UiSurface,
     UsageEvent,
     UsageReport,
 )
@@ -90,8 +95,16 @@ _EMPTY_GOAL = (
     "goal is empty: set `goal` in state_patch, "
     "or use ask_user if you cannot tell what the user wants."
 )
+_UI_HINT = (
+    " Fix the `ui` list in the action, or omit the `ui` key if plain text is enough."
+)
 _NO_DELEGATION = "delegate is not available to subagents"
 _STATUS_CHARS = 80
+_UI_ACTION_CONTEXT_CHARS = 500
+_UI_ACTION_DATA_CHARS = 1000
+# Marks "this surface does not send its data model" (None is a valid data model).
+_NO_DATA = object()
+_logger = logging.getLogger(__name__)
 # Hard cap for the arguments shown on an auto-run tool's status line. A URL is
 # capped at 2048 by its input model, so a web call is always shown whole.
 _CALL_LINE_ARGUMENT_CHARS = 2200
@@ -209,6 +222,29 @@ def _status_text(reply: Reply, tools: ToolRegistry) -> str:
     return text[:_STATUS_CHARS]
 
 
+def _touched_surfaces(
+    ui: Sequence[dict[str, object]] | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Distinct `surfaceId`s, in order: (created or updated, deleted)."""
+    changed: dict[str, None] = {}
+    deleted: dict[str, None] = {}
+    for message in ui or ():
+        for key in ("createSurface", "updateComponents", "updateDataModel"):
+            surface_id = _surface_id(message.get(key))
+            if surface_id is not None:
+                changed[surface_id] = None
+        surface_id = _surface_id(message.get("deleteSurface"))
+        if surface_id is not None:
+            deleted[surface_id] = None
+    return tuple(changed), tuple(deleted)
+
+
+def _surface_id(body: object) -> str | None:
+    if isinstance(body, dict) and isinstance(body.get("surfaceId"), str):
+        return body["surfaceId"]
+    return None
+
+
 def _argument_problems(error: ValidationError) -> str:
     # Only location and message: pydantic's str() echoes the offending input.
     return "; ".join(
@@ -270,6 +306,17 @@ class Orchestrator:
         # The last ask_user question; part of snapshot() so a run can resume from it.
         self.pending_question: str | None = None
         self._last_recall = ""
+        # One per conversation: surfaces accumulate across turns.
+        self._ui_validator = SurfaceValidator()
+        # The accepted `ui` messages of the last reply (surface ids after a rename),
+        # and the `[ui]` lines the model has not been told yet.
+        self._ui_batch: tuple[dict[str, object], ...] | None = None
+        self._ui_notes: list[str] = []
+
+    @property
+    def ui_validator(self) -> SurfaceValidator:
+        """The accepted A2UI surfaces of this conversation (read-only)."""
+        return self._ui_validator
 
     @property
     def state(self) -> OrchestratorState:
@@ -352,6 +399,11 @@ class Orchestrator:
                     if self.pending_question
                     else text
                 )
+                # Told once: a renamed surface must be known before the model uses it.
+                observation = (
+                    "".join(f"{line}\n" for line in self._ui_notes) + observation
+                )
+                self._ui_notes.clear()
                 recall = await self._recall(text, turn)
                 recall_notice = self._vector_notice()
                 if recall_notice:
@@ -434,6 +486,15 @@ class Orchestrator:
                             text=_status_text(reply, self._tools),
                         )
                         action = reply.action
+                        if isinstance(action, RespondAction | AskUserAction):
+                            surface_ids, deleted_ids = _touched_surfaces(self._ui_batch)
+                            if surface_ids or deleted_ids:
+                                yield UiSurface(
+                                    surface_ids=surface_ids,
+                                    deleted_surface_ids=deleted_ids,
+                                )
+                            for line in self._ui_notes:
+                                yield Notice(text=line)
                         if isinstance(action, RespondAction):
                             self.pending_question = None
                             turn.status = "ok"
@@ -501,6 +562,28 @@ class Orchestrator:
                 )
         finally:
             self._busy = False
+
+    async def send_ui_action(
+        self, surface_id: str, action_name: str, context: dict[str, object]
+    ) -> AsyncIterator[StreamEvent]:
+        """Run a turn whose observation is a click on a surface this conversation drew.
+
+        A click on any other surface is dropped: no event, no model call. The log
+        line carries no surface id, name or context, because they are untrusted.
+        """
+        if surface_id not in self._ui_validator.surface_ids:
+            _logger.warning(
+                "dropped ui action for a surface this conversation did not draw"
+            )
+            return
+        data = (
+            self._ui_validator.data_model(surface_id)
+            if self._ui_validator.sends_data_model(surface_id)
+            else _NO_DATA
+        )
+        text = _ui_action_text(surface_id, action_name, context, data)
+        async for event in self.send(text):
+            yield event
 
     async def _recall(self, text: str, turn: SpanHandle) -> str:
         """The memory block for this turn, searched once with the text that starts it.
@@ -742,6 +825,7 @@ class Orchestrator:
                     self._tools,
                     think=self._think,
                     storage=self._storage,
+                    approver=self._approver,
                 )
             except BaseException:
                 # SubagentRun closes the provider only once it runs.
@@ -880,6 +964,15 @@ class Orchestrator:
         )
         if isinstance(reply.action, RespondAction) and not new_state.goal.strip():
             raise ReplyError(_EMPTY_GOAL)
+        # Last: the validator keeps what it accepts, so nothing after this may fail.
+        action = reply.action
+        self._ui_batch = None
+        if isinstance(action, RespondAction | AskUserAction) and action.ui is not None:
+            outcome = self._ui_validator.submit(action.ui)
+            if not outcome.ok:
+                raise ReplyError(" ".join(outcome.errors) + _UI_HINT)
+            self._ui_batch = outcome.messages
+            self._ui_notes.extend(f"[ui] {note}" for note in outcome.notes)
         return reply, new_state.model_copy(update={"step": step})
 
     async def _stream_attempt(
@@ -907,3 +1000,24 @@ class Orchestrator:
                 elif isinstance(event, _FORWARDED):
                     _note_in_span(call, event)
                     yield event
+
+
+def _ui_action_text(
+    surface_id: str,
+    action_name: str,
+    context: dict[str, object],
+    data: object = _NO_DATA,
+) -> str:
+    text = (
+        f"ui_action: surface={surface_id} action={action_name} "
+        f"context={_capped_json(context, _UI_ACTION_CONTEXT_CHARS)}"
+    )
+    if data is not _NO_DATA:
+        text += f" data={_capped_json(data, _UI_ACTION_DATA_CHARS)}"
+    return sanitize_text(text)
+
+
+def _capped_json(value: object, limit: int) -> str:
+    """Sorted ASCII JSON, cut to `limit` characters with a trailing ellipsis."""
+    encoded = json.dumps(value, sort_keys=True, ensure_ascii=True)
+    return encoded if len(encoded) <= limit else encoded[: limit - 3] + "..."

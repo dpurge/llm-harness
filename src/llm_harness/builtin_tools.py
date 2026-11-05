@@ -112,6 +112,8 @@ def build_tool_registry(
     command_allow: Sequence[str] = (),
     command_deny: Sequence[str] = (),
     command_timeout_seconds: int = 30,
+    command_backend: str = "permissions",
+    command_image: str | None = None,
     command_executor: "CommandExecutor | None" = None,
     memory: bool = False,
     user_id: str | None = None,
@@ -122,7 +124,8 @@ def build_tool_registry(
 
     `fetcher` and `search_provider` replace the real web access (tests). The web
     modules are imported only when a web tool is switched on. `command_executor`
-    replaces the real local executor (tests); the command modules are imported only
+    replaces the real executor (tests); `command_backend` "docker" runs each command in a
+    container of `command_image`, otherwise on this machine; the command modules are imported only
     when `run_command` is on. The memory tools are registered only when `memory` is on
     and `user_id` is set (memory is per user); with `memory` on and no `user_id` the
     registry says so in `notes` and a `memory_*` name in `agents` gets a hint.
@@ -157,11 +160,20 @@ def build_tool_registry(
         from llm_harness.command_executor import PermissionsExecutor
         from llm_harness.command_tool import RunCommandTool
 
-        executor = (
-            command_executor
-            if command_executor is not None
-            else PermissionsExecutor(command_allow, command_deny)
-        )
+        executor: CommandExecutor
+        if command_executor is not None:
+            executor = command_executor
+        elif command_backend == "docker":
+            if not command_image:
+                raise ConfigError(
+                    'invalid config.toml: [tools] command_backend = "docker" needs '
+                    "command_image, a local image name"
+                )
+            from llm_harness.docker_executor import DockerExecutor
+
+            executor = DockerExecutor(command_image, command_allow, command_deny)
+        else:
+            executor = PermissionsExecutor(command_allow, command_deny)
         registry.register(RunCommandTool(executor, command_timeout_seconds))
     if memory and user_id is not None:
         from llm_harness.memory_tools import MemoryTools

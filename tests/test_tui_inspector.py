@@ -53,6 +53,7 @@ from tests.test_tui import (
     texts,
     wait_for,
 )
+from tests.platform_marks import posix_only
 
 FINDING = {"text": "port is 8080", "source": "config.yaml"}
 PLAN = [{"text": "read config", "status": "doing"}]
@@ -864,6 +865,7 @@ async def run_and_export(pilot: Pilot, app: ChatApp, path: Path) -> None:
     assert notes_of(app)[-1] == f"state exported to {path}"
 
 
+@posix_only
 async def test_export_without_a_path_writes_the_default_file_in_the_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -917,6 +919,7 @@ async def test_export_refuses_existing_missing_parent_and_directory(
         assert notes_of(app) == []
 
 
+@posix_only
 async def test_export_does_not_follow_a_symlink(tmp_path: Path) -> None:
     victim = tmp_path / "victim.txt"
     victim.write_bytes(b"precious")
@@ -1006,6 +1009,7 @@ def _write(path: Path, data: bytes, mode: int | None = None) -> Path:
     return path
 
 
+@posix_only
 @pytest.mark.parametrize("kind", sorted(BAD_FILES))
 async def test_a_bad_import_is_one_line_and_changes_nothing(
     kind: str, tmp_path: Path
@@ -1071,6 +1075,7 @@ async def test_an_oversized_import_is_rejected_without_reading_it(
         ]
 
 
+@posix_only
 async def test_importing_a_fifo_does_not_hang(tmp_path: Path) -> None:
     fifo = tmp_path / "pipe"
     os.mkfifo(fifo)

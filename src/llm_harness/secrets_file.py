@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from llm_harness import pathing
 from llm_harness.config import ConfigError
 from llm_harness.redact import Secret
 
@@ -38,7 +39,9 @@ def _read_private_file(path: Path) -> bytes | None:
     try:
         # O_NONBLOCK so a FIFO cannot hang the open; checks run on the opened
         # descriptor so the file cannot change between the check and the read.
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        fd = os.open(
+            path, os.O_RDONLY | pathing.nonblock_flag() | pathing.binary_flag()
+        )
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -48,7 +51,7 @@ def _read_private_file(path: Path) -> bytes | None:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise _invalid(f"{path} is not a regular file")
-        if info.st_mode & 0o077:
+        if pathing.has_posix_modes() and info.st_mode & 0o077:
             raise _invalid(
                 f"{path} is accessible by group or other users; run: chmod 600 {path}"
             )

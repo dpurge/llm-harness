@@ -17,6 +17,7 @@ from llm_harness.state_files import (
     write_export,
 )
 from llm_harness.state_io import EXPORT_FILENAME, MAX_IMPORT_BYTES, StateImportError
+from tests.platform_marks import posix_only
 
 
 @pytest.mark.parametrize(
@@ -59,6 +60,7 @@ def test_resolve_path_expands_the_home_and_does_not_glob(
     assert resolve_path("*.yaml") == Path("*.yaml")
 
 
+@posix_only
 def test_write_export_creates_a_0600_file(tmp_path: Path) -> None:
     target = tmp_path / "out.yaml"
     write_export(target, b"goal: x\n")
@@ -85,6 +87,7 @@ def test_write_export_refuses_a_directory(tmp_path: Path) -> None:
         write_export(tmp_path, b"x")
 
 
+@posix_only
 def test_write_export_does_not_follow_a_symlink(tmp_path: Path) -> None:
     victim = tmp_path / "victim.txt"
     victim.write_bytes(b"precious")
@@ -96,6 +99,7 @@ def test_write_export_does_not_follow_a_symlink(tmp_path: Path) -> None:
     assert link.is_symlink()
 
 
+@posix_only
 def test_write_export_does_not_follow_a_dangling_symlink(tmp_path: Path) -> None:
     missing = tmp_path / "missing.txt"
     link = tmp_path / "link.yaml"
@@ -105,6 +109,7 @@ def test_write_export_does_not_follow_a_dangling_symlink(tmp_path: Path) -> None
     assert not missing.exists()
 
 
+@posix_only
 def test_write_export_reports_an_os_error_as_class_and_strerror(
     tmp_path: Path,
 ) -> None:
@@ -189,6 +194,7 @@ def test_read_import_directory(tmp_path: Path) -> None:
         read_import(tmp_path)
 
 
+@posix_only
 def test_read_import_unreadable_file(tmp_path: Path) -> None:
     if os.geteuid() == 0:
         pytest.skip("root ignores file permissions")
@@ -200,6 +206,7 @@ def test_read_import_unreadable_file(tmp_path: Path) -> None:
     assert str(caught.value) == "PermissionError: Permission denied"
 
 
+@posix_only
 def test_read_import_does_not_hang_on_a_fifo(tmp_path: Path) -> None:
     fifo = tmp_path / "pipe"
     os.mkfifo(fifo)

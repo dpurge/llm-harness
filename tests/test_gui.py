@@ -29,7 +29,7 @@ from llm_harness.config import (
     VectorConfig,
 )
 from llm_harness.gui.app import register_page, run_gui
-from llm_harness.gui.security import LoopbackOnlyMiddleware
+from llm_harness.gui.security import LoopbackOnlyMiddleware, MediaCspMiddleware
 from llm_harness.markdown_render import sanitize_html
 from llm_harness.memory import MemoryStore
 from llm_harness.memory_command import USAGE
@@ -51,6 +51,7 @@ from llm_harness.types import (
 )
 from tests.fake_steps import ScriptedSteps, as_step_reply, reply_events
 from tests.fakes import ScriptedProvider, router_factory_for
+from tests.platform_marks import posix_only
 
 CONFIG = HarnessConfig.model_validate(
     {
@@ -1495,8 +1496,11 @@ async def test_run_gui_registers_the_loopback_middleware_with_its_port_first(
         port=9123,
         show=False,
     )
-    assert middleware_calls == [(LoopbackOnlyMiddleware, {"port": 9123})]
-    assert order == ["middleware", "run"]
+    assert middleware_calls == [
+        (LoopbackOnlyMiddleware, {"port": 9123}),
+        (MediaCspMiddleware, {"media_hosts": ()}),
+    ]
+    assert order == ["middleware", "middleware", "run"]
 
 
 async def test_run_gui_returns_130_on_ctrl_c_without_raising(
@@ -1933,6 +1937,7 @@ def button_labels(user: User) -> list[str]:
         ]
 
 
+@posix_only
 async def test_memory_export_in_the_gui_writes_a_file_without_a_model_call(
     user: User, tmp_path: Path
 ) -> None:

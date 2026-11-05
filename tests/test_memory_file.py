@@ -17,6 +17,7 @@ from llm_harness.memory_file import (
     check_text_length,
     read_text_file,
 )
+from tests.platform_marks import posix_only
 
 
 def write(path: Path, content: str | bytes) -> str:
@@ -57,6 +58,7 @@ def test_multibyte_text_is_decoded(tmp_path: Path):
     )
 
 
+@posix_only
 def test_a_symlink_to_a_regular_file_is_followed(tmp_path: Path):
     target = write(tmp_path / "real.md", "linked")
     link = tmp_path / "link.md"
@@ -107,6 +109,7 @@ def test_a_directory_named_like_a_file_is_not_a_regular_file(tmp_path: Path):
     assert refusal(str(path)) == f"not a regular file: {path}"
 
 
+@posix_only
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")
 def test_a_named_pipe_is_refused_without_waiting_for_a_writer(tmp_path: Path):
     path = tmp_path / "pipe.md"
@@ -139,6 +142,7 @@ def test_a_file_over_the_cap_is_refused_from_stat_without_reading(
     assert refusal(path) == "file too large (65537 bytes, at most 65536)"
 
 
+@posix_only
 def test_a_file_that_grows_after_stat_is_still_capped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -193,6 +197,7 @@ def test_a_nul_byte_in_the_path_is_a_missing_file():
     assert refusal("a\x00b.md") == "no such file: a\\u0000b.md"
 
 
+@posix_only
 def test_an_unreadable_file_gives_the_class_name_only(tmp_path: Path):
     path = Path(write(tmp_path / "secret.md", "x"))
     path.chmod(0)

@@ -18,6 +18,9 @@ import shutil
 from collections.abc import Sequence
 from pathlib import Path
 
+from llm_harness import pathing
+from llm_harness.pathing import has_separator
+
 # Always applied; `[tools] command_deny` can add to it, never remove from it.
 # Basename patterns (fnmatch). Interpreters, git and rm are deliberately absent.
 DEFAULT_COMMAND_DENY: tuple[str, ...] = (
@@ -30,12 +33,14 @@ DEFAULT_COMMAND_DENY: tuple[str, ...] = (
     # system
     "dd", "mkfs*", "diskutil", "shutdown", "reboot", "halt", "launchctl",
     "crontab", "osascript",
+    # Windows shells and script hosts
+    "cmd", "powershell", "pwsh", "wscript", "cscript", "mshta",
     # network
     "curl", "wget", "nc", "ncat", "socat", "telnet", "ssh", "scp", "sftp",
 )  # fmt: skip
 
 # Used when the parent PATH is missing or holds no absolute entry.
-_FALLBACK_PATH = "/usr/local/bin:/usr/bin:/bin"
+_POSIX_FALLBACK_PATH = "/usr/local/bin:/usr/bin:/bin"
 
 # A program name is echoed in messages, so cap it.
 _MAX_NAME_CHARS = 100
@@ -43,6 +48,13 @@ _MAX_NAME_CHARS = 100
 
 class CommandDenied(Exception):
     """The command may not run; the message says why and is safe to show."""
+
+
+def _fallback_path() -> str:
+    if pathing.has_posix_modes():
+        return _POSIX_FALLBACK_PATH
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    return os.pathsep.join([os.path.join(root, "System32"), root])
 
 
 def child_path(env_path: str | None) -> str:
@@ -55,7 +67,7 @@ def child_path(env_path: str | None) -> str:
     for entry in (env_path or "").split(os.pathsep):
         if os.path.isabs(entry) and entry not in entries:
             entries.append(entry)
-    return os.pathsep.join(entries) if entries else _FALLBACK_PATH
+    return os.pathsep.join(entries) if entries else _fallback_path()
 
 
 def resolve_program(argv0: str, cwd: Path, path: str) -> Path:
@@ -67,7 +79,7 @@ def resolve_program(argv0: str, cwd: Path, path: str) -> Path:
     if not argv0 or "\0" in argv0:
         raise CommandDenied("program name is empty or contains a NUL character")
     shown = _shown(argv0)
-    if "/" in argv0:
+    if has_separator(argv0):
         found: str | None = str(Path(cwd).absolute() / argv0)
     else:
         found = shutil.which(argv0, path=path)
@@ -110,13 +122,26 @@ def check_policy(
 
 def _matches(program: Path, real: Path, entries: Sequence[str]) -> bool:
     """Whether any entry matches; see `_entry_matches`."""
-    names = {program.name.casefold(), real.name.casefold()}
+    names = _names(program) | _names(real)
     return any(_entry_matches(entry, names, program, real) for entry in entries)
 
 
+def _names(path: Path) -> set[str]:
+    """The case-folded basename; on Windows also without a program extension.
+
+    `git.exe` then matches an entry `git`, as `python3.13` is matched by its own name.
+    """
+    name = path.name.casefold()
+    names = {name}
+    for suffix in pathing.executable_suffixes():
+        if name.endswith(suffix) and len(name) > len(suffix):
+            names.add(name[: -len(suffix)])
+    return names
+
+
 def _entry_matches(entry: str, names: set[str], program: Path, real: Path) -> bool:
-    """A "/" entry equals the resolved or real path exactly; else a basename glob."""
-    if "/" in entry:
+    """A path entry equals the resolved or real path exactly; else a basename glob."""
+    if has_separator(entry):
         return entry in (str(real), str(program))
     pattern = entry.casefold()
     return any(fnmatch.fnmatchcase(name, pattern) for name in names)

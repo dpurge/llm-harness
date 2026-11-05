@@ -10,6 +10,7 @@ from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Literal
 
+from llm_harness.approval import Approver
 from llm_harness.config import (
     AgentConfig,
     HarnessConfig,
@@ -91,6 +92,7 @@ class SubagentRun:
         *,
         think: bool | None = None,
         storage: Storage | None = None,
+        approver: Approver | None = None,
     ) -> None:
         self._child = child
         self._brief = brief
@@ -112,6 +114,7 @@ class SubagentRun:
             instructions=subagent_instructions(child.id, child.name, child.description),
             can_delegate=False,
             goal=brief,
+            approver=approver,
         )
         self._result: SubagentResult | None = None
 

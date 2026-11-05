@@ -5,12 +5,15 @@ plain-text `step N: ...` note per step."""
 
 import asyncio
 import contextlib
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from functools import partial
 
 from nicegui import app, ui
 
+from llm_harness.a2ui.demo import DEMO_MESSAGES, DEMO_SURFACE_ID
+from llm_harness.a2ui.validation import SurfaceValidator
 from llm_harness.approval import ApprovalRequest
-from llm_harness.commands import GUI, help_answer, parse_help
+from llm_harness.commands import GUI, UI_DEMO_COMMAND, help_answer, parse_help
 from llm_harness.config import (
     ConfigError,
     HarnessConfig,
@@ -20,7 +23,8 @@ from llm_harness.config import (
 )
 from llm_harness.display import format_switch, format_usage_report, sanitize_text
 from llm_harness.gui import inspector
-from llm_harness.gui.security import LoopbackOnlyMiddleware
+from llm_harness.gui.a2ui_render import render_surface
+from llm_harness.gui.security import add_gui_middleware
 from llm_harness.markdown_render import pygments_css, render_html, sanitize_html
 from llm_harness.memory_add import PendingProposals, ProposeResult
 from llm_harness.memory_command import (
@@ -41,8 +45,10 @@ from llm_harness.types import (
     ModelSwitch,
     Notice,
     StatusEvent,
+    StreamEvent,
     TextDelta,
     ThinkingDelta,
+    UiSurface,
     UsageReport,
 )
 
@@ -62,6 +68,7 @@ html, body { overflow: hidden; }
 .llm-page .q-field__label, .llm-page .q-field__marginal { font-size: 20px; }
 .llm-page .q-btn { font-size: 18px; }
 .llm-page .q-item__label, .llm-secondary { font-size: 16px; }
+.llm-page .q-tab__label { font-size: 18px; }
 .llm-page .q-scrollarea__content { width: 100%; overflow-wrap: anywhere; }
 """
 
@@ -150,6 +157,10 @@ class ChatPage:
         self._turn: asyncio.Task[None] | None = None
         # The `/memory add` preview that waits for `confirm`; this chat only.
         self._pending = PendingProposals()
+        # surface id -> its container in the log, for the current session only
+        self._surfaces: dict[str, ui.column] = {}
+        # The user's choices in a drawn surface (selected tab), kept over redraws.
+        self._views: dict[str, dict[str, str]] = {}
         self._is_closed = False
 
     async def build(self) -> None:
@@ -243,6 +254,8 @@ class ChatPage:
         self._model = model
         self._is_manual = is_manual
         self._pending.clear()  # a new chat or another model starts without a preview
+        self._surfaces.clear()  # old containers stay in the log, inert
+        self._views.clear()
         self._orchestrator = Orchestrator(
             router,
             model,
@@ -393,6 +406,10 @@ class ChatPage:
             self._show(help_answer(GUI, help_request), "help", "w-full")
             self._prompt.value = ""
             return
+        if text.strip().lower() == UI_DEMO_COMMAND:
+            self._show_ui_demo()
+            self._prompt.value = ""
+            return
         memory_command = parse_memory_command(text.strip())
         if memory_command is not None and memory_command.action in SLOW_ACTIONS:
             self._start_memory_add(text.strip())
@@ -415,6 +432,23 @@ class ChatPage:
         self._set_busy(True)
         self._show(f"you: {sanitize_text(text)}", "user", "text-bold")
         self._turn = asyncio.create_task(self._run_turn(self._orchestrator, text))
+
+    def _show_ui_demo(self) -> None:
+        """Draw the fixed demo surface after it passes the A2UI validator."""
+        validator = SurfaceValidator()
+        outcome = validator.submit(DEMO_MESSAGES)
+        if not outcome.ok:
+            for error in outcome.errors:
+                self._show(f"error: {sanitize_text(error)}", "error", "text-negative")
+            return
+        with self._log:
+            render_surface(validator, DEMO_SURFACE_ID, self._show_ui_action)
+        self._scroll_to_end()
+
+    def _show_ui_action(
+        self, surface_id: str, action_name: str, context: dict[str, object]
+    ) -> None:
+        self._show(f"ui_action: surface={surface_id} action={action_name}", "ui-action")
 
     async def _memory_answer(
         self, text: str, orchestrator: Orchestrator | None = None
@@ -487,7 +521,43 @@ class ChatPage:
         self._prompt.run_method("focus")
         self._refresh_inspector()
 
-    async def _run_turn(self, orchestrator: Orchestrator, text: str) -> None:
+    def _on_ui_click(
+        self,
+        orchestrator: Orchestrator,
+        surface_id: str,
+        action_name: str,
+        context: dict[str, object],
+    ) -> None:
+        """A click on a model-drawn button starts a turn on the orchestrator that drew it."""
+        if self._turn_is_running():
+            self._show("[turn running: click ignored]", "note", _DIM)
+            return
+        if orchestrator is not self._orchestrator:
+            # A model switch replaces the session without clearing the log.
+            self._show("[surface of an earlier session: click ignored]", "note", _DIM)
+            return
+        self._set_busy(True)
+        self._show(
+            f"ui_action: surface={sanitize_text(surface_id)} "
+            f"action={sanitize_text(action_name)}",
+            "ui-action",
+        )
+        self._turn = asyncio.create_task(
+            self._run_turn(
+                orchestrator,
+                "",
+                lambda: orchestrator.send_ui_action(surface_id, action_name, context),
+            )
+        )
+
+    async def _run_turn(
+        self,
+        orchestrator: Orchestrator,
+        text: str,
+        events: Callable[[], AsyncIterator[StreamEvent]] | None = None,
+    ) -> None:
+        # A failed typed turn gives its text back to the input; a click has none.
+        retry_text = text if events is None else None
         report: UsageReport | None = None
         thinking: ui.label | None = None
         thinking_text = ""
@@ -495,7 +565,7 @@ class ChatPage:
         reply_text = ""
         restore_text: str | None = None
         try:
-            async for event in orchestrator.send(text):
+            async for event in (events or (lambda: orchestrator.send(text)))():
                 if isinstance(event, ThinkingDelta):
                     thinking_text += sanitize_text(event.text)
                     if thinking is None:
@@ -519,6 +589,8 @@ class ChatPage:
                     )
                 elif isinstance(event, Notice):
                     self._show(sanitize_text(event.text), "note", _DIM)
+                elif isinstance(event, UiSurface):
+                    self._draw_surfaces(orchestrator, event)
                 elif isinstance(event, UsageReport):
                     report = event
                 elif isinstance(event, Done):
@@ -529,19 +601,60 @@ class ChatPage:
                     self._show(
                         f"error ({event.kind}): {message}", "error", "text-negative"
                     )
-                    restore_text = text
+                    restore_text = retry_text
         except asyncio.CancelledError:
             if not self._is_closed:
                 self._show("cancelled", "note", _DIM)
-            restore_text = text
+            restore_text = retry_text
             raise
         except Exception as exc:  # noqa: BLE001 - shown as one safe line, never a traceback
             # Unhandled, the task would die silently with the input disabled.
             if not self._is_closed:
                 self._show(_unexpected_error_line(exc), "error", "text-negative")
-            restore_text = text
+            restore_text = retry_text
         finally:
             self._end_turn(restore_text)
+
+    def _draw_surfaces(self, orchestrator: Orchestrator, event: UiSurface) -> None:
+        """Bring the log in line with the validator's CURRENT state of each touched surface."""
+        validator = orchestrator.ui_validator
+        for surface_id in dict.fromkeys(
+            (*event.surface_ids, *event.deleted_surface_ids)
+        ):
+            container = self._surfaces.pop(surface_id, None)
+            if surface_id not in validator.surface_ids:
+                if container is not None:
+                    container.delete()
+                    self._views.pop(surface_id, None)
+                continue
+            if container is None:
+                with self._log:
+                    container = ui.column().classes("w-full gap-2").mark("a2ui-surface")
+            self._surfaces[surface_id] = container
+            self._fill_surface(orchestrator, surface_id, container)
+        self._scroll_to_end()
+
+    def _fill_surface(
+        self, orchestrator: Orchestrator, surface_id: str, container: ui.column
+    ) -> None:
+        """(Re)draw one surface inside its container; also the redraw after a user edit."""
+        if (
+            container.is_deleted
+            or surface_id not in orchestrator.ui_validator.surface_ids
+        ):
+            return
+        container.clear()
+        with container:
+            render_surface(
+                orchestrator.ui_validator,
+                surface_id,
+                partial(self._on_ui_click, orchestrator),
+                on_edit=partial(
+                    self._fill_surface, orchestrator, surface_id, container
+                ),
+                view=self._views.setdefault(surface_id, {}),
+                media_hosts=tuple(self._config.gui.a2ui_media_hosts),
+            )
 
     def _show_thinking(self) -> ui.label:
         with self._log, ui.expansion("Thinking", value=False).classes("w-full"):
@@ -598,7 +711,7 @@ def run_gui(
     )
     # Before ui.run: Starlette refuses new middleware once the app has started.
     # NiceGUI mounts socket.io on this same app, so the middleware covers it too.
-    app.add_middleware(LoopbackOnlyMiddleware, port=port)
+    add_gui_middleware(app, port, config.gui.a2ui_media_hosts)
     # host is explicit: NiceGUI's own default is 0.0.0.0. reload=False because
     # reload would re-import this module in a child process.
     app.on_shutdown(_close_open_pages)

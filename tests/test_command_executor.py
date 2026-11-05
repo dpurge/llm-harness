@@ -20,6 +20,7 @@ from llm_harness.command_executor import (
     PermissionsExecutor,
     scrubbed_env,
 )
+from tests.platform_marks import posix_only
 
 BOUND = 5  # seconds; every await is wrapped so a broken executor fails, not hangs
 PYTHON = sys.executable
@@ -75,6 +76,7 @@ def pids() -> Iterator[list[int]]:
 # -- exit code, output, cwd ------------------------------------------------
 
 
+@posix_only
 @pytest.mark.parametrize("code", [0, 3])
 async def test_exit_code_is_reported(code: int) -> None:
     result = await run_request(request(f"import sys; sys.exit({code})"))
@@ -82,6 +84,7 @@ async def test_exit_code_is_reported(code: int) -> None:
     assert result.seconds >= 0
 
 
+@posix_only
 async def test_stdout_and_stderr_are_merged_in_order() -> None:
     code = (
         "import sys\n"
@@ -96,6 +99,7 @@ async def test_stdout_and_stderr_are_merged_in_order() -> None:
     assert result.truncated is False
 
 
+@posix_only
 async def test_cwd_is_honoured(tmp_path: Path) -> None:
     result = await run_request(
         request("import os; print(os.path.realpath(os.getcwd()))", cwd=tmp_path)
@@ -103,6 +107,7 @@ async def test_cwd_is_honoured(tmp_path: Path) -> None:
     assert result.head.strip() == os.path.realpath(tmp_path)
 
 
+@posix_only
 async def test_cwd_defaults_to_the_process_cwd() -> None:
     result = await run_request(
         request("import os; print(os.path.realpath(os.getcwd()))")
@@ -110,6 +115,7 @@ async def test_cwd_defaults_to_the_process_cwd() -> None:
     assert result.head.strip() == os.path.realpath(Path.cwd())
 
 
+@posix_only
 async def test_the_program_in_the_result_is_absolute() -> None:
     result = await run_request(request("pass"))
     assert Path(result.program).is_absolute()
@@ -119,12 +125,14 @@ async def test_the_program_in_the_result_is_absolute() -> None:
 # -- errors are returned, never raised ---------------------------------------
 
 
+@posix_only
 async def test_a_missing_cwd_is_an_error_string(tmp_path: Path) -> None:
     result = await run_request(request("pass", cwd=tmp_path / "missing"))
     assert result.error is not None and "directory" in result.error
     assert (result.exit_code, result.timed_out, result.output_bytes) == (None, False, 0)
 
 
+@posix_only
 async def test_a_file_as_cwd_is_an_error_string(tmp_path: Path) -> None:
     afile = tmp_path / "f.txt"
     afile.write_text("x")
@@ -132,24 +140,28 @@ async def test_a_file_as_cwd_is_an_error_string(tmp_path: Path) -> None:
     assert result.error is not None and "directory" in result.error
 
 
+@posix_only
 async def test_a_program_that_is_not_found_is_an_error_string() -> None:
     result = await run_request(request("", argv=("no-such-program-for-this-test",)))
     assert result.error is not None and "not found" in result.error
     assert result.program == ""
 
 
+@posix_only
 async def test_a_denied_program_is_an_error_string() -> None:
     result = await run_request(request("", argv=("bash", "-c", "echo hi")))
     assert result.error is not None and "denied" in result.error
     assert result.output_bytes == 0
 
 
+@posix_only
 async def test_a_program_outside_the_allow_list_is_an_error_string() -> None:
     executor = PermissionsExecutor(allow=["git"], environ=BASE_ENV)
     result = await run_request(request("pass"), executor)
     assert result.error is not None and "command_allow" in result.error
 
 
+@posix_only
 async def test_a_spawn_oserror_is_an_error_string(tmp_path: Path) -> None:
     script = tmp_path / "broken"
     script.write_text("#!/nonexistent/interpreter\n")
@@ -162,6 +174,7 @@ async def test_a_spawn_oserror_is_an_error_string(tmp_path: Path) -> None:
     assert result.exit_code is None
 
 
+@posix_only
 async def test_a_monkeypatched_spawn_oserror_is_an_error_string(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -176,6 +189,7 @@ async def test_a_monkeypatched_spawn_oserror_is_an_error_string(
 # -- check, and the re-check before the spawn -----------------------------
 
 
+@posix_only
 def test_check_accepts_a_good_command_and_refuses_bad_ones(tmp_path: Path) -> None:
     executor = PermissionsExecutor(environ=BASE_ENV)
     assert executor.check((PYTHON, "-c", "pass"), None) is None
@@ -187,11 +201,13 @@ def test_check_accepts_a_good_command_and_refuses_bad_ones(tmp_path: Path) -> No
     assert "argv is empty" in (executor.check((), None) or "")
 
 
+@posix_only
 def test_check_applies_the_configured_deny_list() -> None:
     executor = PermissionsExecutor(deny=["python*", "Python*"], environ=BASE_ENV)
     assert "denied" in (executor.check((PYTHON,), None) or "")
 
 
+@posix_only
 async def test_execute_checks_again_after_check_accepted(tmp_path: Path) -> None:
     script = tmp_path / "tool.sh"
     script.write_text("#!/bin/sh\necho hi\n")
@@ -211,6 +227,7 @@ async def test_execute_checks_again_after_check_accepted(tmp_path: Path) -> None
 # -- environment and stdin ----------------------------------------------------
 
 
+@posix_only
 @pytest.mark.parametrize(
     ("environ", "expected"),
     [
@@ -259,6 +276,7 @@ def test_scrubbed_env_is_an_allow_list(
     assert scrubbed_env(environ) == expected
 
 
+@posix_only
 async def test_the_child_sees_only_allow_listed_variables() -> None:
     environ = {
         "PATH": "/usr/bin:/bin",
@@ -277,6 +295,7 @@ async def test_the_child_sees_only_allow_listed_variables() -> None:
     assert names.isdisjoint({"API_TOKEN", "OPENAI_API_KEY", "FOO"})
 
 
+@posix_only
 async def test_the_child_path_drops_relative_and_empty_entries() -> None:
     executor = PermissionsExecutor(environ={"PATH": ".::rel/bin:/usr/bin:/bin"})
     result = await run_request(
@@ -285,6 +304,7 @@ async def test_the_child_path_drops_relative_and_empty_entries() -> None:
     assert result.head.strip() == "/usr/bin:/bin"
 
 
+@posix_only
 async def test_the_default_environment_is_the_process_environment_at_execute_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -296,6 +316,7 @@ async def test_the_default_environment_is_the_process_environment_at_execute_tim
     assert result.head.strip() == "False"
 
 
+@posix_only
 async def test_stdin_is_devnull() -> None:
     result = await run_request(request("import sys; print(repr(sys.stdin.read()))"))
     assert result.head.strip() == "''"
@@ -304,6 +325,7 @@ async def test_stdin_is_devnull() -> None:
 # -- timeout and process group ------------------------------------------------
 
 
+@posix_only
 async def test_a_child_past_the_timeout_is_killed(pids: list[int]) -> None:
     code = f"import os; print(os.getpid(), flush=True)\n{SLEEP_30}"
     result = await run_request(request(code, timeout=1))
@@ -323,6 +345,7 @@ GRANDCHILD = (
 )
 
 
+@posix_only
 async def test_a_grandchild_dies_with_the_group_on_timeout(pids: list[int]) -> None:
     result = await run_request(request(GRANDCHILD + SLEEP_30, timeout=2))
     assert result.timed_out is True
@@ -331,6 +354,7 @@ async def test_a_grandchild_dies_with_the_group_on_timeout(pids: list[int]) -> N
     assert await wait_until_dead(grandchild)
 
 
+@posix_only
 async def test_a_grandchild_holding_the_pipe_is_bounded_by_the_timeout(
     pids: list[int],
 ) -> None:
@@ -342,6 +366,7 @@ async def test_a_grandchild_holding_the_pipe_is_bounded_by_the_timeout(
     assert await wait_until_dead(grandchild)
 
 
+@posix_only
 async def test_a_grandchild_is_killed_after_a_normal_exit_too(pids: list[int]) -> None:
     code = (
         "import subprocess, sys\n"
@@ -356,6 +381,7 @@ async def test_a_grandchild_is_killed_after_a_normal_exit_too(pids: list[int]) -
     assert await wait_until_dead(grandchild)
 
 
+@posix_only
 async def test_cancel_kills_the_group_and_reraises(
     tmp_path: Path, pids: list[int]
 ) -> None:
@@ -378,6 +404,7 @@ async def test_cancel_kills_the_group_and_reraises(
 # -- output cap ----------------------------------------------------------------
 
 
+@posix_only
 async def test_a_megabyte_is_capped_and_drained() -> None:
     code = (
         "import sys\n"
@@ -394,6 +421,7 @@ async def test_a_megabyte_is_capped_and_drained() -> None:
     assert result.tail == "B" * TAIL_BYTES
 
 
+@posix_only
 async def test_output_just_over_the_head_stays_in_head_without_duplication() -> None:
     size = HEAD_BYTES + 100
     result = await run_request(request(f"import sys; sys.stdout.write('x' * {size})"))
@@ -403,6 +431,7 @@ async def test_output_just_over_the_head_stays_in_head_without_duplication() -> 
     assert result.truncated is False
 
 
+@posix_only
 async def test_output_at_the_cap_boundary() -> None:
     size = HEAD_BYTES + TAIL_BYTES
     result = await run_request(
@@ -412,12 +441,14 @@ async def test_output_at_the_cap_boundary() -> None:
     assert (len(result.head), len(result.tail)) == (HEAD_BYTES, TAIL_BYTES)
 
 
+@posix_only
 async def test_small_output_is_not_truncated() -> None:
     result = await run_request(request("print('hello')"))
     assert (result.head, result.tail, result.truncated) == ("hello\n", "", False)
     assert result.output_bytes == 6
 
 
+@posix_only
 async def test_no_output() -> None:
     result = await run_request(request("pass"))
     assert (result.head, result.tail, result.output_bytes, result.truncated) == (
@@ -428,6 +459,7 @@ async def test_no_output() -> None:
     )
 
 
+@posix_only
 async def test_non_utf8_bytes_are_replaced() -> None:
     code = (
         "import sys; sys.stdout.buffer.write(b'\\xff\\xfe'); sys.stdout.buffer.flush()"
@@ -437,6 +469,7 @@ async def test_non_utf8_bytes_are_replaced() -> None:
     assert result.output_bytes == 2
 
 
+@posix_only
 async def test_seconds_come_from_the_injected_clock() -> None:
     ticks = iter([10.0, 12.5])
     executor = PermissionsExecutor(environ=BASE_ENV, clock=lambda: next(ticks))
@@ -444,6 +477,7 @@ async def test_seconds_come_from_the_injected_clock() -> None:
     assert result.seconds == 2.5
 
 
+@posix_only
 async def test_a_reader_behind_a_flood_does_not_hang_cleanup_on_cancel(
     tmp_path: Path, pids: list[int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -468,6 +502,7 @@ async def test_a_reader_behind_a_flood_does_not_hang_cleanup_on_cancel(
     assert await wait_until_dead(pids[-1])
 
 
+@posix_only
 async def test_a_holder_that_left_the_group_does_not_hang_the_call(
     pids: list[int],
 ) -> None:

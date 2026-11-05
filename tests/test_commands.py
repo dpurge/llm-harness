@@ -9,6 +9,7 @@ from llm_harness.commands import (
     COMMANDS,
     FRONT_ENDS,
     HELP_COMMAND,
+    UI_DEMO_COMMAND,
     HelpCommand,
     help_answer,
     help_detail,
@@ -55,7 +56,7 @@ def test_other_text_is_not_help(text: str) -> None:
 def test_gui_overview_lists_the_buttons_and_no_slash_export_import_or_exit() -> None:
     lines = help_overview("gui").splitlines()
     assert sorted(overview_names("gui")) == sorted(
-        ["/memory", "/help", "/quit", "[button]", "[button]"]
+        ["/memory", "/help", "/ui-demo", "/quit", "[button]", "[button]"]
     )
     buttons = [line for line in lines if line.startswith("[button] ")]
     assert [b.split(" - ")[0] for b in buttons] == [
@@ -162,7 +163,7 @@ def test_the_table_agrees_with_the_words_each_front_end_dispatches_on() -> None:
         "plain": set(_EXIT_COMMANDS) | {COMMAND_WORD, HELP_COMMAND},
         "tui": set(_QUIT_COMMANDS)
         | {COMMAND_WORD, EXPORT_COMMAND, IMPORT_COMMAND, HELP_COMMAND},
-        "gui": {_QUIT_COMMAND, COMMAND_WORD, HELP_COMMAND},
+        "gui": {_QUIT_COMMAND, COMMAND_WORD, HELP_COMMAND, UI_DEMO_COMMAND},
     }
     assert set(dispatched) == FRONT_ENDS
     for front_end, words in dispatched.items():

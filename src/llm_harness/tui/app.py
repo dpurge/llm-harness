@@ -68,6 +68,7 @@ from llm_harness.types import (
     StatusEvent,
     TextDelta,
     ThinkingDelta,
+    UiSurface,
     UsageReport,
 )
 
@@ -512,6 +513,8 @@ class ChatApp(App[int]):
                     )
                 elif isinstance(event, Notice):
                     await self._show(sanitize_text(event.text), "note")
+                elif isinstance(event, UiSurface):
+                    await self._show("[ui surface omitted]", "note")
                 elif isinstance(event, UsageReport):
                     report = event
                 elif isinstance(event, Done):

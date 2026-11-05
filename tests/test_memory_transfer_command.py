@@ -36,6 +36,7 @@ from tests.test_memory_vectors_wiring import (
     failing_factory,
     vector_registry,
 )
+from tests.platform_marks import posix_only
 
 PAST = "2026-10-01T08:00:00Z"
 EARLIER = "2026-09-01T08:00:00Z"
@@ -172,6 +173,7 @@ async def test_memory_off_answers_before_any_filesystem_access(
 # --- export (17, 18, 19) ------------------------------------------------------------------
 
 
+@posix_only
 async def test_export_writes_a_faithful_0600_file(rig: Rig, tmp_path: Path) -> None:
     first = await rig.store.save("ann", "Ann likes tea", ["tea"])
     mine = await rig.store.save("ann", "Ann shares jam", ["jam"])
@@ -195,6 +197,7 @@ async def test_export_writes_a_faithful_0600_file(rig: Rig, tmp_path: Path) -> N
     assert "Bob" not in target.read_text()
 
 
+@posix_only
 async def test_export_without_a_path_writes_the_default_name_in_the_cwd(
     rig: Rig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -208,6 +211,7 @@ async def test_export_without_a_path_writes_the_default_name_in_the_cwd(
     assert MEMORIES_FILENAME == "llm-harness-memories.yaml"
 
 
+@posix_only
 async def test_export_never_overwrites(rig: Rig, tmp_path: Path) -> None:
     await rig.store.save("ann", "Ann likes tea", ["tea"])
     existing = tmp_path / "existing.yaml"
@@ -477,6 +481,7 @@ async def test_each_file_refusal_is_one_line_and_saves_nothing(
     assert await rig.store.list("ann") == []
 
 
+@posix_only
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a POSIX FIFO")
 async def test_a_fifo_is_refused_without_hanging(rig: Rig, tmp_path: Path) -> None:
     fifo = tmp_path / "pipe.yaml"

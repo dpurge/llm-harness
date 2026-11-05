@@ -14,6 +14,7 @@ from llm_harness.config import (
 from llm_harness.redact import REDACTED, Secret
 from llm_harness.secrets_file import SECRETS_FILE, Secrets, load_secrets
 from tests.test_config import qdrant_toml, write_config
+from tests.platform_marks import posix_only
 
 KEY = "sk-test-SECRET-123"
 VALID = f'[qdrant]\napi_key = "{KEY}"\n'
@@ -60,6 +61,7 @@ def test_file_without_a_key_gives_none(tmp_path: Path, text: str):
     assert load_secrets(tmp_path).qdrant_api_key is None
 
 
+@posix_only
 @pytest.mark.parametrize("mode", [0o644, 0o640, 0o604, 0o660])
 def test_shared_file_is_rejected_with_the_fix(tmp_path: Path, mode: int):
     path = write_secrets(tmp_path, VALID, mode)
@@ -142,6 +144,7 @@ def test_broken_toml_names_the_file_and_never_echoes_content(tmp_path: Path, tex
     assert "api_key" not in message
 
 
+@posix_only
 def test_file_that_is_not_utf8_is_rejected(tmp_path: Path):
     path = tmp_path / SECRETS_FILE
     path.write_bytes(b'[qdrant]\napi_key = "\xff\xfe"\n')
@@ -173,6 +176,7 @@ def test_qdrant_without_a_file_loads_with_no_key(
     assert load_config(tmp_path).qdrant_api_key is None
 
 
+@posix_only
 def test_qdrant_with_a_shared_file_fails_load_config(
     tmp_path: Path, client_installed: None
 ):
@@ -182,6 +186,7 @@ def test_qdrant_with_a_shared_file_fails_load_config(
         load_config(tmp_path)
 
 
+@posix_only
 @pytest.mark.parametrize("backend", ["qdrant-edge", "none"])
 def test_local_backends_never_read_the_file(tmp_path: Path, backend: str):
     write_config(
@@ -298,6 +303,7 @@ def test_bad_password_is_rejected_without_echoing_it(
     assert PASSWORD not in message
 
 
+@posix_only
 @pytest.mark.parametrize("mode", [0o644, 0o640])
 def test_shared_file_with_a_password_is_rejected(tmp_path: Path, mode: int):
     path = write_secrets(tmp_path, PG_VALID, mode)
@@ -335,6 +341,7 @@ def test_postgres_without_a_file_loads_with_no_password(
     assert load_config(tmp_path).postgres_password is None
 
 
+@posix_only
 def test_postgres_with_a_shared_file_fails_load_config(
     tmp_path: Path, driver_installed: None
 ):
@@ -396,6 +403,7 @@ def test_one_read_and_one_parse_serve_both_secrets(
     assert opened == [tmp_path / SECRETS_FILE]
 
 
+@posix_only
 @pytest.mark.parametrize("vector", ["qdrant-edge", "none"])
 def test_sqlite_with_local_vectors_never_reads_a_garbage_file(
     tmp_path: Path, vector: str
