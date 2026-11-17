@@ -39,7 +39,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from typing import Any
 
-from llm_harness.redact import Secret
+from llm_harness.core.redact import Secret
 from llm_harness.storage.postgres import PostgresRelationalStore, is_undefined_table
 from llm_harness.storage.relational import RelationalStoreError, SchemaTooNewError
 from llm_harness.storage.vector_common import (

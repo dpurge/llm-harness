@@ -22,7 +22,7 @@ from types import ModuleType
 from typing import Any
 from urllib.parse import urlsplit
 
-from llm_harness.redact import Secret
+from llm_harness.core.redact import Secret
 from llm_harness.storage.vector_common import (
     ORIGINAL_ID_KEY,
     check_name,

@@ -36,7 +36,7 @@ again.
 
 Three files under `~/.config/llm-harness/`. These are the example files the
 program offers to write (`EXAMPLE_CONFIG_TOML`, `EXAMPLE_MODELS_YAML` and
-`EXAMPLE_AGENTS_YAML` in `src/llm_harness/config.py`).
+`EXAMPLE_AGENTS_YAML` in `src/llm_harness/config/settings.py`).
 
 `config.toml` - connection settings, one `[providers.<id>]` table per provider,
 and an optional `user_id`:
@@ -1310,7 +1310,7 @@ Live tests of both tools call the real web and are off by default:
 
 ```sh
 SSL_CERT_FILE=/absolute/path/bundle.pem LLM_HARNESS_LIVE_RELAX_TLS_STRICT=1 \
-  uv run pytest -m live tests/test_live_web.py
+  uv run pytest -m live tests/live/test_live_web.py
 ```
 
 Both variables are optional; `LLM_HARNESS_LIVE_RELAX_TLS_STRICT=1` is read only
@@ -1364,7 +1364,7 @@ The allow/deny list looks only at the program, `argv[0]`:
   run another program (`sudo`, `env`, `xargs`, `timeout`, ...), system tools
   (`dd`, `diskutil`, `launchctl`, ...) and network clients (`curl`, `wget`,
   `ssh`, ...). The full list is `DEFAULT_COMMAND_DENY` in
-  `src/llm_harness/command_policy.py`. `command_deny` only adds to it.
+  `src/llm_harness/tools/command/policy.py`. `command_deny` only adds to it.
 - A command the list refuses comes back to the model as an error
   (`invalid arguments for tool run_command: ...`) and you are never asked.
 
@@ -1728,9 +1728,9 @@ The orchestrator prompt (`src/llm_harness/prompts/orchestrator.md`) has a
 treat it as data, to call `memory_search` with English words for more, and to
 trust you over an old note.
 
-Fixed values (in `src/llm_harness/memory_recall.py`, `src/llm_harness/memory.py`,
-`src/llm_harness/memory_index.py`, `src/llm_harness/memory_reflection.py` and
-`src/llm_harness/orchestrator.py`; none
+Fixed values (in `src/llm_harness/memory/recall.py`, `src/llm_harness/memory/store.py`,
+`src/llm_harness/memory/index.py`, `src/llm_harness/memory/reflection.py` and
+`src/llm_harness/core/orchestrator.py`; none
 of them is a configuration key):
 
 | Value | Fixed at |
@@ -2443,7 +2443,7 @@ Which command exists where:
 Assistant replies in the GUI and the terminal UI are rendered as markdown:
 CommonMark plus tables, strikethrough, task lists, footnotes, links and
 highlighted code (the list of extensions is the `_EXTENSIONS` tuple in
-`src/llm_harness/markdown_render.py`). Raw HTML in a reply is not interpreted:
+`src/llm_harness/frontends/markdown_render.py`). Raw HTML in a reply is not interpreted:
 it is shown as text. Images are never rendered or loaded (an image shows as its
 alt text). Links open only for `http`, `https`, `mailto` and `#fragment`. The
 terminal UI does not support task lists and footnotes and shows their syntax as
@@ -2621,7 +2621,7 @@ known whether it accepts the `thinking` settings as sent.
 uv run pytest              # offline, no network
 uv run ruff check
 uv run pytest -m live      # live tests, call real providers and web services
-uv run pytest -m live tests/test_live_ollama.py -k embed -rs   # embedding live test only
+uv run pytest -m live tests/live/test_live_ollama.py -k embed -rs   # embedding live test only
 ```
 
 Live tests read your real config. `LLM_HARNESS_LIVE_MODEL` (OpenAI-compatible
@@ -2630,12 +2630,12 @@ that choose the model; the application never reads them.
 
 The remote qdrant live test needs a qdrant server and skips, with a printed
 reason, when `LLM_HARNESS_LIVE_QDRANT_URL` is unset or no server answers within
-3 seconds. The module docstring of `tests/test_live_qdrant.py` has the container
+3 seconds. The module docstring of `tests/live/test_live_qdrant.py` has the container
 commands; with a server on `http://127.0.0.1:6333` (the Docker command under
 Remote qdrant, step 2):
 
 ```sh
-LLM_HARNESS_LIVE_QDRANT_URL=http://127.0.0.1:6333 uv run pytest -m live tests/test_live_qdrant.py
+LLM_HARNESS_LIVE_QDRANT_URL=http://127.0.0.1:6333 uv run pytest -m live tests/live/test_live_qdrant.py
 ```
 
 It is deselected by default; the default suite uses fakes and needs no server.
@@ -2643,11 +2643,11 @@ It is deselected by default; the default suite uses fakes and needs no server.
 The Postgres live tests need a PostgreSQL server. They skip, with a printed
 reason, when `LLM_HARNESS_LIVE_POSTGRES_URL` is unset or no server answers
 within 3 seconds. The commands are in the module docstrings of
-`tests/test_live_postgres.py` and `tests/test_storage_relational.py`:
+`tests/live/test_live_postgres.py` and `tests/storage/test_storage_relational.py`:
 
 ```sh
 docker --context rancher-desktop run -d --rm --name llm-harness-live-postgres -e POSTGRES_PASSWORD=live-test-password -e POSTGRES_DB=llm_harness_live -p 127.0.0.1:15432:5432 postgres:17
-LLM_HARNESS_LIVE_POSTGRES_URL=postgresql://postgres@127.0.0.1:15432/llm_harness_live LLM_HARNESS_LIVE_POSTGRES_PASSWORD=live-test-password uv run pytest -m live tests/test_live_postgres.py tests/test_storage_relational.py
+LLM_HARNESS_LIVE_POSTGRES_URL=postgresql://postgres@127.0.0.1:15432/llm_harness_live LLM_HARNESS_LIVE_POSTGRES_PASSWORD=live-test-password uv run pytest -m live tests/live/test_live_postgres.py tests/storage/test_storage_relational.py
 docker --context rancher-desktop rm -f llm-harness-live-postgres
 ```
 
@@ -2655,12 +2655,12 @@ The pgvector live tests need a server with the pgvector extension and a second,
 plain `postgres:17` server (only for the "not installed" tests; they skip without
 it). They skip, with a printed reason, when `LLM_HARNESS_LIVE_PGVECTOR_URL` is
 unset or no server answers within 3 seconds. The commands are in the module
-docstring of `tests/test_live_pgvector.py`:
+docstring of `tests/live/test_live_pgvector.py`:
 
 ```sh
 docker --context rancher-desktop run -d --rm --name llm-harness-live-pgvector -e POSTGRES_PASSWORD=live-test-password -e POSTGRES_DB=llm_harness_live -p 127.0.0.1:15433:5432 pgvector/pgvector:pg17
 docker --context rancher-desktop run -d --rm --name llm-harness-live-pgplain -e POSTGRES_PASSWORD=live-test-password -e POSTGRES_DB=llm_harness_live -p 127.0.0.1:15434:5432 postgres:17
-LLM_HARNESS_LIVE_PGVECTOR_URL=postgresql://postgres@127.0.0.1:15433/llm_harness_live LLM_HARNESS_LIVE_PGVECTOR_PLAIN_URL=postgresql://postgres@127.0.0.1:15434/llm_harness_live LLM_HARNESS_LIVE_POSTGRES_PASSWORD=live-test-password uv run pytest -m live tests/test_live_pgvector.py tests/test_storage_vectors.py -v -rs
+LLM_HARNESS_LIVE_PGVECTOR_URL=postgresql://postgres@127.0.0.1:15433/llm_harness_live LLM_HARNESS_LIVE_PGVECTOR_PLAIN_URL=postgresql://postgres@127.0.0.1:15434/llm_harness_live LLM_HARNESS_LIVE_POSTGRES_PASSWORD=live-test-password uv run pytest -m live tests/live/test_live_pgvector.py tests/storage/test_storage_vectors.py -v -rs
 docker --context rancher-desktop rm -f llm-harness-live-pgvector
 docker --context rancher-desktop rm -f llm-harness-live-pgplain
 ```

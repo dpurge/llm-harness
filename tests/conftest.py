@@ -1,6 +1,6 @@
 import pytest
 
-import llm_harness.store as store_module
+import llm_harness.models.ledger as store_module
 
 
 @pytest.fixture(autouse=True)

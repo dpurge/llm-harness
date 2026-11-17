@@ -6,6 +6,9 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ### Fixed
 
+- Terminal UI: the prompt is re-enabled when a reply stream ends without a Done or error event.
+- Web GUI: typing `/exit` quits the application, like `/quit` (and as in the terminal UI and `--plain`); `/exit` is listed in `/help`.
+- Web GUI and `--plain`: the tool name and agent id in the approval prompt are shown with control characters removed, as in the terminal UI.
 - Windows: absolute-path checks (`[tools] command_allow`/`command_deny`, the file store) no longer assume a leading `/`; file-open flags and `fchmod` that Windows lacks are skipped; the file-mode checks and warnings are skipped where mode bits carry no meaning; `command_allow`/`command_deny` paths may contain spaces; `git.exe` matches an entry `git`; the built-in deny list adds `cmd powershell pwsh wscript cscript mshta`; the fallback `PATH` is `System32`. Simulated in tests only; not run on a real Windows machine.
 
 ### Added

@@ -10,8 +10,8 @@ and the connection are made at first use.
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from llm_harness.config import ConfigError, StorageConfig
-from llm_harness.redact import Secret
+from llm_harness.config.settings import ConfigError, StorageConfig
+from llm_harness.core.redact import Secret
 from llm_harness.storage.files import FileStore, LocalFileStore
 from llm_harness.storage.pgvector import PgVectorStore
 from llm_harness.storage.postgres import PostgresRelationalStore

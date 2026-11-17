@@ -1,0 +1,1590 @@
+"""Terminal UI tests: Textual's Pilot drives the app with a scripted provider."""
+
+import asyncio
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import pytest
+from rich.text import Text
+from textual.pilot import Pilot
+from textual.widgets import Input, Markdown, Select, Static
+from textual.widgets.markdown import MarkdownBlock, MarkdownFence
+
+from llm_harness.tools.builtin import build_tool_registry
+from llm_harness.chat.commands import help_overview
+from llm_harness.config.settings import (
+    AgentConfig,
+    ConfigError,
+    HarnessConfig,
+    ProviderConfig,
+    StorageConfig,
+    ToolsConfig,
+    VectorConfig,
+)
+from llm_harness.memory.store import MemoryStore
+from llm_harness.memory.command import USAGE
+from llm_harness.core.redact import REDACTED
+from llm_harness.storage import open_storage
+from llm_harness.models.ledger import Store
+from llm_harness.core.subagents import make_subagent_factory_maker
+from llm_harness.frontends.tui.app import ChatApp
+from llm_harness.core.types import (
+    Done,
+    ErrorEvent,
+    StreamEvent,
+    TextDelta,
+    ThinkingDelta,
+    Usage,
+    UsageEvent,
+)
+from tests.support.fake_steps import ScriptedSteps, as_step_reply, reply_events
+from tests.support.fakes import ScriptedProvider, router_factory_for
+from tests.frontends.gui.test_gui import AddFactory
+from tests.support.platform_marks import posix_only
+
+CONFIG = HarnessConfig.model_validate(
+    {
+        "providers": {
+            "local": {"type": "ollama", "base_url": "http://localhost:11434"},
+            "remote": {
+                "type": "openai",
+                "base_url": "https://api.example/v1",
+                "api_key_env": "MISSING_KEY",
+            },
+        },
+        "models": [
+            {
+                "id": "m1",
+                "name": "Model One",
+                "provider": "local",
+                "model": "provider-model-1",
+                "tags": ["default"],
+                "priority": 1,
+            },
+            {
+                "id": "m2",
+                "name": "Model Two",
+                "provider": "local",
+                "model": "provider-model-2",
+                "tags": [],
+                "priority": 1,
+            },
+            {
+                "id": "m3",
+                "name": "Model Three",
+                "provider": "remote",
+                "model": "provider-model-3",
+                "tags": [],
+                "priority": 1,
+            },
+        ],
+    }
+)
+MODEL_1, MODEL_2, MODEL_3 = CONFIG.models
+
+REPLY = [TextDelta(text="Hel"), TextDelta(text="lo"), Done(finish_reason="stop")]
+
+
+class RecordingProvider(ScriptedProvider):
+    def __init__(self, events: list[StreamEvent], **kwargs: Any) -> None:
+        super().__init__(as_step_reply(events), **kwargs)
+        self.close_calls = 0
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
+class Factory:
+    """Builds one RecordingProvider per call; `openai` providers fail like a missing key."""
+
+    def __init__(self, events: list[StreamEvent], **provider_kwargs: Any) -> None:
+        self._events = events
+        self._provider_kwargs = provider_kwargs
+        self.providers: list[RecordingProvider] = []
+
+    def __call__(self, config: ProviderConfig) -> RecordingProvider:
+        if config.type == "openai":
+            raise ConfigError("environment variable MISSING_KEY is not set")
+        provider = RecordingProvider(self._events, **self._provider_kwargs)
+        self.providers.append(provider)
+        return provider
+
+
+CANARY = "sk-CANARY-123456789"
+RESPOND_HELLO = {"type": "respond", "text": "Hello"}
+ASK_FILE = {"type": "ask_user", "question": "Which file?"}
+
+
+class StepFactory:
+    """One ScriptedSteps provider serving full step replies, for every model."""
+
+    def __init__(self, scripts: list[list[StreamEvent]]) -> None:
+        self.provider = ScriptedSteps(scripts)
+
+    def __call__(self, config: ProviderConfig) -> ScriptedSteps:
+        return self.provider
+
+
+class BoomFactory(Factory):
+    """Like Factory, but `openai` providers fail with a non-ConfigError."""
+
+    def __call__(self, config: ProviderConfig) -> RecordingProvider:
+        if config.type == "openai":
+            raise ValueError(f"boom {CANARY}")
+        return super().__call__(config)
+
+
+class FlakyProvider(RecordingProvider):
+    """The first stream raises after one delta; later streams answer normally."""
+
+    async def stream_chat(self, req):
+        if self.requests:
+            async for event in super().stream_chat(req):
+                yield event
+            return
+        self.requests.append(req.model_copy(deep=True))
+        yield TextDelta(text="par")
+        raise RuntimeError(f"kaboom {CANARY}")
+
+
+class FlakyFactory:
+    def __init__(self) -> None:
+        self.providers: list[FlakyProvider] = []
+
+    def __call__(self, config: ProviderConfig) -> FlakyProvider:
+        provider = FlakyProvider(REPLY)
+        self.providers.append(provider)
+        return provider
+
+
+def make_app(
+    factory: Callable[[ProviderConfig], Any],
+    *,
+    model=MODEL_1,
+    think_flag=None,
+    is_manual=False,
+) -> ChatApp:
+    return ChatApp(
+        CONFIG, model, router_factory_for(CONFIG, factory, think_flag), is_manual
+    )
+
+
+async def test_the_orchestrator_gets_the_agent_from_the_config() -> None:
+    agent = AgentConfig(
+        id="boss",
+        name="Boss",
+        description="Leads.",
+        tags=["orchestrator"],
+        model_tags=[],
+    )
+    config = CONFIG.model_copy(update={"agents": [agent]})
+    app = ChatApp(
+        config,
+        MODEL_1,
+        router_factory_for(config, Factory(REPLY), None),
+        False,
+    )
+    async with app.run_test():
+        assert app._orchestrator is not None
+        assert app._orchestrator._agent_id == "boss"
+
+
+async def test_the_orchestrator_gets_the_subagents_and_the_factory() -> None:
+    helper = AgentConfig(
+        id="helper",
+        name="Helper",
+        description="Helps.",
+        tags=[],
+        model_tags=[],
+        examples=["Help me."],
+    )
+    config = CONFIG.model_copy(update={"agents": [helper]})
+
+    def factory(agent: AgentConfig) -> Any:
+        raise AssertionError("not called")
+
+    parents: list[Any] = []
+
+    def maker(parent: Any) -> Any:
+        parents.append(parent)
+        return factory
+
+    app = ChatApp(
+        config,
+        MODEL_1,
+        router_factory_for(config, Factory(REPLY), None),
+        False,
+        subagent_factory_maker=maker,
+    )
+    async with app.run_test():
+        assert app._orchestrator is not None
+        assert app._orchestrator.subagents == (helper,)
+        assert app._orchestrator._subagent_factory is factory
+        assert parents == [app._router]
+
+
+def texts(app: ChatApp, css_class: str) -> list[str]:
+    return [w.visual.plain for w in app.query(f"#log Static.{css_class}")]
+
+
+def reply_texts(app: ChatApp) -> list[str]:
+    """The rendered text of each reply: its non-empty markdown blocks, one per line."""
+    return [
+        "\n".join(b.visual.plain for b in w.query(MarkdownBlock) if b.visual.plain)
+        for w in app.query("#log Markdown.reply")
+    ]
+
+
+def prompt_of(app: ChatApp) -> Input:
+    return app.query_one("#prompt", Input)
+
+
+async def wait_for(pilot: Pilot, condition: Callable[[], bool]) -> None:
+    for _ in range(200):
+        if condition():
+            return
+        await pilot.pause()
+    raise AssertionError("condition not reached")
+
+
+async def send(pilot: Pilot, app: ChatApp, text: str) -> None:
+    prompt_of(app).value = text
+    await pilot.press("enter")
+    await app.workers.wait_for_complete()
+    await pilot.pause()
+
+
+# Streaming and display
+
+
+async def test_streamed_reply_appears_in_the_log() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        assert texts(app, "user") == ["you: hi"]
+        assert reply_texts(app) == ["Hello"]
+        assert prompt_of(app).value == ""
+
+
+async def test_blank_input_is_ignored() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "   ")
+        assert factory.providers[0].requests == []
+        assert texts(app, "user") == []
+
+
+async def test_thinking_is_in_a_collapsed_block_not_in_the_reply() -> None:
+    factory = Factory([ThinkingDelta(text="pond"), ThinkingDelta(text="ering"), *REPLY])
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        (block,) = app.query("#log Collapsible")
+        assert block.title == "Thinking"
+        assert block.collapsed is True
+        assert texts(app, "thinking") == ["pondering"]
+        assert reply_texts(app) == ["Hello"]
+
+
+async def test_no_thinking_block_without_thinking_deltas() -> None:
+    app = make_app(Factory(REPLY))
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        assert list(app.query("#log Collapsible")) == []
+
+
+async def test_usage_line_follows_the_reply() -> None:
+    usage = UsageEvent(usage=Usage(input_tokens=3, output_tokens=7))
+    app = make_app(Factory([TextDelta(text="x"), usage, Done()]))
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        (line,) = texts(app, "usage")
+        assert line.startswith("[m1 tokens in=3 out=7 $0.00 ")
+        assert line.endswith("s | session $0.00]")
+
+
+async def test_error_event_shows_error_and_restores_the_input() -> None:
+    factory = Factory(
+        [TextDelta(text="par"), ErrorEvent(kind="auth", message="bad key")]
+    )
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hello")
+        assert texts(app, "error") == ["error (auth): bad key"]
+        assert prompt_of(app).value == "hello"
+        assert prompt_of(app).disabled is False
+        assert app._orchestrator is not None
+        assert app._orchestrator.has_completed_turn is False
+
+
+async def test_input_is_disabled_during_a_turn_and_enabled_after() -> None:
+    factory = Factory([ThinkingDelta(text="par"), *REPLY], hang_after=1)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        prompt_of(app).value = "hi"
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: texts(app, "thinking") == ["par"])
+        assert prompt_of(app).disabled is True
+        await pilot.press("escape")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert prompt_of(app).disabled is False
+
+
+async def test_escape_cancels_the_turn_and_restores_the_input() -> None:
+    factory = Factory([ThinkingDelta(text="par"), *REPLY], hang_after=1)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        prompt_of(app).value = "hi there"
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: texts(app, "thinking") == ["par"])
+        await pilot.press("escape")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert texts(app, "note") == ["cancelled"]
+        assert prompt_of(app).value == "hi there"
+        assert app._orchestrator is not None
+        assert app._orchestrator.has_completed_turn is False
+        assert factory.providers[0].closed is True
+
+
+def request_text(request) -> str:
+    return "\n".join(m.content for m in request.messages)
+
+
+async def test_the_ui_never_sends_a_transcript_only_state() -> None:
+    first = f"remember {CANARY}"
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, first)
+        await send(pilot, app, "two")
+        requests = factory.providers[0].requests
+        assert [m.role for m in requests[-1].messages] == ["system", "user"]
+        assert CANARY in request_text(requests[0])
+        assert CANARY not in request_text(requests[1])
+        assert "Hello" not in request_text(requests[1])
+
+
+async def test_text_kept_in_the_state_is_sent_again_on_the_next_turn() -> None:
+    kept = {"findings": {"$append": [{"text": CANARY, "source": "user"}]}}
+    reply = reply_events(RESPOND_HELLO, {"goal": "g", **kept})
+    factory = StepFactory([reply, reply_events(RESPOND_HELLO)])
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "one")
+        await send(pilot, app, "two")
+        assert CANARY in request_text(factory.provider.requests[1])
+
+
+@pytest.mark.parametrize("flag", [True, False, None])
+async def test_think_flag_reaches_the_request(flag: bool | None) -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory, think_flag=flag)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        assert factory.providers[0].requests[-1].think is flag
+
+
+class ErrorThenReplyFactory:
+    """The first provider fails every call; later ones answer normally."""
+
+    def __init__(self) -> None:
+        self.providers: list[RecordingProvider] = []
+
+    def __call__(self, config: ProviderConfig) -> RecordingProvider:
+        events = (
+            REPLY
+            if self.providers
+            else [ErrorEvent(kind="connection", message="refused")]
+        )
+        provider = RecordingProvider(events)
+        self.providers.append(provider)
+        return provider
+
+
+async def test_a_status_line_follows_each_valid_step() -> None:
+    app = make_app(Factory(REPLY))
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        assert texts(app, "note") == ["step 1: answering"]
+
+
+async def test_a_status_line_is_plain_sanitised_text() -> None:
+    hostile = "[bold red]x[/]\x1b[31m"
+    factory = StepFactory(
+        [
+            reply_events({"type": "call_tool", "tool": hostile}, {"goal": "g"}),
+            reply_events(RESPOND_HELLO),
+        ]
+    )
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        assert texts(app, "note") == [
+            "step 1: calling tool [bold red]x[/][31m",
+            "step 2: answering",
+        ]
+        assert "\x1b" not in screen_text(app)
+
+
+async def test_the_ask_user_question_is_shown_as_the_assistant_reply() -> None:
+    factory = StepFactory([reply_events(ASK_FILE, {"goal": "g"})])
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "fix it")
+        assert reply_texts(app) == ["Which file?"]
+        assert texts(app, "note") == ["step 1: asking the user"]
+        assert texts(app, "error") == []
+        assert prompt_of(app).disabled is False
+
+
+async def test_the_selector_stays_free_after_a_failed_first_turn() -> None:
+    factory = ErrorThenReplyFactory()
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        (error,) = texts(app, "error")
+        assert error.endswith("pick a model to try it now")
+        assert app._orchestrator is not None
+        assert app._orchestrator.has_completed_turn is False
+        app.query_one("#model", Select).value = "m2"
+        await pilot.pause()
+        assert len(factory.providers) == 2
+        assert texts(app, "note") == []
+        await send(pilot, app, "hi")
+        assert reply_texts(app) == ["Hello"]
+        assert factory.providers[1].requests[-1].model == "provider-model-2"
+
+
+async def test_the_selector_locks_after_a_completed_turn() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        assert app._orchestrator is not None
+        assert app._orchestrator.has_completed_turn is False
+        await send(pilot, app, "hi")
+        assert app._orchestrator.has_completed_turn is True
+        app.query_one("#model", Select).value = "m2"
+        await pilot.pause()
+        assert len(factory.providers) == 1
+        assert "applies to the next new chat (Ctrl+N)" in texts(app, "note")
+
+
+async def test_an_ask_user_turn_also_locks_the_selector() -> None:
+    app = make_app(StepFactory([reply_events(ASK_FILE, {"goal": "g"})]))
+    async with app.run_test() as pilot:
+        await send(pilot, app, "fix it")
+        assert app._orchestrator is not None
+        assert app._orchestrator.has_completed_turn is True
+
+
+# Security
+
+MARKUP = "[bold red]x[/] [link=http://evil]y[/link]"
+
+
+async def test_markup_in_model_text_appears_literally() -> None:
+    factory = Factory(
+        [
+            ThinkingDelta(text=MARKUP),
+            TextDelta(text=MARKUP),
+            Done(),
+        ]
+    )
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, MARKUP)
+        assert reply_texts(app) == [MARKUP]
+        assert texts(app, "thinking") == [MARKUP]
+        assert texts(app, "user") == [f"you: {MARKUP}"]
+
+
+async def test_markup_in_an_error_message_appears_literally() -> None:
+    factory = Factory([ErrorEvent(kind="bad_request", message=MARKUP)])
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        assert texts(app, "error") == [f"error (bad_request): {MARKUP}"]
+
+
+async def test_control_characters_are_stripped_from_all_model_text() -> None:
+    dirty = "a\x1b[31mb\x07c\x9bd\x7fe\nf"
+    clean = "a[31mbcde\nf"
+    factory = Factory([ThinkingDelta(text=dirty), TextDelta(text=dirty), Done()])
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        # Markdown joins the two lines of a paragraph with a space.
+        assert reply_texts(app) == [clean.replace("\n", " ")]
+        assert texts(app, "thinking") == [clean]
+    error_app = make_app(Factory([ErrorEvent(kind="bad_request", message=dirty)]))
+    async with error_app.run_test() as pilot:
+        await send(pilot, error_app, "hi")
+        assert texts(error_app, "error") == [f"error (bad_request): {clean}"]
+
+
+# Model selector
+
+
+async def test_selector_lists_exactly_the_models_yaml_names() -> None:
+    app = make_app(Factory(REPLY))
+    async with app.run_test():
+        select = app.query_one("#model", Select)
+        assert [label.plain for label, _ in select._options] == [
+            "Model One",
+            "Model Two",
+            "Model Three",
+        ]
+        assert [value for _, value in select._options] == ["m1", "m2", "m3"]
+        assert select.value == "m1"
+
+
+async def test_selector_starts_on_the_requested_model() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory, model=MODEL_2)
+    async with app.run_test() as pilot:
+        assert app.query_one("#model", Select).value == "m2"
+        await send(pilot, app, "hi")
+        assert factory.providers[0].requests[-1].model == "provider-model-2"
+
+
+async def test_selection_with_empty_history_applies_immediately() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        app.query_one("#model", Select).value = "m2"
+        await pilot.pause()
+        await send(pilot, app, "hi")
+        assert len(factory.providers) == 2
+        assert factory.providers[0].close_calls == 1
+        assert factory.providers[1].requests[-1].model == "provider-model-2"
+
+
+async def test_selection_with_history_waits_for_ctrl_n() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "first")
+        app.query_one("#model", Select).value = "m2"
+        await pilot.pause()
+        assert texts(app, "note") == [
+            "step 1: answering",
+            "applies to the next new chat (Ctrl+N)",
+        ]
+        assert len(factory.providers) == 1
+
+        await send(pilot, app, "second")
+        assert factory.providers[0].requests[-1].model == "provider-model-1"
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        assert len(factory.providers) == 2
+        assert factory.providers[0].close_calls == 1
+        assert reply_texts(app) == []
+        await send(pilot, app, "third")
+        request = factory.providers[1].requests[-1]
+        assert request.model == "provider-model-2"
+        assert "first" not in request_text(request)
+
+
+async def test_config_error_on_selection_is_shown_and_session_keeps_working() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        app.query_one("#model", Select).value = "m3"
+        await pilot.pause()
+        assert texts(app, "error") == [
+            "error: environment variable MISSING_KEY is not set"
+        ]
+        assert app.query_one("#model", Select).value == "m1"
+        await send(pilot, app, "hi")
+        assert factory.providers[0].requests[-1].model == "provider-model-1"
+        assert factory.providers[0].close_calls == 0
+
+
+async def test_config_error_on_new_chat_keeps_the_current_chat() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "first")
+        app.query_one("#model", Select).value = "m3"
+        await pilot.pause()
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        assert texts(app, "error") == [
+            "error: environment variable MISSING_KEY is not set"
+        ]
+        assert reply_texts(app) == ["Hello"]
+        await send(pilot, app, "second")
+        assert len(factory.providers[0].requests) == 2
+        assert factory.providers[0].requests[-1].model == "provider-model-1"
+
+
+async def test_failed_initial_model_can_be_replaced_by_a_working_one() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory, model=MODEL_3)
+    async with app.run_test() as pilot:
+        assert len(texts(app, "error")) == 1
+        await send(pilot, app, "hi")
+        assert texts(app, "user") == []
+        assert "no working model" in texts(app, "error")[-1]
+        app.query_one("#model", Select).value = "m1"
+        await pilot.pause()
+        await send(pilot, app, "hi")
+        assert reply_texts(app) == ["Hello"]
+
+
+# Unexpected exceptions
+
+
+def screen_text(app: ChatApp) -> str:
+    return "\n".join(w.visual.plain for w in app.screen.query(Static))
+
+
+async def test_unexpected_stream_exception_is_one_masked_line_and_the_app_goes_on() -> (
+    None
+):
+    factory = FlakyFactory()
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hello")
+        assert texts(app, "error") == [
+            f"error (unexpected): RuntimeError: kaboom {REDACTED}"
+        ]
+        assert CANARY not in screen_text(app)
+        assert "Traceback" not in screen_text(app)
+        assert prompt_of(app).value == "hello"
+        assert prompt_of(app).disabled is False
+        assert app._orchestrator is not None
+        assert app._orchestrator.has_completed_turn is False
+        await send(pilot, app, "again")
+        assert reply_texts(app) == ["Hello"]
+        assert prompt_of(app).value == ""
+        assert app.return_code is None
+
+
+async def test_unexpected_provider_factory_exception_keeps_the_current_session() -> (
+    None
+):
+    factory = BoomFactory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "first")
+        app.query_one("#model", Select).value = "m3"
+        await pilot.pause()
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        assert texts(app, "error") == [
+            f"error (unexpected): ValueError: boom {REDACTED}"
+        ]
+        assert CANARY not in screen_text(app)
+        assert "Traceback" not in screen_text(app)
+        assert prompt_of(app).disabled is False
+        await send(pilot, app, "second")
+        assert len(factory.providers[0].requests) == 2
+        assert factory.providers[0].requests[-1].model == "provider-model-1"
+        assert factory.providers[0].close_calls == 0
+
+
+async def test_unexpected_factory_exception_on_the_first_model_is_shown_too() -> None:
+    factory = BoomFactory(REPLY)
+    app = make_app(factory, model=MODEL_3)
+    async with app.run_test():
+        assert texts(app, "error") == [
+            f"error (unexpected): ValueError: boom {REDACTED}"
+        ]
+        assert CANARY not in screen_text(app)
+
+
+# Model names are literal text
+
+NAMES = ["GPT [beta]", "[/]", "[bold]x[/bold]"]
+
+
+def config_with_names(names: list[str]) -> HarnessConfig:
+    return HarnessConfig.model_validate(
+        {
+            "providers": {"local": {"type": "ollama", "base_url": "http://x"}},
+            "models": [
+                {
+                    "id": f"id{i}",
+                    "name": name,
+                    "provider": "local",
+                    "model": "m",
+                    "tags": [],
+                    "priority": 1,
+                }
+                for i, name in enumerate(names)
+            ],
+        }
+    )
+
+
+@pytest.mark.parametrize("initial", range(len(NAMES)))
+async def test_model_names_are_literal_text_not_markup(initial: int) -> None:
+    config = config_with_names(NAMES)
+    app = ChatApp(
+        config,
+        config.models[initial],
+        router_factory_for(config, Factory(REPLY)),
+        False,
+    )
+    async with app.run_test() as pilot:
+        select = app.query_one("#model", Select)
+        for index, name in enumerate(NAMES):
+            select.value = f"id{index}"
+            await pilot.pause()
+            assert select.query_one("#label", Static).visual.plain == name
+        prompts = [
+            option.prompt for option in select.query_one("SelectOverlay").options
+        ]
+        assert all(isinstance(prompt, Text) for prompt in prompts)
+        assert [prompt.plain for prompt in prompts] == NAMES
+
+
+def embedding_config_app() -> ChatApp:
+    config = HarnessConfig.model_validate(
+        {
+            "providers": {"local": {"type": "ollama", "base_url": "http://x"}},
+            "models": [
+                {
+                    "id": "bge-m3-local",
+                    "name": "BGE M3",
+                    "provider": "local",
+                    "model": "bge-m3",
+                    "tags": ["embedding"],
+                    "priority": 1,
+                },
+                {
+                    "id": "chat1",
+                    "name": "Chat One",
+                    "provider": "local",
+                    "model": "chat-model",
+                    "tags": ["default"],
+                    "priority": 1,
+                },
+            ],
+        }
+    )
+    return ChatApp(
+        config, config.models[1], router_factory_for(config, Factory(REPLY)), False
+    )
+
+
+async def test_selector_hides_embedding_models() -> None:
+    app = embedding_config_app()
+    async with app.run_test():
+        select = app.query_one("#model", Select)
+        assert [(label.plain, value) for label, value in select._options] == [
+            ("Chat One", "chat1")
+        ]
+
+
+# Fallback notes, the usage line and the manual flag
+
+FALLBACK_CONFIG = HarnessConfig.model_validate(
+    {
+        "providers": {
+            "dead": {"type": "ollama", "base_url": "http://dead.invalid:1"},
+            "local": {"type": "ollama", "base_url": "http://local.invalid:2"},
+        },
+        "models": [
+            {
+                "id": "dead-model",
+                "name": "Dead",
+                "provider": "dead",
+                "model": "dead-id",
+                "tags": ["default", "chat"],
+                "priority": 200,
+            },
+            {
+                "id": "live-model",
+                "name": "Live",
+                "provider": "local",
+                "model": "live-id",
+                "tags": ["chat", "default"],
+                "priority": 100,
+                "price": {"input_per_mtok": 1000, "output_per_mtok": 2000},
+            },
+        ],
+    }
+)
+DEAD_MODEL = FALLBACK_CONFIG.models[0]
+
+
+class FallbackFactory:
+    """`dead` fails to connect; `local` answers with 3 in / 7 out tokens."""
+
+    def __init__(self) -> None:
+        self.dead = RecordingProvider(
+            [ErrorEvent(kind="connection", message="refused")]
+        )
+        self.live = RecordingProvider(
+            [
+                TextDelta(text="pong"),
+                UsageEvent(usage=Usage(input_tokens=3, output_tokens=7)),
+                Done(),
+            ]
+        )
+
+    def __call__(self, config: ProviderConfig) -> RecordingProvider:
+        return self.dead if (config.base_url or "").endswith(":1") else self.live
+
+
+def fallback_app(factory: FallbackFactory) -> ChatApp:
+    router_factory = router_factory_for(FALLBACK_CONFIG, factory)
+    return ChatApp(FALLBACK_CONFIG, DEAD_MODEL, router_factory, False)
+
+
+async def test_a_fallback_shows_the_note_the_reply_and_the_usage_line() -> None:
+    app = fallback_app(FallbackFactory())
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        assert texts(app, "note") == [
+            "dead-model unavailable (connection); using live-model",
+            "step 1: answering",
+        ]
+        assert reply_texts(app) == ["pong"]
+        (line,) = texts(app, "usage")
+        assert line.startswith("[live-model tokens in=3 out=7 $0.02 ")
+        assert line.endswith("s | session $0.02]")
+        assert texts(app, "error") == []
+
+
+async def test_a_new_chat_starts_its_session_cost_at_zero_again() -> None:
+    factory = FallbackFactory()
+    router_factory = router_factory_for(FALLBACK_CONFIG, factory)
+    maker = make_subagent_factory_maker(FALLBACK_CONFIG, factory, None, None)
+    app = ChatApp(
+        FALLBACK_CONFIG,
+        DEAD_MODEL,
+        router_factory,
+        False,
+        subagent_factory_maker=maker,
+    )
+    async with app.run_test() as pilot:
+        await send(pilot, app, "one")
+        (first,) = texts(app, "usage")
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        await send(pilot, app, "two")
+        (second,) = texts(app, "usage")
+    # One turn costs $0.017: a carried-over total would show $0.03 in the second.
+    assert first.endswith("s | session $0.02]")
+    assert second.endswith("s | session $0.02]")
+
+
+async def test_a_second_turn_skips_the_model_in_backoff_when_a_store_is_used(
+    tmp_path: Path,
+) -> None:
+    factory = FallbackFactory()
+    store = Store(tmp_path / "harness.db")
+    router_factory = router_factory_for(FALLBACK_CONFIG, factory, None, store)
+    app = ChatApp(FALLBACK_CONFIG, DEAD_MODEL, router_factory, False)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "one")
+        await send(pilot, app, "two")
+        assert texts(app, "note") == [
+            "dead-model unavailable (connection); using live-model",
+            "step 1: answering",
+            "dead-model is in backoff; using live-model",
+            "step 1: answering",
+        ]
+        assert [line.rsplit("| ", 1)[1] for line in texts(app, "usage")] == [
+            "session $0.02]",
+            "session $0.03]",
+        ]
+        assert len(factory.dead.requests) == 1
+
+
+async def test_an_unusable_database_notice_is_shown_once_as_a_note(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "harness.db").mkdir()  # a directory where the file should be
+    router_factory = router_factory_for(
+        CONFIG, Factory(REPLY), None, Store(tmp_path / "harness.db")
+    )
+    app = ChatApp(CONFIG, MODEL_1, router_factory, False)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "one")
+        await send(pilot, app, "two")
+        note, *steps = texts(app, "note")
+        assert note.startswith("usage database unavailable (")
+        assert steps == ["step 1: answering"] * 2
+        assert reply_texts(app) == ["Hello", "Hello"]
+
+
+async def test_quit_closes_every_provider_the_router_built() -> None:
+    factory = FallbackFactory()
+    app = fallback_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        await pilot.press("ctrl+q")
+    assert (factory.dead.close_calls, factory.live.close_calls) == (1, 1)
+
+
+async def test_the_default_model_is_automatic_and_a_selector_change_is_manual() -> None:
+    router_factory = router_factory_for(CONFIG, Factory(REPLY))
+    app = ChatApp(CONFIG, MODEL_1, router_factory, False)
+    async with app.run_test() as pilot:
+        assert router_factory.calls == [("m1", False)]
+        await send(pilot, app, "hi")
+        await pilot.press("ctrl+n")  # same model: the flag is kept
+        await pilot.pause()
+        assert router_factory.calls[-1] == ("m1", False)
+
+        app.query_one("#model", Select).value = "m2"  # empty history: applies now
+        await pilot.pause()
+        assert router_factory.calls[-1] == ("m2", True)
+
+        await send(pilot, app, "hi")
+        app.query_one("#model", Select).value = "m1"  # waits for the next new chat
+        await pilot.pause()
+        assert len(router_factory.calls) == 3
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        assert router_factory.calls[-1] == ("m1", True)
+        await pilot.press("ctrl+n")  # no selector change: the flag is kept
+        await pilot.pause()
+        assert router_factory.calls[-1] == ("m1", True)
+
+
+async def test_a_model_given_on_the_command_line_stays_manual_on_new_chat() -> None:
+    router_factory = router_factory_for(CONFIG, Factory(REPLY))
+    app = ChatApp(CONFIG, MODEL_1, router_factory, True)
+    async with app.run_test() as pilot:
+        assert router_factory.calls == [("m1", True)]
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        assert router_factory.calls[-1] == ("m1", True)
+
+
+# Quit
+
+
+async def test_quit_closes_the_active_provider() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+q")
+    assert factory.providers[0].close_calls == 1
+
+
+@pytest.mark.parametrize("command", ["/quit", " /QUIT ", "/exit"])
+async def test_quit_command_quits_without_a_model_call(command: str) -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        prompt_of(app).value = command
+        await pilot.press("enter")
+        await pilot.pause()
+    assert app.return_code == 0
+    assert factory.providers[0].requests == []
+    assert factory.providers[0].close_calls == 1
+
+
+async def test_quit_command_while_a_turn_runs_cancels_it_and_quits() -> None:
+    factory = Factory(REPLY, hang_after=0)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        prompt_of(app).value = "hi"
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: prompt_of(app).disabled)
+        # The input is disabled during a turn, so the message is posted directly.
+        prompt = prompt_of(app)
+        prompt.post_message(Input.Submitted(prompt, "/quit"))
+        await pilot.pause()
+    assert app.return_code == 0
+    assert len(factory.providers[0].requests) == 1
+    assert factory.providers[0].closed is True
+    assert factory.providers[0].close_calls == 1
+
+
+async def test_quit_command_is_not_sent_to_the_model() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        prompt_of(app).value = "/quit"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._orchestrator is not None
+        assert app._orchestrator.state.turn == 1
+        assert len(factory.providers[0].requests) == 1
+        assert texts(app, "user") == ["you: hi"]
+
+
+async def test_text_that_merely_contains_quit_is_a_normal_message() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "/quit now")
+        assert texts(app, "user") == ["you: /quit now"]
+        assert len(factory.providers[0].requests) == 1
+
+
+async def test_the_placeholder_mentions_the_quit_command() -> None:
+    app = make_app(Factory(REPLY))
+    async with app.run_test():
+        assert "/quit" in prompt_of(app).placeholder
+
+
+async def test_footer_shows_the_key_bindings() -> None:
+    app = make_app(Factory(REPLY))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        shown = {
+            active.binding.key
+            for active in app.active_bindings.values()
+            if active.binding.show
+        }
+        assert {"escape", "ctrl+n", "ctrl+q"} <= shown
+
+
+# Markdown in the reply
+
+
+@dataclass
+class Rendered:
+    reply: list[str]
+    cells: list[str]
+    fences: list[tuple[str, str]]
+    errors: list[str]
+
+
+async def render_reply(text: str, *, deltas: list[str] | None = None) -> Rendered:
+    """Run one turn whose reply is `text` (or `deltas`) and read what the log shows."""
+    events = [TextDelta(text=d) for d in (deltas or [text])] + [Done()]
+    app = make_app(Factory(events))
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        await pilot.pause()
+        return Rendered(
+            reply=reply_texts(app),
+            cells=[
+                w.visual.plain for w in app.query("#log Markdown.reply .cell, .header")
+            ],
+            fences=[(w.code, w.lexer) for w in app.query(MarkdownFence)],
+            errors=texts(app, "error"),
+        )
+
+
+async def test_the_reply_is_a_markdown_widget_and_the_rest_stays_plain_static() -> None:
+    events = [
+        ThinkingDelta(text="t"),
+        TextDelta(text="**hi**"),
+        Done(),
+    ]
+    app = make_app(Factory(events))
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        (reply,) = app.query("#log .reply")
+        assert isinstance(reply, Markdown)
+        assert reply.source == "**hi**"
+        assert reply_texts(app) == ["hi"]
+        for css_class in ("user", "thinking"):
+            (plain,) = app.query(f"#log .{css_class}")
+            assert type(plain) is Static
+            assert not isinstance(plain, Markdown)
+
+
+async def test_a_table_renders_as_cells() -> None:
+    r = await render_reply("| a | b |\n|---|---|\n| 1 | 2 |\n")
+    assert r.cells == ["a", "b", "1", "2"]
+
+
+async def test_a_code_fence_renders_as_a_fence_block_with_its_language() -> None:
+    r = await render_reply("```python\nx = 1\n```\n")
+    assert r.fences == [("x = 1", "python")]
+
+
+async def test_strikethrough_and_autolink_text_render() -> None:
+    r = await render_reply("~~gone~~ see https://a.example/x")
+    assert r.reply == ["gone see https://a.example/x"]
+
+
+async def test_rich_markup_and_raw_html_in_the_reply_stay_literal() -> None:
+    text = (
+        "[bold red]x[/] <b>y</b> <script>alert(1)</script> [link=http://evil]z[/link]"
+    )
+    r = await render_reply(text)
+    assert r.reply == [text]
+
+
+async def test_raw_html_in_a_code_fence_stays_literal() -> None:
+    r = await render_reply("```\n<script>alert(1)</script>\n```\n")
+    assert r.fences == [("<script>alert(1)</script>", "")]
+
+
+async def test_control_characters_are_stripped_before_markdown_is_parsed() -> None:
+    r = await render_reply("**a\x1b[31mb\x07**\u202ec")
+    assert r.reply == ["a[31mbc"]
+
+
+async def test_footnotes_and_task_lists_do_not_crash_the_terminal_reply() -> None:
+    # Textual's widget cannot show footnotes; the parser must leave them as text.
+    text = "a[^1]\n\n[^1]: note\n\n- [x] done\n"
+    r = await render_reply(text)
+    assert r.errors == []
+    assert "[x] done" in r.reply[0]
+
+
+async def test_an_image_shows_its_alt_text_and_nothing_is_fetched() -> None:
+    r = await render_reply("![the alt](http://evil.example/p.png?q=secret)")
+    assert r.errors == []
+    assert "the alt" in r.reply[0]
+
+
+async def test_unfinished_fences_tables_and_emphasis_do_not_raise() -> None:
+    for text in ("```py\nx = ", "| a | b |\n|---|", "**bold and *it", "[x](http://a"):
+        r = await render_reply(text)
+        assert r.errors == [], text
+
+
+async def test_streaming_deltas_end_rendered() -> None:
+    r = await render_reply("", deltas=["**bo", "ld**"])
+    assert r.reply == ["bold"]
+
+
+async def test_a_link_in_the_reply_opens_nothing_on_render_or_click(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr(ChatApp, "open_url", lambda self, url, **kw: opened.append(url))
+    app = make_app(
+        Factory([TextDelta(text="[x](https://e.example) https://a.example"), Done()])
+    )
+    async with app.run_test() as pilot:
+        await send(pilot, app, "hi")
+        (reply,) = app.query("#log Markdown.reply")
+        assert opened == []
+        reply.post_message(Markdown.LinkClicked(reply, "https://e.example"))
+        await pilot.pause()
+        assert opened == []
+
+
+# Storage
+
+
+class SpyStorage:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+async def test_the_orchestrator_gets_the_storage_and_exit_closes_it_once() -> None:
+    storage = SpyStorage()
+    app = ChatApp(
+        CONFIG,
+        MODEL_1,
+        router_factory_for(CONFIG, Factory(REPLY)),
+        False,
+        storage,  # type: ignore[arg-type]
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._orchestrator is not None
+        assert app._orchestrator._storage is storage
+        assert storage.close_calls == 0
+    assert storage.close_calls == 1
+
+
+# /help
+
+
+async def test_help_shows_the_overview_as_a_note_without_a_model_call() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "/help")
+        assert texts(app, "note") == [help_overview("tui")]
+        assert texts(app, "user") == []
+        assert prompt_of(app).value == ""
+        assert not any(p.requests for p in factory.providers)
+
+
+async def test_help_memory_shows_the_memory_usage_in_the_tui() -> None:
+    app = make_app(Factory(REPLY))
+    async with app.run_test() as pilot:
+        await send(pilot, app, "/Help memory")
+        assert texts(app, "note") == [USAGE]
+
+
+async def memory_front_end(
+    tmp_path: Path, user_id: str, admins: list[str]
+) -> tuple[HarnessConfig, Any, Any]:
+    """A config naming `user_id` and `admins`, a memory registry and a storage holding note #1."""
+    storage = open_storage(
+        StorageConfig(vector=VectorConfig(backend="none")),
+        tmp_path,
+        relational_path=tmp_path / "memory.db",
+    )
+    await MemoryStore(storage.relational).save("alice", "likes tea", ["drink"])
+    config = CONFIG.model_copy(
+        update={"user_id": user_id, "tools": ToolsConfig(memory_admins=admins)}
+    )
+    return config, build_tool_registry([], memory=True, user_id=user_id), storage
+
+
+NOT_ADMIN = "only memory admins may publish or unpublish shared memories"
+
+
+@pytest.mark.parametrize(
+    ("user_id", "admins", "expected"),
+    [
+        ("alice", ["alice"], "published memory #1"),
+        ("alice", ["bob"], NOT_ADMIN),
+        ("alice", [], NOT_ADMIN),
+    ],
+)
+async def test_memory_publish_in_the_tui_needs_an_admin(
+    tmp_path: Path, user_id: str, admins: list[str], expected: str
+) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, user_id, admins)
+    try:
+        factory = Factory(REPLY)
+        app = ChatApp(
+            config,
+            MODEL_1,
+            router_factory_for(config, factory, None),
+            False,
+            storage,
+            tools,
+        )
+        async with app.run_test() as pilot:
+            await send(pilot, app, "/memory publish 1")
+            assert texts(app, "note") == [expected]
+            await send(pilot, app, "/memory")
+            listing = texts(app, "note")[-1]
+            assert ("[shared]" in listing) is (expected == "published memory #1")
+            assert texts(app, "user") == []
+            assert not any(p.requests for p in factory.providers)
+    finally:
+        await storage.close()
+
+
+# `/memory add`: the model call runs in the turn worker group, so Escape cancels it
+
+NOT_ADMIN_ADD = "only memory admins may add shared memories"
+SAVED_TWO = "saved 2 of 2 memories (#2, #3); skipped 0 already known"
+
+
+def make_add_app(
+    config: HarnessConfig, tools: Any, storage: Any, factory: Any, model=MODEL_1
+) -> ChatApp:
+    return ChatApp(
+        config, model, router_factory_for(config, factory, None), False, storage, tools
+    )
+
+
+async def test_memory_add_in_the_tui_previews_then_confirm_saves(
+    tmp_path: Path,
+) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, "alice", [])
+    try:
+        factory = AddFactory()
+        app = make_add_app(config, tools, storage, factory)
+        async with app.run_test() as pilot:
+            await send(pilot, app, "/memory add Alice likes tea in the morning")
+            preview = texts(app, "note")[-1]
+            assert preview.splitlines()[:2] == [
+                "1. [tea, drink] Alice prefers green tea",
+                "2. [morning] Alice drinks tea in the morning",
+            ]
+            assert "/memory add confirm to save 2 notes" in preview
+            assert "[memory: proposing...]" in texts(app, "note")
+            assert prompt_of(app).value == "" and not prompt_of(app).disabled
+            assert len(await MemoryStore(storage.relational).list("alice")) == 1
+            await send(pilot, app, "/memory add confirm")
+            assert texts(app, "note")[-1] == SAVED_TWO
+            assert len(await MemoryStore(storage.relational).list("alice")) == 3
+            await send(pilot, app, "/memory add confirm")
+            assert texts(app, "note")[-1] == "nothing to confirm"
+            assert texts(app, "user") == []
+            assert len(factory.requests) == 1
+    finally:
+        await storage.close()
+
+
+async def test_memory_add_in_the_tui_reads_a_file_and_cancel_discards(
+    tmp_path: Path,
+) -> None:
+    notes = tmp_path / "my notes.md"
+    notes.write_bytes("\ufeffAlice likes tea\r\nand jam\r\n".encode())
+    config, tools, storage = await memory_front_end(tmp_path, "alice", [])
+    try:
+        factory = AddFactory()
+        app = make_add_app(config, tools, storage, factory)
+        async with app.run_test() as pilot:
+            await send(pilot, app, f"/memory add @{notes}")
+            assert texts(app, "note")[-1].startswith("1. [tea, drink] Alice prefers")
+            (request,) = factory.requests
+            content = request.messages[1].content
+            assert "Alice likes tea\nand jam" in content and str(notes) not in content
+            await send(pilot, app, "/memory add cancel")
+            assert texts(app, "note")[-1] == "discarded 2 proposed memories"
+            await send(pilot, app, "/memory add confirm")
+            assert texts(app, "note")[-1] == "nothing to confirm"
+            assert len(await MemoryStore(storage.relational).list("alice")) == 1
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize("admins", [[], ["bob"]])
+async def test_memory_add_shared_in_the_tui_needs_an_admin(
+    tmp_path: Path, admins: list[str]
+) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, "alice", admins)
+    try:
+        factory = AddFactory()
+        app = make_add_app(config, tools, storage, factory)
+        async with app.run_test() as pilot:
+            await send(pilot, app, "/memory add --shared @/nonexistent/x.md")
+            assert texts(app, "note")[-1] == NOT_ADMIN_ADD
+            assert factory.requests == []
+    finally:
+        await storage.close()
+
+
+async def test_escape_cancels_a_memory_add_and_leaves_nothing_pending(
+    tmp_path: Path,
+) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, "alice", [])
+    try:
+        factory = AddFactory(hang_after=0)
+        app = make_add_app(config, tools, storage, factory)
+        async with app.run_test() as pilot:
+            prompt_of(app).value = "/memory add Alice likes tea"
+            await pilot.press("enter")
+            await wait_for(
+                pilot, lambda: "[memory: proposing...]" in texts(app, "note")
+            )
+            assert prompt_of(app).disabled
+            await pilot.press("escape")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert "cancelled" in texts(app, "note")
+            assert not prompt_of(app).disabled
+            assert prompt_of(app).value == "/memory add Alice likes tea"
+            assert factory.providers[0].closed
+            await send(pilot, app, "/memory add confirm")
+            assert texts(app, "note")[-1] == "nothing to confirm"
+            assert len(await MemoryStore(storage.relational).list("alice")) == 1
+    finally:
+        await storage.close()
+
+
+async def test_a_new_chat_clears_the_pending_memory_preview_in_the_tui(
+    tmp_path: Path,
+) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, "alice", [])
+    try:
+        app = make_add_app(config, tools, storage, AddFactory())
+        async with app.run_test() as pilot:
+            await send(pilot, app, "/memory add Alice likes tea")
+            await pilot.press("ctrl+n")
+            await pilot.pause()
+            await send(pilot, app, "/memory add confirm")
+            assert texts(app, "note")[-1] == "nothing to confirm"
+    finally:
+        await storage.close()
+
+
+async def test_memory_add_without_a_working_model_in_the_tui(tmp_path: Path) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, "alice", [])
+    try:
+        app = make_add_app(config, tools, storage, AddFactory(), model=MODEL_3)
+        async with app.run_test() as pilot:
+            await send(pilot, app, "/memory add Alice likes tea")
+            assert texts(app, "note")[-1] == (
+                "no working model: pick another and press Ctrl+N"
+            )
+            await send(pilot, app, "/memory add cancel")
+            assert texts(app, "note")[-1] == "nothing to cancel"
+    finally:
+        await storage.close()
+
+
+NOT_ADMIN_FORGET = "only memory admins may forget shared memories"
+
+
+@pytest.mark.parametrize(
+    ("user_id", "admins", "expected"),
+    [
+        ("bob", ["bob"], "forgot shared memory #1: likes tea"),
+        ("bob", ["alice"], NOT_ADMIN_FORGET),
+        ("bob", [], NOT_ADMIN_FORGET),
+    ],
+)
+async def test_memory_forget_in_the_tui_needs_an_admin(
+    tmp_path: Path, user_id: str, admins: list[str], expected: str
+) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, user_id, admins)
+    try:
+        assert await MemoryStore(storage.relational).set_shared("alice", 1, True)
+        factory = Factory(REPLY)
+        app = ChatApp(
+            config,
+            MODEL_1,
+            router_factory_for(config, factory, None),
+            False,
+            storage,
+            tools,
+        )
+        async with app.run_test() as pilot:
+            await send(pilot, app, "/memory forget 1")
+            assert texts(app, "note") == [expected]
+            await send(pilot, app, "/memory")
+            listing = texts(app, "note")[-1]
+            assert ("[shared]" in listing) is (expected == NOT_ADMIN_FORGET)
+            assert texts(app, "user") == []
+            assert not any(p.requests for p in factory.providers)
+    finally:
+        await storage.close()
+
+
+async def test_help_for_an_unknown_name_is_reported_in_the_tui() -> None:
+    app = make_app(Factory(REPLY))
+    async with app.run_test() as pilot:
+        await send(pilot, app, "/help nope")
+        assert texts(app, "note") == ['no help for "nope"; type /help']
+
+
+async def test_helpx_is_an_ordinary_message_in_the_tui() -> None:
+    factory = Factory(REPLY)
+    app = make_app(factory)
+    async with app.run_test() as pilot:
+        await send(pilot, app, "/helpx")
+        assert texts(app, "user") == ["you: /helpx"]
+        assert help_overview("tui") not in texts(app, "note")
+        assert len(factory.providers[0].requests) == 1
+
+
+async def test_a_pasted_multi_line_text_keeps_only_its_first_line_in_the_tui() -> None:
+    """Why `/memory add` documents the file form: a terminal paste is cut to line 1."""
+    from textual.events import Paste
+
+    app = make_app(Factory(REPLY))
+    async with app.run_test() as pilot:
+        prompt_of(app).focus()
+        prompt_of(app).post_message(Paste("/memory add first line\nsecond line"))
+        await pilot.pause()
+        assert prompt_of(app).value == "/memory add first line"
+
+
+# `/memory export` and `/memory import`: files, no model, in the turn worker group
+
+
+@posix_only
+async def test_memory_export_and_import_in_the_tui(tmp_path: Path) -> None:
+    (tmp_path / "alice").mkdir()
+    (tmp_path / "bob").mkdir()
+    target = tmp_path / "out.yaml"
+    config, tools, storage = await memory_front_end(tmp_path / "alice", "alice", [])
+    try:
+        factory = Factory(REPLY)
+        app = make_add_app(config, tools, storage, factory)
+        async with app.run_test() as pilot:
+            await send(pilot, app, f"/memory export {target}")
+            assert texts(app, "note") == [f"exported 1 memories to {target}"]
+            assert target.stat().st_mode & 0o777 == 0o600
+            await send(pilot, app, f"/memory import {target}")
+            assert texts(app, "note")[-1].startswith(
+                "imported 0 of 1 memories; skipped 1 already known"
+            )
+            await send(pilot, app, f"/memory export --shared {target}")
+            assert (
+                texts(app, "note")[-1]
+                == "only memory admins may export shared memories"
+            )
+            await send(pilot, app, f"/memory import {tmp_path / 'missing.yaml'}")
+            assert texts(app, "note")[-1].startswith("FileNotFoundError")
+            assert texts(app, "user") == []
+            assert not any(p.requests for p in factory.providers)
+    finally:
+        await storage.close()
+    config, tools, storage = await memory_front_end(tmp_path / "bob", "bob", [])
+    try:
+        app = make_add_app(config, tools, storage, Factory(REPLY))
+        async with app.run_test() as pilot:
+            await send(pilot, app, f"/memory import --shared {target}")
+            assert (
+                texts(app, "note")[-1]
+                == "only memory admins may import shared memories"
+            )
+            await send(pilot, app, f"/memory import {target}")
+            assert texts(app, "note")[-1].startswith(
+                "imported 1 of 1 memories; skipped 0 already known"
+            )
+            assert [
+                n.user_id for n in await MemoryStore(storage.relational).list("bob")
+            ] == ["bob"]
+    finally:
+        await storage.close()
+
+
+async def test_escape_cancels_a_memory_import_and_keeps_the_saved_notes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, tools, storage = await memory_front_end(tmp_path, "alice", [])
+    try:
+        source = tmp_path / "in.yaml"
+        source.write_bytes(
+            b"version: 1\nmemories:\n"
+            b"- {text: first note, keywords: [one]}\n"
+            b"- {text: second note, keywords: [two]}\n"
+        )
+        original = MemoryStore.save
+        calls: list[str] = []
+
+        async def blocking_save(self, user_id, text, keywords, *args, **kwargs):
+            calls.append(text)
+            if len(calls) > 1:
+                await asyncio.Event().wait()
+            return await original(self, user_id, text, keywords, *args, **kwargs)
+
+        monkeypatch.setattr(MemoryStore, "save", blocking_save)
+        app = make_add_app(config, tools, storage, Factory(REPLY))
+        async with app.run_test() as pilot:
+            command = f"/memory import {source}"
+            prompt_of(app).value = command
+            await pilot.press("enter")
+            await wait_for(pilot, lambda: len(calls) == 2)
+            assert prompt_of(app).disabled  # running in the turn slot, not inline
+            await pilot.press("escape")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert "cancelled" in texts(app, "note")
+            assert not prompt_of(app).disabled
+            assert prompt_of(app).value == command
+        monkeypatch.undo()
+        notes = await MemoryStore(storage.relational).list("alice")
+        assert sorted(note.text for note in notes) == ["first note", "likes tea"]
+    finally:
+        await storage.close()
+
+
+async def test_a_stream_that_ends_without_done_or_error_still_re_enables_the_prompt() -> (
+    None
+):
+    app = make_app(Factory(REPLY))
+    async with app.run_test() as pilot:
+        assert app._orchestrator is not None
+
+        async def ends_early(text: str):
+            yield TextDelta(text="partial")
+
+        # A real orchestrator always ends a stream with Done or ErrorEvent; this
+        # stands in for a stream that breaks that contract.
+        app._orchestrator.send = ends_early  # type: ignore[method-assign]
+        await send(pilot, app, "hi")
+        assert reply_texts(app) == ["partial"]
+        assert prompt_of(app).disabled is False
+        assert prompt_of(app).value == ""

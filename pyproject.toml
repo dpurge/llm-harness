@@ -32,7 +32,7 @@ remote = ["qdrant-client>=1.20.0"]
 postgres = ["psycopg[binary]>=3.3.7"]
 
 [project.scripts]
-llm-harness = "llm_harness.cli:main"
+llm-harness = "llm_harness.frontends.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]

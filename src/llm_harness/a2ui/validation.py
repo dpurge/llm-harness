@@ -14,7 +14,7 @@ from a2ui.core.resolution import DataContext
 from a2ui.core.validation import STRICT_VALIDATION
 
 from llm_harness.a2ui.catalog import GuardedBasicCatalog, custom_catalog
-from llm_harness.display import sanitize_text
+from llm_harness.core.display import sanitize_text
 
 _PROTOCOL_VERSION = "1.0"
 _ERROR_PREFIX = "A2UI message rejected: "

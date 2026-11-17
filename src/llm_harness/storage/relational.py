@@ -9,7 +9,7 @@ grandfathered `ledger` namespace, whose tables are `llm_calls` and `model_backof
 The SQLite backend opens one connection per call, so the async methods run the
 blocking `*_sync` methods in a worker thread without sharing a connection. The
 `*_sync` methods are public for synchronous callers such as the ledger in
-`llm_harness.store`. Construction touches nothing; the directory (0700) and the
+`llm_harness.models.ledger`. Construction touches nothing; the directory (0700) and the
 file (0600) are created on first use.
 """
 
@@ -45,7 +45,7 @@ def database_error_classes() -> tuple[type[Exception], ...]:
 
     A caller that must survive a database failure catches this tuple, so it does
     not import a driver that a bare install lacks. The usage ledger in
-    `llm_harness.store` catches this tuple (`_database_errors`).
+    `llm_harness.models.ledger` catches this tuple (`_database_errors`).
     """
     classes: tuple[type[Exception], ...] = (sqlite3.Error,)
     try:

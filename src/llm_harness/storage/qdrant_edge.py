@@ -22,7 +22,7 @@ from typing import Any
 
 import qdrant_edge as q
 
-from llm_harness import pathing
+from llm_harness.config import pathing
 from llm_harness.storage.files import make_private_dirs
 from llm_harness.storage.vector_common import (
     NAME_PATTERN,

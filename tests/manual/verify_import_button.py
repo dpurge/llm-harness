@@ -28,10 +28,10 @@ def free_port() -> int:
 def serve(port: int) -> None:
     from nicegui import ui
 
-    from llm_harness.gui.app import register_page
-    from tests.fake_steps import reply_events
-    from tests.fakes import router_factory_for
-    from tests.test_gui import CONFIG, MODEL_1, StepFactory
+    from llm_harness.frontends.gui.server import register_page
+    from tests.support.fake_steps import reply_events
+    from tests.support.fakes import router_factory_for
+    from tests.frontends.gui.test_gui import CONFIG, MODEL_1, StepFactory
 
     factory = StepFactory([reply_events({"type": "respond", "text": "hi"})])
     register_page(CONFIG, MODEL_1, router_factory_for(CONFIG, factory), False)
@@ -39,8 +39,8 @@ def serve(port: int) -> None:
 
 
 def exported_yaml() -> bytes:
-    from llm_harness.state import Environment, OrchestratorState, RunState
-    from llm_harness.state_io import export_yaml
+    from llm_harness.core.state import Environment, OrchestratorState, RunState
+    from llm_harness.core.state_io import export_yaml
 
     now = dt.datetime.now(dt.UTC)
     state = OrchestratorState(

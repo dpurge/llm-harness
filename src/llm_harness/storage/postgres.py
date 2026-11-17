@@ -1,7 +1,7 @@
 """The relational store on a PostgreSQL server (psycopg 3, synchronous, one connection per call).
 
 Same shape as `SqliteRelationalStore`: async methods run the public `*_sync` methods
-in a worker thread, and the ledger (`llm_harness.store`) uses `connect_sync()` with
+in a worker thread, and the ledger (`llm_harness.models.ledger`) uses `connect_sync()` with
 SQLite-flavoured SQL. The adapter bridges the differences; each was verified in a
 spike on PostgreSQL 17.11 with psycopg 3.3.7:
 
@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from llm_harness.redact import Secret
+from llm_harness.core.redact import Secret
 from llm_harness.storage.relational import (
     Migration,
     RelationalStoreError,

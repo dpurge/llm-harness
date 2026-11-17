@@ -13,7 +13,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-from llm_harness.config import ConfigError, HarnessConfig
+from llm_harness.config.settings import ConfigError, HarnessConfig
 from llm_harness.storage.files import FileStoreError, LocalFileStore
 from llm_harness.storage.pgvector import PgVectorStatus, PgVectorStore
 from llm_harness.storage.postgres import PostgresConnectError, PostgresRelationalStore
@@ -24,7 +24,7 @@ from llm_harness.storage.qdrant_edge import (
 )
 from llm_harness.storage.relational import ReadOnlySchema, read_schema_versions
 from llm_harness.storage.vectors import VectorStoreError, VectorStoreLockedError
-from llm_harness.store import expected_schema_versions, optional_schema_versions
+from llm_harness.models.ledger import expected_schema_versions, optional_schema_versions
 
 _NEWER = "newer than this version of llm-harness"
 

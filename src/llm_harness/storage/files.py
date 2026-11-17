@@ -17,7 +17,7 @@ import stat
 from pathlib import Path, PureWindowsPath
 from typing import Protocol
 
-from llm_harness import pathing
+from llm_harness.config import pathing
 
 MAX_SEGMENT_CHARS = 255
 MAX_PATH_CHARS = 1024
@@ -189,7 +189,9 @@ class LocalFileStore:
         full_path = os.path.join(parent, segments[-1])
         try:
             # Without O_NOFOLLOW (Windows) a final symlink is refused by this lstat.
-            if not pathing.nofollow_flag() and stat.S_ISLNK(os.lstat(full_path).st_mode):
+            if not pathing.nofollow_flag() and stat.S_ISLNK(
+                os.lstat(full_path).st_mode
+            ):
                 raise FileStoreError(f"not a regular file: {path}")
             # O_NOFOLLOW refuses a final symlink; O_NONBLOCK keeps a FIFO from hanging the open.
             descriptor = os.open(
